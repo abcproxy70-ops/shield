@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v2.3 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v2.4 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - CrowdSec (SSH brute-force + community blocklist)
@@ -230,6 +230,13 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
     print_status "Устанавливаю sqlite3 (для оптимизации guard)..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 >/dev/null 2>&1 || \
         print_warn "sqlite3 не установлен — guard будет использовать cscli (медленнее)"
+fi
+
+# v2.4: jq для парсинга nft -j вывода в guard
+if ! command -v jq >/dev/null 2>&1; then
+    print_status "Устанавливаю jq (для парсинга nft JSON в guard)..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y jq >/dev/null 2>&1 || \
+        print_warn "jq не установлен — guard будет использовать text-парсинг (хрупко)"
 fi
 
 if ! nft list ruleset >/dev/null 2>&1; then
@@ -981,8 +988,42 @@ CUR_MGMT_V4=$(nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
     tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | \
     sort -u | tr '\n' ',' | sed 's/,$//')
 
+# v2.4: SAFETY GUARD — не затирать существующие данные пустыми результатами.
+# Это случается когда:
+#   - UFW в момент опроса делает atomic rename файлов (transient empty output)
+#   - path-unit срабатывает несколько раз подряд, и один раз фаервол не отвечает
+#   - Кратковременная блокировка ufw lock
+#
+# Логика: если фаервол активен И мы получили пустой результат, НО предыдущий
+# результат был непустой — это скорее всего transient ошибка. Пропускаем
+# обновление, не затираем правильные данные.
+FIREWALL_ACTIVE=0
+case "$FIREWALL_TYPE" in
+    ufw)       ufw status 2>/dev/null | grep -q "Status: active" && FIREWALL_ACTIVE=1 ;;
+    firewalld) systemctl is-active --quiet firewalld 2>/dev/null && FIREWALL_ACTIVE=1 ;;
+    iptables)  [ "$(iptables -L INPUT 2>/dev/null | wc -l)" -gt 2 ] && FIREWALL_ACTIVE=1 ;;
+    nftables)  nft list ruleset 2>/dev/null | grep -q "table inet filter" && FIREWALL_ACTIVE=1 ;;
+esac
+
+if [ "$FIREWALL_ACTIVE" = "1" ] && [ -z "$NEW_TCP" ] && [ -z "$NEW_UDP" ] && [ -z "$NEW_MGMT_V4" ]; then
+    if [ -n "$CUR_TCP" ] || [ -n "$CUR_MGMT_V4" ]; then
+        logger -t "$LOG_TAG" "SKIP: empty parse result while firewall is active (transient?)"
+        exit 0
+    fi
+fi
+
 # Если ничего не изменилось — выходим
 if [ "$NEW_TCP" = "$CUR_TCP" ] && [ "$NEW_UDP" = "$CUR_UDP" ] && [ "$NEW_MGMT_V4" = "$CUR_MGMT_V4" ]; then
+    exit 0
+fi
+
+# v2.4: Lock-файл — предотвращает одновременный запуск (path-unit + timer).
+# flock с -n (non-blocking) — если уже запущен другой instance, выходим.
+LOCKFILE="/run/cs-ssh-whitelist/.ports-update.lock"
+mkdir -p /run/cs-ssh-whitelist 2>/dev/null
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+    logger -t "$LOG_TAG" "SKIP: another update already in progress"
     exit 0
 fi
 
@@ -1010,10 +1051,12 @@ trap 'rm -f "$TMP"' EXIT
     fi
 } > "$TMP"
 
-if nft -f "$TMP" 2>/dev/null; then
+# v2.4: захватываем stderr из nft для диагностики (раньше >/dev/null глотал ошибки)
+NFT_ERR=$(nft -f "$TMP" 2>&1)
+if [ $? -eq 0 ]; then
     logger -t "$LOG_TAG" "Updated: TCP={$NEW_TCP} UDP={$NEW_UDP} MGMT={$NEW_MGMT_V4}"
 else
-    logger -t "$LOG_TAG" "ERROR: failed to apply nft update for TCP={$NEW_TCP} UDP={$NEW_UDP} MGMT={$NEW_MGMT_V4}"
+    logger -t "$LOG_TAG" "ERROR: nft failed: $NFT_ERR"
     exit 1
 fi
 UPDATER_EOF2
@@ -1774,12 +1817,39 @@ show_syn_flood_ips() {
     echo ""
     echo -e "${B}SYN-flood IPs (TCP rate-limit)${N}"
     echo -e "${DIM}─────────────────────────────────${N}"
-    nft list set inet ddos_protect syn_flood_v4 2>/dev/null | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ expires [^,}]+' | \
-        awk '{printf "  %-18s %s\n", $1, $3}'
-    nft list set inet ddos_protect syn_flood_v6 2>/dev/null | \
-        grep -oE '[0-9a-f:]+ expires [^,}]+' | head -50 | \
-        awk '{printf "  %-40s %s\n", $1, $3}'
+
+    # v2.4: используем JSON-вывод nft (надёжнее regex'а на текстовом формате)
+    local json4 json6
+    json4=$(nft -j list set inet ddos_protect syn_flood_v4 2>/dev/null)
+    json6=$(nft -j list set inet ddos_protect syn_flood_v6 2>/dev/null)
+
+    if command -v jq >/dev/null 2>&1 && [ -n "$json4" ]; then
+        echo "$json4" | jq -r '
+            .nftables[]?.set?.elem[]? |
+            (.elem.val // .val) as $ip |
+            (.elem.expires // .expires // 0) as $exp |
+            "  \($ip)  expires \($exp)s"
+        ' 2>/dev/null | head -50
+    else
+        # Fallback: текстовый парсинг (формат: "IP limit rate ... expires Xs")
+        nft list set inet ddos_protect syn_flood_v4 2>/dev/null | \
+            tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ limit rate[^,}]+expires [0-9smh]+' | \
+            awk '{
+                ip=$1
+                # expires — последнее поле
+                exp=$NF
+                printf "  %-18s expires %s\n", ip, exp
+            }' | head -50
+    fi
+
+    if [ -n "$json6" ] && command -v jq >/dev/null 2>&1; then
+        echo "$json6" | jq -r '
+            .nftables[]?.set?.elem[]? |
+            (.elem.val // .val) as $ip |
+            (.elem.expires // .expires // 0) as $exp |
+            "  \($ip)  expires \($exp)s"
+        ' 2>/dev/null | head -20
+    fi
     echo ""
 }
 
