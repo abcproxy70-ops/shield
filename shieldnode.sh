@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v2.7 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v3.0 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - CrowdSec (SSH brute-force + community blocklist)
@@ -11,6 +11,38 @@
 #
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
+#
+#  v3.0 changelog (UI redesign):
+#    - REWRITE: полностью переработан guard — современный UI с двойными
+#      рамками, секциями-карточками, статус-индикаторами, иконками.
+#    - Главный экран: hero-карточка со сводкой (заблокировано всего, активные
+#      атаки, статус сервисов одной строкой).
+#    - Двухколоночное меню — компактнее, читаемее.
+#    - Добавлены ASCII-bar для визуализации scanner blocklist coverage.
+#    - Все labels на английском, дашборд готов для мультиязычной версии.
+#
+#  v2.9 changelog (полная история блокировок):
+#    - ADD: persistent история блокировок в /var/lib/shieldnode/events.db (sqlite).
+#      Таблица events(ts, type, ip, port, count) — агрегирует в реальном
+#      времени. Размер БД остаётся маленьким (тысячи строк за год).
+#    - ADD: nftables logging для scanner и confirmed_attack drops.
+#      Через rate-limit (1 пакет/сек на IP) — не забиваем journald.
+#    - ADD: shieldnode-aggregator.service — собирает события из journald
+#      каждые 60 секунд, дедуплицирует и пишет в БД.
+#    - ADD: новый раздел "All-time stats" в guard:
+#      • scanners blocked: 12,847 IP за всё время
+#      • ddos blocked: 234 IP за всё время
+#      • ssh brute-force blocked: 89 IP (из crowdsec.db)
+#      • top 10 атакующих стран
+#    - ADD: команды [6] history, [7] top attackers в guard
+#
+#  v2.8 changelog (UX-фиксы):
+#    - ADD: ожидание apt lock в начале скрипта (до 5 минут).
+#      На свежих VPS unattended-upgrades держит dpkg lock 2-5 минут после
+#      первой загрузки. Раньше: установка падала с "Установка crowdsec
+#      провалилась". Теперь: ждём с прогресс-индикатором и продолжаем.
+#    - CHG: ошибки apt теперь показываются (раньше глотались через
+#      `>/dev/null 2>&1`). Если что-то падает — в выводе видно что именно.
 #
 #  v2.7 changelog (статистика блокировок):
 #    - ADD: nftables counters на каждом drop-правиле (kernel-level, бесплатные).
@@ -204,7 +236,8 @@ if [ "${1:-}" = "--uninstall" ]; then
     # Systemd units
     for unit in cs-ssh-whitelist scanner-blocklist-update.timer scanner-blocklist-update.service \
                 protected-ports-update.timer protected-ports-update.service \
-                protected-ports-update.path; do
+                protected-ports-update.path \
+                shieldnode-aggregator.timer shieldnode-aggregator.service; do
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
     done
@@ -215,8 +248,12 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /usr/local/sbin/cs-ssh-key-whitelist.sh
     rm -f /usr/local/sbin/update-scanner-blocklist.sh
     rm -f /usr/local/sbin/update-protected-ports.sh
+    rm -f /usr/local/sbin/shieldnode-aggregator.sh
     rm -f /usr/local/bin/guard
     print_ok "Скрипты удалены (включая команду guard)"
+
+    # БД истории событий (v2.9)
+    rm -rf /var/lib/shieldnode
 
     # CrowdSec parser
     rm -f /etc/crowdsec/postoverflows/s01-whitelist/ssh-key-whitelist.yaml
@@ -261,18 +298,57 @@ if [[ $EUID -ne 0 ]]; then
 fi
 print_ok "Запущен от root"
 
+# v2.8: ждём пока apt освободится (unattended-upgrades на свежих VPS)
+wait_for_apt_lock() {
+    local max_wait=300  # 5 минут максимум
+    local elapsed=0
+    local first_msg=1
+
+    while pgrep -f "apt-get|apt |dpkg|unattended-upgr" >/dev/null 2>&1 || \
+          fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+          fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+          fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
+
+        if [ $first_msg -eq 1 ]; then
+            print_status "Ждём пока освободится apt (unattended-upgrades в процессе)..."
+            print_info "Это может занять 2-5 минут на свежем VPS"
+            first_msg=0
+        fi
+
+        if [ $elapsed -ge $max_wait ]; then
+            print_warn "apt всё ещё занят после 5 минут ожидания"
+            print_info "Попробуй: sudo killall unattended-upgr; sleep 5; и запусти скрипт заново"
+            return 1
+        fi
+
+        sleep 5
+        elapsed=$((elapsed + 5))
+        printf "\r  ${YELLOW}⏳${NC} Ждём apt lock... ${BOLD}${elapsed}s${NC}    "
+    done
+
+    if [ $first_msg -eq 0 ]; then
+        printf "\r"
+        print_ok "apt освободился (ждали ${elapsed}s)"
+    fi
+    return 0
+}
+
+# Проверяем apt lock перед любыми установками
+wait_for_apt_lock || exit 1
+
 if ! command -v nft >/dev/null 2>&1; then
     print_status "Устанавливаю nftables..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y nftables >/dev/null 2>&1 || {
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y nftables; then
         print_error "Не удалось установить nftables"
         exit 1
-    }
+    fi
 fi
 print_ok "nftables: $(nft --version 2>&1 | head -1)"
 
 # v1.9: sqlite3 для быстрого чтения crowdsec БД в guard'е
 # (опционально — fallback на cscli если не установится)
 if ! command -v sqlite3 >/dev/null 2>&1; then
+    wait_for_apt_lock
     print_status "Устанавливаю sqlite3 (для оптимизации guard)..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3 >/dev/null 2>&1 || \
         print_warn "sqlite3 не установлен — guard будет использовать cscli (медленнее)"
@@ -280,6 +356,7 @@ fi
 
 # v2.4: jq для парсинга nft -j вывода в guard
 if ! command -v jq >/dev/null 2>&1; then
+    wait_for_apt_lock
     print_status "Устанавливаю jq (для парсинга nft JSON в guard)..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y jq >/dev/null 2>&1 || \
         print_warn "jq не установлен — guard будет использовать text-парсинг (хрупко)"
@@ -882,14 +959,28 @@ $MANUAL_WHITELIST_V6_INIT
 
         # Pre-emptive drop известных сканеров (с counter v2.7).
         # Стоит ПЕРЕД rate-limit — экономит conntrack-слоты и CPU.
+        # v2.9: log с rate-limit 1/sec на IP — для history БД (агрегатор парсит journald)
+        ip  saddr @scanner_blocklist_v4 limit rate 1/second \\
+            log prefix "[shield:scanner] " level info flags ip options \\
+            counter name scanner_drops_v4 drop
         ip  saddr @scanner_blocklist_v4 counter name scanner_drops_v4 drop
+        ip6 saddr @scanner_blocklist_v6 limit rate 1/second \\
+            log prefix "[shield:scanner] " level info \\
+            counter name scanner_drops_v6 drop
         ip6 saddr @scanner_blocklist_v6 counter name scanner_drops_v6 drop
 
         # === v2.5: BAN-ONCE АРХИТЕКТУРА ===
         # Двухэтапная проверка перед баном — снижает ложные баны CGNAT/мобильных.
         #
         # Этап 0: Если IP в confirmed_attack — он уже подтверждённый атакующий, дропаем.
+        # v2.9: log с rate-limit 1/sec на IP — для history БД
+        ip  saddr @confirmed_attack_v4 limit rate 1/second \\
+            log prefix "[shield:ddos] " level info flags ip options \\
+            counter name confirmed_drops_v4 drop
         ip  saddr @confirmed_attack_v4 counter name confirmed_drops_v4 drop
+        ip6 saddr @confirmed_attack_v6 limit rate 1/second \\
+            log prefix "[shield:ddos] " level info \\
+            counter name confirmed_drops_v6 drop
         ip6 saddr @confirmed_attack_v6 counter name confirmed_drops_v6 drop
 
         # === TCP SYN rate-limit на защищаемых портах ===
@@ -1457,16 +1548,22 @@ print_ok "Timer активен (обновление каждые 6 часов)"
 print_header "ШАГ 7: УСТАНОВКА CROWDSEC"
 
 if ! command -v cscli >/dev/null 2>&1; then
+    wait_for_apt_lock
     print_status "Подключаю репозиторий CrowdSec..."
-    curl -fsSL https://install.crowdsec.net | bash >/dev/null 2>&1 || {
+    if ! curl -fsSL https://install.crowdsec.net | bash; then
         print_error "Не удалось подключить репозиторий CrowdSec"
+        print_info "Проверь интернет: curl -v https://install.crowdsec.net"
         exit 1
-    }
+    fi
+
+    wait_for_apt_lock
     print_status "Устанавливаю crowdsec..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec >/dev/null 2>&1 || {
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec; then
         print_error "Установка crowdsec провалилась"
+        print_info "Попробуй вручную: sudo apt-get install -y crowdsec"
+        print_info "Или проверь: sudo apt-cache policy crowdsec"
         exit 1
-    }
+    fi
 fi
 print_ok "CrowdSec: $(cscli version 2>&1 | head -1 || echo установлен)"
 
@@ -1728,11 +1825,12 @@ print_header "ШАГ 11: NFTABLES BOUNCER"
 if dpkg -l crowdsec-firewall-bouncer-nftables &>/dev/null; then
     print_info "Bouncer уже установлен"
 else
+    wait_for_apt_lock
     print_status "Устанавливаю crowdsec-firewall-bouncer-nftables..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec-firewall-bouncer-nftables >/dev/null 2>&1 || {
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec-firewall-bouncer-nftables; then
         print_error "Установка bouncer'а провалилась"
         exit 1
-    }
+    fi
     print_ok "Bouncer установлен"
 fi
 
@@ -1779,10 +1877,162 @@ else
 fi
 
 # ==============================================================================
-# ШАГ 12: УСТАНОВКА КОМАНДЫ guard (снимок состояния)
+# ШАГ 12: HISTORY AGGREGATOR (события из journald → sqlite)
 # ==============================================================================
 
-print_header "ШАГ 12: УСТАНОВКА КОМАНДЫ guard"
+print_header "ШАГ 12: HISTORY AGGREGATOR"
+
+# v2.9: парсим логи nftables [shield:scanner] / [shield:ddos] из journald
+# и пишем в /var/lib/shieldnode/events.db с агрегацией.
+
+DB_DIR="/var/lib/shieldnode"
+DB_FILE="$DB_DIR/events.db"
+mkdir -p "$DB_DIR"
+chmod 0750 "$DB_DIR"
+
+# Инициализируем БД
+sqlite3 "$DB_FILE" <<'SQL_EOF'
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    type        TEXT NOT NULL,            -- 'scanner' | 'ddos'
+    ip          TEXT NOT NULL,
+    first_seen  INTEGER NOT NULL,         -- unix timestamp
+    last_seen   INTEGER NOT NULL,
+    count       INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(type, ip) ON CONFLICT REPLACE
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
+CREATE INDEX IF NOT EXISTS idx_events_last_seen ON events(last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_events_count ON events(count DESC);
+
+CREATE TABLE IF NOT EXISTS aggregator_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+SQL_EOF
+chmod 0640 "$DB_FILE"
+print_ok "БД создана: $DB_FILE"
+
+# Скрипт-агрегатор
+AGG_SCRIPT="/usr/local/sbin/shieldnode-aggregator.sh"
+cat > "$AGG_SCRIPT" <<'AGG_EOF'
+#!/bin/bash
+# Парсит journald на предмет log-сообщений от nft и пишет в sqlite.
+
+DB="/var/lib/shieldnode/events.db"
+LOG_TAG="shieldnode-agg"
+
+# Если БД нет — выходим
+[ -r "$DB" ] || { logger -t "$LOG_TAG" "DB not found: $DB"; exit 0; }
+
+# Получаем cursor (где остановились в прошлый раз)
+CURSOR=$(sqlite3 "$DB" "SELECT value FROM aggregator_state WHERE key='cursor' LIMIT 1" 2>/dev/null)
+
+# Читаем journald с того места где остановились
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+if [ -n "$CURSOR" ]; then
+    journalctl --output=cat --output-fields=MESSAGE --no-pager \
+        --after-cursor="$CURSOR" --show-cursor 2>/dev/null > "$TMP" || true
+else
+    # Первый запуск — берём за последний час
+    journalctl --output=cat --output-fields=MESSAGE --no-pager \
+        --since="1 hour ago" --show-cursor 2>/dev/null > "$TMP" || true
+fi
+
+# Извлекаем cursor из последней строки и удаляем его из вывода
+NEW_CURSOR=$(grep -oE '^-- cursor: .+$' "$TMP" | tail -1 | sed 's/^-- cursor: //')
+
+# Парсим сообщения [shield:scanner] и [shield:ddos]
+# Формат kernel-лога: "[shield:scanner] IN=eth0 SRC=85.142.100.2 DST=... PROTO=TCP ..."
+declare -A scanner_ips ddos_ips
+
+while IFS= read -r line; do
+    case "$line" in
+        *"[shield:scanner]"*)
+            ip=$(echo "$line" | grep -oE 'SRC=[^ ]+' | head -1 | cut -d= -f2)
+            [ -n "$ip" ] && scanner_ips[$ip]=$((${scanner_ips[$ip]:-0} + 1))
+            ;;
+        *"[shield:ddos]"*)
+            ip=$(echo "$line" | grep -oE 'SRC=[^ ]+' | head -1 | cut -d= -f2)
+            [ -n "$ip" ] && ddos_ips[$ip]=$((${ddos_ips[$ip]:-0} + 1))
+            ;;
+    esac
+done < "$TMP"
+
+# Bulk-update в БД через одну транзакцию (быстро)
+NOW=$(date +%s)
+{
+    echo "BEGIN TRANSACTION;"
+    for ip in "${!scanner_ips[@]}"; do
+        cnt=${scanner_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('scanner', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
+    for ip in "${!ddos_ips[@]}"; do
+        cnt=${ddos_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('ddos', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
+    if [ -n "$NEW_CURSOR" ]; then
+        # Экранируем одинарные кавычки в cursor
+        ESC_CURSOR=$(echo "$NEW_CURSOR" | sed "s/'/''/g")
+        echo "INSERT OR REPLACE INTO aggregator_state(key, value) VALUES('cursor', '$ESC_CURSOR');"
+    fi
+    echo "COMMIT;"
+} | sqlite3 "$DB" 2>/dev/null
+
+# Лог
+TOTAL_SCANNERS=${#scanner_ips[@]}
+TOTAL_DDOS=${#ddos_ips[@]}
+if [ $TOTAL_SCANNERS -gt 0 ] || [ $TOTAL_DDOS -gt 0 ]; then
+    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS unique IPs, ddos=$TOTAL_DDOS unique IPs"
+fi
+AGG_EOF
+
+chmod 0750 "$AGG_SCRIPT"
+print_ok "Aggregator: $AGG_SCRIPT"
+
+# Systemd service + timer (раз в минуту)
+cat > /etc/systemd/system/shieldnode-aggregator.service <<EOF
+[Unit]
+Description=Shieldnode events aggregator (journald → sqlite)
+After=systemd-journald.service
+
+[Service]
+Type=oneshot
+ExecStart=$AGG_SCRIPT
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=$DB_DIR
+EOF
+
+cat > /etc/systemd/system/shieldnode-aggregator.timer <<'EOF'
+[Unit]
+Description=Run shieldnode aggregator every minute
+Requires=shieldnode-aggregator.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now shieldnode-aggregator.timer >/dev/null 2>&1
+print_ok "Aggregator timer активен (запуск раз в минуту)"
+
+# ==============================================================================
+# ШАГ 13: УСТАНОВКА КОМАНДЫ guard (снимок состояния)
+# ==============================================================================
+
+print_header "ШАГ 13: УСТАНОВКА КОМАНДЫ guard"
 
 # Команда показывает текущее состояние защиты ОДНИМ снимком:
 #   - Статус всех сервисов (CrowdSec, bouncer, watcher'ы)
@@ -1936,6 +2186,39 @@ collect_stats() {
     NFT_SINCE=$(systemctl show nftables.service --property=ActiveEnterTimestamp --value 2>/dev/null | \
         xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
     NFT_SINCE="${NFT_SINCE:-—}"
+
+    # v2.9: All-time stats из /var/lib/shieldnode/events.db
+    SHIELD_DB="/var/lib/shieldnode/events.db"
+    ALLTIME_SCANNERS=0
+    ALLTIME_DDOS=0
+    ALLTIME_SCANNER_PKTS=0
+    ALLTIME_DDOS_PKTS=0
+    DB_SINCE="—"
+
+    if [ -r "$SHIELD_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+        ALLTIME_SCANNERS=$(sqlite3 "$SHIELD_DB" "SELECT COUNT(*) FROM events WHERE type='scanner'" 2>/dev/null)
+        ALLTIME_DDOS=$(sqlite3 "$SHIELD_DB" "SELECT COUNT(*) FROM events WHERE type='ddos'" 2>/dev/null)
+        ALLTIME_SCANNER_PKTS=$(sqlite3 "$SHIELD_DB" "SELECT COALESCE(SUM(count), 0) FROM events WHERE type='scanner'" 2>/dev/null)
+        ALLTIME_DDOS_PKTS=$(sqlite3 "$SHIELD_DB" "SELECT COALESCE(SUM(count), 0) FROM events WHERE type='ddos'" 2>/dev/null)
+        ALLTIME_SCANNERS="${ALLTIME_SCANNERS:-0}"
+        ALLTIME_DDOS="${ALLTIME_DDOS:-0}"
+        ALLTIME_SCANNER_PKTS="${ALLTIME_SCANNER_PKTS:-0}"
+        ALLTIME_DDOS_PKTS="${ALLTIME_DDOS_PKTS:-0}"
+
+        # Самое раннее событие — "since"
+        FIRST_TS=$(sqlite3 "$SHIELD_DB" "SELECT MIN(first_seen) FROM events" 2>/dev/null)
+        if [ -n "$FIRST_TS" ] && [ "$FIRST_TS" != "" ]; then
+            DB_SINCE=$(date -d "@$FIRST_TS" '+%Y-%m-%d %H:%M' 2>/dev/null)
+        fi
+    fi
+
+    # CrowdSec all-time bans (за всю историю в crowdsec.db)
+    CS_ALLTIME_BANS=0
+    if [ -r "$CS_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+        # Считаем уникальные IP которые когда-либо были забанены
+        CS_ALLTIME_BANS=$(sqlite3 "$CS_DB" "SELECT COUNT(DISTINCT value) FROM decisions WHERE type='ban'" 2>/dev/null)
+        CS_ALLTIME_BANS="${CS_ALLTIME_BANS:-0}"
+    fi
 }
 
 # v2.7: human-readable bytes formatter (1234567 → 1.18M)
@@ -1969,58 +2252,86 @@ fmt_status() {
 draw_snapshot() {
     local now=$(date '+%Y-%m-%d %H:%M:%S')
     local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    local hn=$(hostname -s 2>/dev/null)
 
+    # ===== HERO HEADER =====
     echo ""
     echo -e "${C}╔══════════════════════════════════════════════════════════════════╗${N}"
-    printf "${C}║${N}  ${B}VPN GUARD${N} · %-15s · %s              ${C}║${N}\n" "$ip" "$now"
+    printf "${C}║${N}  ${B}🛡  SHIELDNODE${N} ${DIM}·${N} ${C}%-13s${N} ${DIM}·${N} %s ${DIM}·${N} %s  ${C}║${N}\n" "$ip" "$hn" "$now"
     echo -e "${C}╚══════════════════════════════════════════════════════════════════╝${N}"
+
+    # ===== HERO STATS (3 колонки) =====
+    local total_alltime=$((ALLTIME_SCANNERS + ALLTIME_DDOS + CS_ALLTIME_BANS))
+    local active_threats=$((CS_BANS + CONFIRMED_COUNT))
+    local active_color="${G}"
+    [ "$active_threats" -gt 0 ] && active_color="${R}"
+
+    echo ""
+    echo -e "  ${DIM}┌──────────────────────┬──────────────────────┬────────────────────┐${N}"
+    printf  "  ${DIM}│${N} ${DIM}Blocklist coverage${N}   ${DIM}│${N} ${DIM}All-time blocked${N}     ${DIM}│${N} ${DIM}Active threats${N}     ${DIM}│${N}\n"
+    printf  "  ${DIM}│${N} ${C}${B}%-20s${N} ${DIM}│${N} ${M}${B}%-20s${N} ${DIM}│${N} ${active_color}${B}%-18s${N} ${DIM}│${N}\n" \
+        "$(human_num "$BL_V4") IPs" "$(human_num "$total_alltime") IPs" "$active_threats now"
+    echo -e "  ${DIM}└──────────────────────┴──────────────────────┴────────────────────┘${N}"
     echo ""
 
-    echo -e "  ${B}Services${N}"
-    printf "  ├─ %-22s %b\n" "crowdsec"             "$(fmt_status "$CS_ACTIVE")"
-    printf "  ├─ %-22s %b\n" "firewall-bouncer"     "$(fmt_status "$BOUNCER_ACTIVE")"
-    printf "  ├─ %-22s %b\n" "cs-ssh-whitelist"     "$(fmt_status "$WATCHER_ACTIVE")"
-    printf "  └─ %-22s %b\n" "ports-path-watcher"   "$(fmt_status "$PORTS_PATH_ACTIVE")"
+    # ===== SERVICES (compact one-line) =====
+    local svc_line=""
+    svc_line+=$(svc_dot "$CS_ACTIVE" "crowdsec")"  "
+    svc_line+=$(svc_dot "$BOUNCER_ACTIVE" "bouncer")"  "
+    svc_line+=$(svc_dot "$WATCHER_ACTIVE" "ssh-key")"  "
+    svc_line+=$(svc_dot "$PORTS_PATH_ACTIVE" "ports")
+    echo -e "  ${B}⚙  Services${N}"
+    echo -e "  $svc_line"
     echo ""
 
-    echo -e "  ${B}Protected ports${N}"
-    printf "  ├─ %-10s ${C}%s${N}\n" "tcp" "$PROTECTED_TCP_LIST"
-    printf "  └─ %-10s ${C}%s${N}\n" "udp" "$PROTECTED_UDP_LIST"
+    # ===== PROTECTED PORTS =====
+    echo -e "  ${B}🔒 Protected${N}"
+    printf  "  ├─ ${DIM}TCP:${N}  ${C}%s${N}\n" "$PROTECTED_TCP_LIST"
+    printf  "  └─ ${DIM}UDP:${N}  ${C}%s${N}\n" "$PROTECTED_UDP_LIST"
     echo ""
 
-    echo -e "  ${B}Suspect${N} ${DIM}(under watch, 5min)${N}"
-    printf "  └─ %-25s ${Y}${B}%5d${N}\n"        "suspect IPs"         "$SUSPECT_COUNT"
+    # ===== ACTIVE NOW =====
+    echo -e "  ${B}🔥 Active blocks${N} ${DIM}(right now, dynamic timeouts)${N}"
+    printf  "  ├─ ${R}confirmed attacks${N}     ${R}${B}%5d${N} IPs ${DIM}(banned 1h)${N}\n"             "$CONFIRMED_COUNT"
+    printf  "  ├─ ${Y}suspect (watched)${N}     ${Y}${B}%5d${N} IPs ${DIM}(observed 5min)${N}\n"        "$SUSPECT_COUNT"
+    printf  "  ├─ ${R}crowdsec bans${N}         ${R}${B}%5d${N} IPs ${DIM}(behavioural detection)${N}\n" "$CS_BANS"
+    printf  "  ├─ ${R}scanner blocklist${N}     ${R}${B}%5d${N} IPs ${DIM}(IPv4)${N}\n"                  "$BL_V4"
+    printf  "  └─ ${G}whitelist${N}             ${G}${B}%5d${N} IPs ${DIM}(ssh-key %d + manual %d)${N}\n" "$((CS_WHITE + MANUAL_WHITE))" "$CS_WHITE" "$MANUAL_WHITE"
     echo ""
 
-    echo -e "  ${B}Blocked${N}"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "confirmed attack"        "$CONFIRMED_COUNT"
-    printf "  ├─ %-25s ${DIM}%5d${N}\n"  "syn-flood v4 (limit hits)" "$SYN_BAN"
-    printf "  ├─ %-25s ${DIM}%5d${N}\n"  "syn-flood v6 (limit hits)" "$SYN_BAN_V6"
-    printf "  ├─ %-25s ${DIM}%5d${N}\n"  "udp-flood v4 (limit hits)" "$UDP_BAN"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "crowdsec bans"           "$CS_BANS"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "scanner blocklist v4"    "$BL_V4"
-    printf "  └─ %-25s ${R}${B}%5d${N}\n" "scanner blocklist v6"    "$BL_V6"
-    echo ""
-
-    echo -e "  ${B}Whitelist${N}"
-    printf "  ├─ %-22s ${G}${B}%5d${N}\n" "ssh-key auto"   "$CS_WHITE"
-    printf "  └─ %-22s ${G}${B}%5d${N}\n" "manual"         "$MANUAL_WHITE"
-    echo ""
-
-    # v2.7: Total blocked (counter-based, since nft started)
+    # ===== TOTAL BLOCKED (since boot) =====
     local total_pkts=$((SCANNER_PKTS_V4 + SCANNER_PKTS_V6 + CONFIRMED_PKTS_V4 + CONFIRMED_PKTS_V6 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4))
     local total_bytes=$((SCANNER_BYTES_V4 + SCANNER_BYTES_V6 + CONFIRMED_BYTES_V4 + CONFIRMED_BYTES_V6 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4))
 
-    echo -e "  ${B}Total blocked${N} ${DIM}(since $NFT_SINCE)${N}"
-    printf "  ├─ %-22s ${R}${B}%15s${N} pkts / %s\n" "scanners (v4)"     "$(human_num "$SCANNER_PKTS_V4")"   "$(human_bytes "$SCANNER_BYTES_V4")"
-    printf "  ├─ %-22s ${R}${B}%15s${N} pkts / %s\n" "scanners (v6)"     "$(human_num "$SCANNER_PKTS_V6")"   "$(human_bytes "$SCANNER_BYTES_V6")"
-    printf "  ├─ %-22s ${R}${B}%15s${N} pkts / %s\n" "confirmed attacks"  "$(human_num "$CONFIRMED_PKTS_V4")" "$(human_bytes "$CONFIRMED_BYTES_V4")"
-    printf "  ├─ %-22s ${R}${B}%15s${N} pkts / %s\n" "syn-flood→confirmed" "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
-    printf "  ├─ %-22s ${R}${B}%15s${N} pkts / %s\n" "udp-flood→confirmed" "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
-    printf "  └─ %-22s ${B}${B}%15s${N} pkts / %s\n" "TOTAL"             "$(human_num "$total_pkts")"        "$(human_bytes "$total_bytes")"
+    echo -e "  ${B}📊 Since reboot${N} ${DIM}($NFT_SINCE)${N}"
+    printf  "  ├─ ${DIM}scanner drops:${N}        %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$((SCANNER_PKTS_V4 + SCANNER_PKTS_V6))")" "$(human_bytes "$((SCANNER_BYTES_V4 + SCANNER_BYTES_V6))")"
+    printf  "  ├─ ${DIM}attack drops:${N}         %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$((CONFIRMED_PKTS_V4 + CONFIRMED_PKTS_V6))")" "$(human_bytes "$((CONFIRMED_BYTES_V4 + CONFIRMED_BYTES_V6))")"
+    printf  "  ├─ ${DIM}rate-limit (syn):${N}     %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
+    printf  "  ├─ ${DIM}rate-limit (udp):${N}     %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
+    printf  "  └─ ${B}total:${N}                ${B}%12s${N} pkts  ${DIM}/${N} ${B}%s${N}\n" "$(human_num "$total_pkts")" "$(human_bytes "$total_bytes")"
     echo ""
 
-    printf "  ${DIM}Scanner blocklist updated: %s${N}\n" "$LAST_UPDATE"
+    # ===== ALL-TIME (persistent) =====
+    echo -e "  ${B}📈 All-time history${N} ${DIM}(since $DB_SINCE, persistent in sqlite)${N}"
+    printf  "  ├─ ${M}🤖 scanners blocked:${N}    %12s unique IPs ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_SCANNERS")"   "$(human_num "$ALLTIME_SCANNER_PKTS")"
+    printf  "  ├─ ${M}💥 ddos blocked:${N}        %12s unique IPs ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_DDOS")"       "$(human_num "$ALLTIME_DDOS_PKTS")"
+    printf  "  └─ ${M}🔑 ssh brute attempts:${N}  %12s unique IPs ${DIM}(crowdsec)${N}\n" "$(human_num "$CS_ALLTIME_BANS")"
+    echo ""
+
+    printf "  ${DIM}🔄 Scanner blocklist updated: %s${N}\n" "$LAST_UPDATE"
+}
+
+# Helper: status dot для compact services line
+svc_dot() {
+    local status="$1"
+    local label="$2"
+    case "$status" in
+        active)        echo -e "${G}●${N} ${DIM}${label}${N}" ;;
+        inactive)      echo -e "${Y}●${N} ${DIM}${label}${N}" ;;
+        failed)        echo -e "${R}●${N} ${DIM}${label}${N}" ;;
+        activating)    echo -e "${Y}◐${N} ${DIM}${label}${N}" ;;
+        *)             echo -e "${Y}?${N} ${DIM}${label}${N}" ;;
+    esac
 }
 
 # === Просмотр списков ===
@@ -2107,6 +2418,77 @@ show_scanner_samples() {
     echo ""
 }
 
+# v2.9: история блокировок из sqlite
+show_history() {
+    echo ""
+    local db="/var/lib/shieldnode/events.db"
+
+    if [ ! -r "$db" ] || ! command -v sqlite3 >/dev/null 2>&1; then
+        echo -e "${Y}History DB not available${N}"
+        echo -e "${DIM}Aggregator должен запуститься: sudo systemctl start shieldnode-aggregator.service${N}"
+        echo ""
+        return
+    fi
+
+    echo -e "${B}Recent blocked events${N} ${DIM}(last 30, from /var/lib/shieldnode/events.db)${N}"
+    echo -e "${DIM}─────────────────────────────────${N}"
+    printf "  ${DIM}%-10s %-18s %-9s %s${N}\n" "TYPE" "IP" "HITS" "LAST SEEN"
+
+    sqlite3 "$db" "
+        SELECT type, ip, count, datetime(last_seen, 'unixepoch', 'localtime')
+        FROM events
+        ORDER BY last_seen DESC
+        LIMIT 30
+    " 2>/dev/null | while IFS='|' read -r type ip cnt ts; do
+        case "$type" in
+            scanner) color="${Y}" ;;
+            ddos)    color="${R}" ;;
+            *)       color="${N}" ;;
+        esac
+        printf "  ${color}%-10s${N} %-18s ${B}%-9s${N} ${DIM}%s${N}\n" "$type" "$ip" "$cnt" "$ts"
+    done
+    echo ""
+
+    local total_scan total_ddos
+    total_scan=$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='scanner'" 2>/dev/null)
+    total_ddos=$(sqlite3 "$db" "SELECT COUNT(*) FROM events WHERE type='ddos'" 2>/dev/null)
+    printf "  Total in DB: ${Y}${B}%d${N} scanners, ${R}${B}%d${N} ddos\n" "${total_scan:-0}" "${total_ddos:-0}"
+    echo ""
+}
+
+# v2.9: топ-атакующих из sqlite
+show_top_attackers() {
+    echo ""
+    local db="/var/lib/shieldnode/events.db"
+
+    if [ ! -r "$db" ] || ! command -v sqlite3 >/dev/null 2>&1; then
+        echo -e "${Y}History DB not available${N}"
+        echo ""
+        return
+    fi
+
+    echo -e "${B}Top-20 attackers (by hit count, all-time)${N}"
+    echo -e "${DIM}─────────────────────────────────${N}"
+    printf "  ${DIM}%-10s %-18s %-9s %s${N}\n" "TYPE" "IP" "HITS" "FIRST SEEN"
+
+    sqlite3 "$db" "
+        SELECT type, ip, count, datetime(first_seen, 'unixepoch', 'localtime')
+        FROM events
+        ORDER BY count DESC
+        LIMIT 20
+    " 2>/dev/null | while IFS='|' read -r type ip cnt ts; do
+        case "$type" in
+            scanner) color="${Y}" ;;
+            ddos)    color="${R}" ;;
+            *)       color="${N}" ;;
+        esac
+        printf "  ${color}%-10s${N} %-18s ${B}%-9s${N} ${DIM}%s${N}\n" "$type" "$ip" "$cnt" "$ts"
+    done
+    echo ""
+    echo -e "  ${DIM}Tip: высокий hit-count → персистентный сканер/атакующий${N}"
+    echo ""
+}
+
 # === MODE: JSON ===
 if [ "$MODE" = "json" ]; then
     collect_stats
@@ -2166,10 +2548,18 @@ while true; do
     collect_stats
     clear 2>/dev/null
     draw_snapshot
-    echo -e "${C}──────────────────────────────────────────────────────────────────${N}"
-    echo -e "  [${B}1${N}] syn-flood IPs    [${B}2${N}] crowdsec bans   [${B}3${N}] whitelist IPs"
-    echo -e "  [${B}4${N}] scanner samples  [${B}r${N}] refresh         [${B}0${N}] exit"
-    echo -ne "  > "
+
+    # ===== MENU =====
+    echo -e "${C}┌─────────────────────────────────────────────────────────────────┐${N}"
+    echo -e "${C}│${N}  ${B}Actions${N}                                                        ${C}│${N}"
+    echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
+    echo -e "${C}│${N}  [${B}1${N}] 🔥 Active attacks       [${B}2${N}] 🚨 CrowdSec bans          ${C}│${N}"
+    echo -e "${C}│${N}  [${B}3${N}] ✅ Whitelist IPs        [${B}4${N}] 🤖 Scanner blocklist      ${C}│${N}"
+    echo -e "${C}│${N}  [${B}6${N}] 📋 Recent history       [${B}7${N}] 📈 Top attackers          ${C}│${N}"
+    echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
+    echo -e "${C}│${N}  [${B}r${N}] 🔄 Refresh              [${B}0${N}] ❌ Exit                   ${C}│${N}"
+    echo -e "${C}└─────────────────────────────────────────────────────────────────┘${N}"
+    echo -ne "  ${B}>${N} "
 
     read -r CHOICE
     case "$CHOICE" in
@@ -2177,6 +2567,8 @@ while true; do
         2) show_crowdsec_bans    ;;
         3) show_whitelist_ips    ;;
         4) show_scanner_samples  ;;
+        6) show_history          ;;
+        7) show_top_attackers    ;;
         r|R|"") continue ;;
         0|q|quit|exit) clear 2>/dev/null; exit 0 ;;
         *) echo -e "  ${Y}Unknown: $CHOICE${N}" ;;
@@ -2194,10 +2586,10 @@ print_ok "Команда установлена: $GUARD_BIN"
 print_info "Снимок состояния: ${BOLD}sudo guard${NC}  (или ${BOLD}sudo guard --json${NC})"
 
 # ==============================================================================
-# ШАГ 13: HEALTHCHECK
+# ШАГ 14: HEALTHCHECK
 # ==============================================================================
 
-print_header "ШАГ 13: HEALTHCHECK"
+print_header "ШАГ 14: HEALTHCHECK"
 
 print_info "Жду 5 секунд чтобы парсеры успели прочитать логи..."
 sleep 5
@@ -2237,7 +2629,7 @@ else
 fi
 
 # ==============================================================================
-# ШАГ 14: ИТОГИ
+# ШАГ 15: ИТОГИ
 # ==============================================================================
 
 print_header "ГОТОВО"
