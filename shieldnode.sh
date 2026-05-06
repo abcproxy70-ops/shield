@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.1 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v3.2 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - CrowdSec (SSH brute-force + community blocklist)
@@ -11,6 +11,17 @@
 #
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
+#
+#  v3.2 changelog (UI polish + актуализация документации):
+#    - FIX: рамки меню в guard съезжали из-за 2-cell ширины эмодзи в терминалах.
+#      Решение: убраны эмодзи из меню, оставлены только в заголовках разделов.
+#      Теперь рамки выровнены везде (xterm/screen/tmux/ssh-клиенты).
+#    - FIX: footer установки содержал устаревшую информацию:
+#      • "60/sec burst 100" → теперь правильно "300/sec burst 500" (v2.5+)
+#      • "Удалить: bash vpn-node-ddos-protect-v1_5.sh" → актуальная версия
+#      • Добавлено упоминание ban-once архитектуры
+#      • Добавлено упоминание SKIPA blocklist + MISP/CIRCL
+#      • Добавлены команды для управления историей блокировок
 #
 #  v3.1 changelog (КРИТИЧЕСКИЙ FIX UFW conflict):
 #    - FIX: после установки скрипта UFW переставал работать после ребута.
@@ -2310,9 +2321,10 @@ draw_snapshot() {
     local hn=$(hostname -s 2>/dev/null)
 
     # ===== HERO HEADER =====
+    # v3.2: убран эмодзи 🛡 — занимает 2 cells, ломает выравнивание правой ║
     echo ""
     echo -e "${C}╔══════════════════════════════════════════════════════════════════╗${N}"
-    printf "${C}║${N}  ${B}🛡  SHIELDNODE${N} ${DIM}·${N} ${C}%-13s${N} ${DIM}·${N} %s ${DIM}·${N} %s  ${C}║${N}\n" "$ip" "$hn" "$now"
+    printf "${C}║${N}  ${B}SHIELDNODE${N} ${DIM}·${N} ${C}%-15s${N} ${DIM}·${N} %s ${DIM}·${N} %s    ${C}║${N}\n" "$ip" "$hn" "$now"
     echo -e "${C}╚══════════════════════════════════════════════════════════════════╝${N}"
 
     # ===== HERO STATS (3 колонки) =====
@@ -2605,14 +2617,15 @@ while true; do
     draw_snapshot
 
     # ===== MENU =====
+    # v3.2: убраны эмодзи из меню — они занимают 2-cell в терминале и ломают рамки
     echo -e "${C}┌─────────────────────────────────────────────────────────────────┐${N}"
     echo -e "${C}│${N}  ${B}Actions${N}                                                        ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
-    echo -e "${C}│${N}  [${B}1${N}] 🔥 Active attacks       [${B}2${N}] 🚨 CrowdSec bans          ${C}│${N}"
-    echo -e "${C}│${N}  [${B}3${N}] ✅ Whitelist IPs        [${B}4${N}] 🤖 Scanner blocklist      ${C}│${N}"
-    echo -e "${C}│${N}  [${B}6${N}] 📋 Recent history       [${B}7${N}] 📈 Top attackers          ${C}│${N}"
+    echo -e "${C}│${N}  [${B}1${N}] Active attacks         [${B}2${N}] CrowdSec bans                   ${C}│${N}"
+    echo -e "${C}│${N}  [${B}3${N}] Whitelist IPs          [${B}4${N}] Scanner blocklist               ${C}│${N}"
+    echo -e "${C}│${N}  [${B}6${N}] Recent history         [${B}7${N}] Top attackers                   ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
-    echo -e "${C}│${N}  [${B}r${N}] 🔄 Refresh              [${B}0${N}] ❌ Exit                   ${C}│${N}"
+    echo -e "${C}│${N}  [${B}r${N}] Refresh                [${B}0${N}] Exit                            ${C}│${N}"
     echo -e "${C}└─────────────────────────────────────────────────────────────────┘${N}"
     echo -ne "  ${B}>${N} "
 
@@ -2746,18 +2759,24 @@ else
 fi
 
 echo -e "  ${BOLD}Многоуровневая защита (по приоритету):${NC}"
-echo -e "  1. ${CYAN}Manual whitelist${NC}      → твои runtime-добавленные IP"
+echo -e "  1. ${CYAN}Manual whitelist${NC}      → доверенные IP (management из UFW + manual)"
 echo -e "  2. ${CYAN}SSH (порт $SSH_PORT)${NC}      → пропуск (защищает CrowdSec)"
-echo -e "  3. ${CYAN}Scanner blocklist${NC}     → drop известных сканеров (Shodan, Censys, gov)"
-echo -e "  4. ${CYAN}SYN-flood rate-limit${NC}  → 60/sec burst 100 на Xray (CGNAT-friendly)"
-echo -e "  5. ${CYAN}CrowdSec bouncer${NC}      → бан по поведению (SSH brute-force only)"
+echo -e "  3. ${CYAN}Scanner blocklist${NC}     → drop ${BOLD}~3000${NC} известных сканеров"
+echo -e "      ├─ shadow-netlab/traffic-guard-lists (общие: Shodan, Censys, gov)"
+echo -e "      ├─ tread-lightly/CyberOK_Skipa_ips (SKIPA, ГРЧЦ, НКЦКИ)"
+echo -e "      └─ MISP/CIRCL warninglists (honeypot-verified)"
+echo -e "  4. ${CYAN}Confirmed attack${NC}      → drop IP подтверждённых атакующих (1 час)"
+echo -e "  5. ${CYAN}Rate-limit ban-once${NC}   → 1й удар = suspect (5 мин), 2й = бан"
+echo -e "      ├─ TCP SYN: ${BOLD}300/sec burst 500${NC} (CGNAT-friendly)"
+echo -e "      └─ UDP:     ${BOLD}600/sec burst 1000${NC}"
+echo -e "  6. ${CYAN}CrowdSec bouncer${NC}      → бан по поведению (SSH brute, regreSSHion)"
 echo ""
 echo -e "  ${BOLD}${GREEN}User-friendly defaults:${NC}"
-echo -e "  ${GREEN}✔${NC} Юзеры за CGNAT (мобильные операторы) не банятся — лимит 60/sec"
+echo -e "  ${GREEN}✔${NC} CGNAT юзеры (МТС/Билайн/МегаФон) не банятся — лимит 300/sec на IP"
+echo -e "  ${GREEN}✔${NC} Ban-once архитектура: случайный всплеск ≠ бан, два подряд = бан"
 echo -e "  ${GREEN}✔${NC} Профили с несколькими Xray-портами не банятся как 'port-scan'"
-echo -e "  ${GREEN}✔${NC} Ложные баны живут 4h вместо 24h"
-echo -e "  ${GREEN}✔${NC} Юзеры из подсетей в blocklist (~0.007% всего IPv4) — это"
-echo -e "      реальные госсканеры/Shodan/Censys, не домашние пользователи"
+echo -e "  ${GREEN}✔${NC} Ложные баны от CrowdSec живут 4h вместо 24h"
+echo -e "  ${GREEN}✔${NC} Юзеры из подсетей в blocklist — реально госсканеры, не домашние"
 echo ""
 echo -e "  ${BOLD}Как работает auto-whitelist:${NC}"
 echo -e "  1. Заходишь по SSH с приватным ключом с ЛЮБОГО IP"
@@ -2768,36 +2787,44 @@ echo -e "  5. IP сменился → новый заход по ключу → 
 echo -e "  ${MAGENTA}ℹ${NC} Безопасно даже при включённом password-auth: ловится ТОЛЬКО"
 echo -e "     'Accepted publickey'. Юзер с подобранным паролем НЕ попадёт в whitelist."
 echo ""
+echo -e "  ${BOLD}История блокировок (v2.9+):${NC}"
+echo -e "  ├─ ${CYAN}/var/lib/shieldnode/events.db${NC} — sqlite БД с историей всех IP"
+echo -e "  ├─ Агрегатор парсит journald раз в минуту, бесплатно по CPU"
+echo -e "  ├─ В guard: кнопка [6] history, [7] top attackers"
+echo -e "  └─ Smetka: \`sqlite3 /var/lib/shieldnode/events.db 'SELECT * FROM events'\`"
+echo ""
 echo -e "  ${BOLD}Полезные команды:${NC}"
-echo -e "  ${CYAN}cscli decisions list --type whitelist${NC}              # текущие whitelist'ы"
-echo -e "  ${CYAN}cscli decisions list --type ban${NC}                    # активные баны"
-echo -e "  ${CYAN}journalctl -u cs-ssh-whitelist -f${NC}                  # логи SSH-watcher'а"
-echo -e "  ${CYAN}journalctl -u scanner-blocklist-update${NC}             # логи blocklist updater"
-echo -e "  ${CYAN}systemctl list-timers scanner-blocklist-update${NC}     # когда след. обновление"
-echo -e "  ${CYAN}journalctl -t protected-ports${NC}                       # логи синхронизации портов"
-echo -e "  ${CYAN}systemctl status protected-ports-update.path${NC}        # статус inotify-watcher'а"
-echo -e "  ${CYAN}cscli metrics${NC}                                      # статистика парсеров"
-echo -e "  ${CYAN}nft list set inet ddos_protect syn_flood_v4${NC}        # SYN-флуд бан-сет"
+echo -e "  ${CYAN}sudo guard${NC}                                          # дашборд"
+echo -e "  ${CYAN}cscli decisions list --type whitelist${NC}               # whitelist'ы"
+echo -e "  ${CYAN}cscli decisions list --type ban${NC}                     # активные баны"
+echo -e "  ${CYAN}journalctl -u cs-ssh-whitelist -f${NC}                   # логи SSH-watcher'а"
+echo -e "  ${CYAN}journalctl -u scanner-blocklist-update${NC}              # логи blocklist updater"
+echo -e "  ${CYAN}journalctl -t shieldnode-agg${NC}                        # логи агрегатора"
+echo -e "  ${CYAN}systemctl list-timers${NC}                               # когда след. обновления"
+echo -e "  ${CYAN}cscli metrics${NC}                                       # статистика парсеров"
+echo -e "  ${CYAN}nft list set inet ddos_protect confirmed_attack_v4${NC}  # подтверждённые баны"
 echo -e "  ${CYAN}nft list set inet ddos_protect scanner_blocklist_v4 | wc -l${NC}  # размер blocklist"
 echo ""
-echo -e "  ${BOLD}Принудительное обновление blocklist:${NC}"
-echo -e "  ${CYAN}systemctl start scanner-blocklist-update.service${NC}"
+echo -e "  ${BOLD}Принудительное обновление:${NC}"
+echo -e "  ${CYAN}systemctl start scanner-blocklist-update.service${NC}    # обновить blocklist сейчас"
+echo -e "  ${CYAN}systemctl start shieldnode-aggregator.service${NC}       # обновить историю сейчас"
 echo ""
 echo -e "  ${BOLD}Если потерял доступ и забанен:${NC}"
 echo -e "  Зайти через консоль провайдера (KVM/VNC) и:"
 echo -e "  ${CYAN}cscli decisions delete --ip <твой_IP>${NC}"
-echo -e "  ${CYAN}nft add element inet ddos_protect manual_whitelist_v4 { <твой_IP> }${NC}"
+echo -e "  ${CYAN}nft delete element inet ddos_protect confirmed_attack_v4 { <IP> }${NC}"
+echo -e "  ${CYAN}nft add element inet ddos_protect manual_whitelist_v4 { <IP> }${NC}"
 echo ""
 echo -e "  ${BOLD}Бэкап:${NC} ${CYAN}$BACKUP_DIR${NC}"
 echo ""
 # v1.5 fix: при запуске через pipe (curl ... | bash) или process substitution
-# $0 может быть /dev/fd/63 — некрасиво в выводе. Используем имя файла
-# скрипта если оно валидное, иначе показываем generic-команду.
+# $0 может быть /dev/fd/63 — некрасиво в выводе. Используем generic-команду.
 SCRIPT_NAME="$0"
 case "$SCRIPT_NAME" in
     /dev/fd/*|/proc/*|bash|-bash|sh|-sh)
-        SCRIPT_NAME="vpn-node-ddos-protect-v1_5.sh"
+        SCRIPT_NAME="shieldnode.sh"
         ;;
 esac
 echo -e "  ${BOLD}Удалить всё:${NC} ${CYAN}sudo bash $SCRIPT_NAME --uninstall${NC}"
+echo -e "  ${DIM}или: bash <(curl -sL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode.sh) --uninstall${NC}"
 echo ""
