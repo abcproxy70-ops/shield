@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.6 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v3.7 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables connection-flood + slowloris защита (ct count + new-conn rate)
@@ -14,6 +14,23 @@
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
 #  Совместимо с vpn-node-setup.sh v4.0 (XanMod + IPv6 disabled).
+#
+#  v3.7 changelog (standalone-ready: shieldnode работает БЕЗ vpn-node-setup.sh):
+#    - ADD: shieldnode теперь сам ставит критичные security sysctl, скопированные
+#      из vpn-node-setup.sh (один-в-один значения). Скрипт перестал зависеть от
+#      порядка установки — защита работает даже если setup запускался раньше,
+#      позже или вообще не ставился. Скопированы 9 ключей:
+#        • tcp_syncookies=1, tcp_rfc1337=1
+#        • rp_filter=2 (loose, all+default — обязательно для VPN-форвардинга)
+#        • accept_redirects=0 (all+default)
+#        • send_redirects=0 (all+default)
+#        • icmp_echo_ignore_broadcasts=1
+#      Все значения проверены на безопасность для VPN-нагрузки (Reality/sing-box
+#      /Hysteria/TUIC) — не ломают форвардинг, mux, мобильных клиентов, CGNAT.
+#    - CHANGE: /etc/sysctl.d/99-shieldnode.conf → /etc/sysctl.d/90-shieldnode.conf.
+#      Префикс 90 < 99 — теперь vpn-node-setup.sh (99-xray-tuning) грузится
+#      ПОСЛЕ нас. При любых будущих коллизиях по ключам setup всегда выигрывает.
+#      Если на сервере был старый 99-shieldnode.conf — uninstall чистит оба имени.
 #
 #  v3.6 changelog (compatibility с vpn-node-setup.sh + IPv6 dropped):
 #    - REMOVED: ВСЯ IPv6-логика. Причина: vpn-node-setup.sh отключает IPv6
@@ -352,9 +369,15 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /etc/logrotate.d/shieldnode
     print_ok "Логи и logrotate-конфиг удалены"
 
-    # Sysctl hardening (v3.3)
-    if [ -f /etc/sysctl.d/99-shieldnode.conf ]; then
-        rm -f /etc/sysctl.d/99-shieldnode.conf
+    # Sysctl hardening (v3.3+, оба имени файла — старое 99 и новое 90 из v3.7)
+    REMOVED_SYSCTL=0
+    for f in /etc/sysctl.d/99-shieldnode.conf /etc/sysctl.d/90-shieldnode.conf; do
+        if [ -f "$f" ]; then
+            rm -f "$f"
+            REMOVED_SYSCTL=1
+        fi
+    done
+    if [ "$REMOVED_SYSCTL" = "1" ]; then
         sysctl --system >/dev/null 2>&1 || true
         print_ok "Sysctl hardening удалён (применятся defaults)"
     fi
@@ -530,27 +553,67 @@ fi
 
 # 2) Sysctl kernel hardening
 print_status "Применяю sysctl kernel hardening..."
-SYSCTL_FILE="/etc/sysctl.d/99-shieldnode.conf"
-cat > "$SYSCTL_FILE" <<'SYSCTL_EOF'
-# Shieldnode kernel hardening v3.6
-# Только то, что НЕ покрыто vpn-node-setup.sh.
-# Перекрывающиеся ключи (tcp_syncookies, tcp_max_syn_backlog, tcp_rfc1337,
-# rp_filter, accept_redirects, send_redirects, icmp_echo_ignore_broadcasts,
-# nf_conntrack_*) — зона ответственности vpn-node-setup.sh, мы их не трогаем.
 
-# === SYN-flood mitigation (дополнительно к syncookies из setup) ===
-# Сколько раз отправлять SYN+ACK перед сдачей (по умолчанию 5 — слишком много)
+# v3.7: миграция со старого имени 99-shieldnode.conf → 90-shieldnode.conf.
+# Префикс 90 < 99, теперь vpn-node-setup.sh (99-xray-tuning) грузится ПОСЛЕ нас
+# и при коллизиях побеждает (но коллизий быть не должно — setup ставит те же
+# значения что и мы, см. блок ниже).
+if [ -f /etc/sysctl.d/99-shieldnode.conf ]; then
+    rm -f /etc/sysctl.d/99-shieldnode.conf
+    print_info "Удалён старый /etc/sysctl.d/99-shieldnode.conf (миграция v3.7)"
+fi
+
+SYSCTL_FILE="/etc/sysctl.d/90-shieldnode.conf"
+cat > "$SYSCTL_FILE" <<'SYSCTL_EOF'
+# Shieldnode kernel hardening v3.7
+# Префикс 90 — это базовая security-полка. vpn-node-setup.sh (99-xray-tuning)
+# может перетереть отдельные ключи, если у оператора другие приоритеты.
+#
+# v3.7: shieldnode стал standalone. Раньше критичные security-ключи
+# (rp_filter, syncookies, redirects, ...) ставил только vpn-node-setup.sh,
+# из-за чего без него shieldnode работал на дефолтах ядра (rp_filter=1
+# strict — ломал VPN-форвардинг). Теперь shieldnode сам пишет минимум,
+# нужный для своей работы. Значения скопированы из vpn-node-setup.sh
+# один-в-один — конфликта не будет.
+#
+# Зону ответственности setup'а (BBRv3, qdisc=fq, conntrack tuning, buffer
+# sizes, file-max, swappiness, ip_forward, ephemeral ports, keepalives,
+# tcp_max_syn_backlog, tcp_tw_reuse) shieldnode НЕ трогает.
+
+# === SYN-flood mitigation ===
+# SYN cookies (kernel сам активирует когда backlog переполнен)
+net.ipv4.tcp_syncookies = 1
+# Сколько раз отправлять SYN+ACK перед сдачей (по умолчанию 5 — слишком долго под flood)
 net.ipv4.tcp_synack_retries = 2
 # Сколько раз ретраить SYN при исходящих (по умолчанию 6)
 net.ipv4.tcp_syn_retries = 3
 
-# === Source routing (древняя угроза, всё ещё актуально) ===
+# === IP-spoofing mitigation ===
+# Reverse path filter (RFC 3704), режим 2 = loose.
+# КРИТИЧНО для VPN: режим 1 (strict) дропает asymmetric routing
+# (пакет приходит на eth0, ответ через tun0 — нормально для VPN).
+# Режим 2 защищает от spoofing и при этом не ломает форвардинг.
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+# Source routing — древняя угроза, отключаем
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
+# ICMP redirects — могут использоваться для атак (man-in-the-middle)
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+# VPN-нода — forwarding-роутер, ICMP redirects слать не должна
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
 
 # === ICMP hardening ===
-# Игнорировать bogus ICMP responses (setup уже игнорит broadcast)
+# Игнорировать broadcast ping (smurf-атаки)
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+# Игнорировать bogus ICMP responses
 net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# === TCP hardening ===
+# Защита от TIME_WAIT assassination (RFC 1337)
+net.ipv4.tcp_rfc1337 = 1
 
 # === Logging ===
 # Логировать martian packets (странные source IP — ранний сигнал атаки)
