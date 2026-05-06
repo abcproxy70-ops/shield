@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v2.0 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v2.3 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - CrowdSec (SSH brute-force + community blocklist)
@@ -11,6 +11,24 @@
 #
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
+#
+#  v2.2 changelog:
+#    - ADD: автоматический whitelist management-IP из правил фаервола.
+#      Любое правило 'ufw allow X/tcp from <IP>' → IP попадает в
+#      manual_whitelist_v4 — он не подвергается rate-limit и сканер-проверкам.
+#      Это для случаев когда управляющий сервер (Marzban/3X-UI/Remnawave)
+#      делает много запросов к ноде. Раньше нужно было вручную добавлять
+#      `nft add element manual_whitelist_v4 { IP }` после установки.
+#    - ADD: management IP синхронизируются протекторс-вотчером каждые 60s
+#      (или мгновенно через path-unit при изменениях UFW).
+#
+#  v2.1 changelog (bugfixes):
+#    - FIX: guard показывал "—" в защищаемых портах если nft возвращал
+#      многострочный elements (порты переносились на новую строку при
+#      выводе). Парсер не учитывал переносы. Добавлен tr перед grep.
+#    - FIX: cs-ssh-whitelist падал в цикле restart из-за ProtectSystem=strict
+#      и попытки mkdir /run/cs-ssh-whitelist (debounce dir из v1.9).
+#      Добавлен RuntimeDirectory + ReadWritePaths.
 #
 #  v2.0 changelog:
 #    - REMOVED: live-обновление дашборда (interactive mode с циклом).
@@ -341,6 +359,8 @@ detect_firewall_ports() {
     local fw="$1"
     local tcp_list=""
     local udp_list=""
+    local mgmt_ipv4=""
+    local mgmt_ipv6=""
 
     case "$fw" in
         ufw)
@@ -349,7 +369,7 @@ detect_firewall_ports() {
             ufw_out=$(ufw status 2>/dev/null)
             # Парсим строки с ALLOW для не-v6 (v6-правила дублируют v4 в UFW по умолчанию)
             tcp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ {
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
                     pp = $1
                     if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
                         n = split(pp, a, "/")
@@ -361,7 +381,7 @@ detect_firewall_ports() {
             ' | sort -un | tr '\n' ',' | sed 's/,$//')
 
             udp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ {
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
                     pp = $1
                     if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
                         n = split(pp, a, "/")
@@ -371,6 +391,20 @@ detect_firewall_ports() {
                     }
                 }
             ' | sort -un | tr '\n' ',' | sed 's/,$//')
+
+            # v2.2: management IPs из правил "ALLOW from <IP>"
+            # Формат: "2222/tcp  ALLOW  213.165.55.166" (3й колонкой идёт IP вместо Anywhere)
+            mgmt_ipv4=$(echo "$ufw_out" | awk '
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 != "Anywhere" {
+                    if ($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $3
+                }
+            ' | sort -u | tr '\n' ',' | sed 's/,$//')
+
+            mgmt_ipv6=$(echo "$ufw_out" | awk '
+                $2 == "ALLOW" {
+                    if ($3 ~ /:/ && $3 !~ /^Anywhere/) print $3
+                }
+            ' | sort -u | tr '\n' ',' | sed 's/,$//')
             ;;
 
         firewalld)
@@ -458,12 +492,16 @@ detect_firewall_ports() {
 
     echo "$tcp_list"
     echo "$udp_list"
+    echo "$mgmt_ipv4"
+    echo "$mgmt_ipv6"
 }
 
 # Получаем сырые списки портов из фаервола
 FW_OUTPUT=$(detect_firewall_ports "$FIREWALL_TYPE")
 RAW_TCP=$(echo "$FW_OUTPUT" | sed -n '1p')
 RAW_UDP=$(echo "$FW_OUTPUT" | sed -n '2p')
+MGMT_IPV4=$(echo "$FW_OUTPUT" | sed -n '3p')
+MGMT_IPV6=$(echo "$FW_OUTPUT" | sed -n '4p')
 
 # Определяем SSH порт чтобы исключить его из защиты
 SSH_PORT=$(ss -tlnpH 2>/dev/null | awk '
@@ -501,6 +539,14 @@ else
     print_info "В фаерволе нет открытых UDP-портов (Hysteria/TUIC/QUIC будет нечего защищать)"
 fi
 
+# v2.2: автоматический whitelist для management-IP (правила "ALLOW from <IP>")
+if [ -n "$MGMT_IPV4" ]; then
+    print_ok "Management IPv4 (auto-whitelist): ${BOLD}$MGMT_IPV4${NC}"
+fi
+if [ -n "$MGMT_IPV6" ]; then
+    print_ok "Management IPv6 (auto-whitelist): ${BOLD}$MGMT_IPV6${NC}"
+fi
+
 if [ -z "$PROTECTED_TCP" ] && [ -z "$PROTECTED_UDP" ]; then
     print_error ""
     print_error "В фаерволе нет открытых портов (кроме SSH)."
@@ -513,6 +559,16 @@ fi
 XRAY_PORTS_TCP="$PROTECTED_TCP"
 XRAY_PORTS_UDP="$PROTECTED_UDP"
 XRAY_PORTS=$(echo "${XRAY_PORTS_TCP},${XRAY_PORTS_UDP}" | tr ',' '\n' | grep -v '^$' | sort -un | tr '\n' ',' | sed 's/,$//')
+
+# v2.2: management IPs для nft set
+MANUAL_WHITELIST_V4_INIT=""
+MANUAL_WHITELIST_V6_INIT=""
+if [ -n "$MGMT_IPV4" ]; then
+    MANUAL_WHITELIST_V4_INIT="        elements = { $(echo "$MGMT_IPV4" | sed 's/,/, /g') }"
+fi
+if [ -n "$MGMT_IPV6" ]; then
+    MANUAL_WHITELIST_V6_INIT="        elements = { $(echo "$MGMT_IPV6" | sed 's/,/, /g') }"
+fi
 
 # Инициализирующие elements для nft-set
 nft_set_init() {
@@ -696,16 +752,20 @@ $XRAY_PORTS_UDP_INIT
     }
 
     # --- Manual whitelist ---
-    # nft add element inet ddos_protect manual_whitelist_v4 { 1.2.3.4 }
+    # Авто-заполняется management-IP из правил UFW "ALLOW from <IP>".
+    # Также можно добавить вручную:
+    #   nft add element inet ddos_protect manual_whitelist_v4 { 1.2.3.4 }
     set manual_whitelist_v4 {
         type ipv4_addr
         flags interval
         auto-merge
+$MANUAL_WHITELIST_V4_INIT
     }
     set manual_whitelist_v6 {
         type ipv6_addr
         flags interval
         auto-merge
+$MANUAL_WHITELIST_V6_INIT
     }
 
     chain prerouting {
@@ -810,13 +870,15 @@ detect_firewall_ports() {
     local fw="$1"
     local tcp_list=""
     local udp_list=""
+    local mgmt_ipv4=""
+    local mgmt_ipv6=""
 
     case "$fw" in
         ufw)
             local ufw_out
             ufw_out=$(ufw status 2>/dev/null)
             tcp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ {
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
                     pp = $1
                     if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
                         n = split(pp, a, "/")
@@ -827,7 +889,7 @@ detect_firewall_ports() {
                 }
             ' | sort -un | tr '\n' ',' | sed 's/,$//')
             udp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ {
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
                     pp = $1
                     if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
                         n = split(pp, a, "/")
@@ -837,12 +899,28 @@ detect_firewall_ports() {
                     }
                 }
             ' | sort -un | tr '\n' ',' | sed 's/,$//')
+            # v2.2: management IPs
+            mgmt_ipv4=$(echo "$ufw_out" | awk '
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 != "Anywhere" {
+                    if ($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $3
+                }
+            ' | sort -u | tr '\n' ',' | sed 's/,$//')
+            mgmt_ipv6=$(echo "$ufw_out" | awk '
+                $2 == "ALLOW" {
+                    if ($3 ~ /:/ && $3 !~ /^Anywhere/) print $3
+                }
+            ' | sort -u | tr '\n' ',' | sed 's/,$//')
             ;;
         firewalld)
             local fw_out
             fw_out=$(firewall-cmd --list-ports 2>/dev/null)
             tcp_list=$(echo "$fw_out" | tr ' ' '\n' | awk -F/ '$2=="tcp"{print $1}' | sort -un | tr '\n' ',' | sed 's/,$//')
             udp_list=$(echo "$fw_out" | tr ' ' '\n' | awk -F/ '$2=="udp"{print $1}' | sort -un | tr '\n' ',' | sed 's/,$//')
+            # firewalld --list-rich-rules может содержать source address
+            local rich_rules
+            rich_rules=$(firewall-cmd --list-rich-rules 2>/dev/null)
+            mgmt_ipv4=$(echo "$rich_rules" | grep -oE 'address="[0-9.]+(/[0-9]+)?"' | \
+                grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u | tr '\n' ',' | sed 's/,$//')
             ;;
         iptables)
             tcp_list=$(iptables -S INPUT 2>/dev/null | awk '/-j ACCEPT/ && /-p tcp/ {
@@ -855,6 +933,13 @@ detect_firewall_ports() {
                     if ($i == "--dport" || $i == "--dports") print $(i+1)
                 }
             }' | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
+            # iptables: -s <IP>/-s <IP/CIDR> в ACCEPT-правилах
+            mgmt_ipv4=$(iptables -S INPUT 2>/dev/null | awk '/-j ACCEPT/ {
+                for (i=1; i<=NF; i++) {
+                    if ($i == "-s") print $(i+1)
+                }
+            }' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' | \
+                grep -v '^0\.0\.0\.0' | sort -u | tr '\n' ',' | sed 's/,$//')
             ;;
         nftables)
             local rules
@@ -868,6 +953,8 @@ detect_firewall_ports() {
 
     echo "$tcp_list"
     echo "$udp_list"
+    echo "$mgmt_ipv4"
+    echo "$mgmt_ipv6"
 }
 
 exclude_port() {
@@ -875,22 +962,27 @@ exclude_port() {
     echo ",$list," | sed "s/,$exclude,/,/g; s/^,//; s/,$//"
 }
 
-# Получаем актуальные порты
+# Получаем актуальные данные
 FW_OUTPUT=$(detect_firewall_ports "$FIREWALL_TYPE")
 NEW_TCP=$(echo "$FW_OUTPUT" | sed -n '1p')
 NEW_UDP=$(echo "$FW_OUTPUT" | sed -n '2p')
+NEW_MGMT_V4=$(echo "$FW_OUTPUT" | sed -n '3p')
+NEW_MGMT_V6=$(echo "$FW_OUTPUT" | sed -n '4p')
 
 # Исключаем SSH из TCP
 NEW_TCP=$(exclude_port "$NEW_TCP" "$SSH_PORT")
 
 # Текущее состояние nft set'ов
 CUR_TCP=$(nft list set inet ddos_protect protected_ports_tcp 2>/dev/null | \
-    grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
+    tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
 CUR_UDP=$(nft list set inet ddos_protect protected_ports_udp 2>/dev/null | \
-    grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
+    tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
+CUR_MGMT_V4=$(nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
+    tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | \
+    sort -u | tr '\n' ',' | sed 's/,$//')
 
 # Если ничего не изменилось — выходим
-if [ "$NEW_TCP" = "$CUR_TCP" ] && [ "$NEW_UDP" = "$CUR_UDP" ]; then
+if [ "$NEW_TCP" = "$CUR_TCP" ] && [ "$NEW_UDP" = "$CUR_UDP" ] && [ "$NEW_MGMT_V4" = "$CUR_MGMT_V4" ]; then
     exit 0
 fi
 
@@ -907,12 +999,21 @@ trap 'rm -f "$TMP"' EXIT
     if [ -n "$NEW_UDP" ]; then
         echo "add element inet ddos_protect protected_ports_udp { $(echo "$NEW_UDP" | sed 's/,/, /g') }"
     fi
+    # v2.2: синхронизируем management whitelist
+    echo "flush set inet ddos_protect manual_whitelist_v4"
+    if [ -n "$NEW_MGMT_V4" ]; then
+        echo "add element inet ddos_protect manual_whitelist_v4 { $(echo "$NEW_MGMT_V4" | sed 's/,/, /g') }"
+    fi
+    echo "flush set inet ddos_protect manual_whitelist_v6"
+    if [ -n "$NEW_MGMT_V6" ]; then
+        echo "add element inet ddos_protect manual_whitelist_v6 { $(echo "$NEW_MGMT_V6" | sed 's/,/, /g') }"
+    fi
 } > "$TMP"
 
 if nft -f "$TMP" 2>/dev/null; then
-    logger -t "$LOG_TAG" "Updated: TCP={$NEW_TCP} UDP={$NEW_UDP}"
+    logger -t "$LOG_TAG" "Updated: TCP={$NEW_TCP} UDP={$NEW_UDP} MGMT={$NEW_MGMT_V4}"
 else
-    logger -t "$LOG_TAG" "ERROR: failed to apply nft update for TCP={$NEW_TCP} UDP={$NEW_UDP}"
+    logger -t "$LOG_TAG" "ERROR: failed to apply nft update for TCP={$NEW_TCP} UDP={$NEW_UDP} MGMT={$NEW_MGMT_V4}"
     exit 1
 fi
 UPDATER_EOF2
@@ -1341,8 +1442,16 @@ ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/log
 # Сервису нужны: journalctl (read), cscli (запись decisions через socket).
-# cscli работает через /var/run/crowdsec/, поэтому добавляем туда write.
-ReadWritePaths=/var/run/crowdsec /run/crowdsec
+# v2.3 fix: leading "-" делает путь optional — если каталога нет, systemd
+# не падает с "Failed to set up mount namespacing". Это бывает когда
+# crowdsec ещё не создал /var/run/crowdsec (новая установка, до первого старта).
+ReadWritePaths=-/var/run/crowdsec
+ReadWritePaths=-/run/crowdsec
+# v2.1.1: дебаунс-кэш для предотвращения шторма cscli при множественных логинах
+ReadWritePaths=/run/cs-ssh-whitelist
+# Системд автоматически создаст каталог по этому пути перед стартом
+RuntimeDirectory=cs-ssh-whitelist
+RuntimeDirectoryMode=0700
 
 [Install]
 WantedBy=multi-user.target
@@ -1498,7 +1607,7 @@ print_header "ШАГ 12: УСТАНОВКА КОМАНДЫ guard"
 #   - Активные whitelist'ы
 #   - Когда последний раз обновлялся blocklist
 #
-# v2.0: команда работает в one-shot режиме — никакой фоновой нагрузки,
+# v2.1: команда работает в one-shot режиме — никакой фоновой нагрузки,
 # никаких циклов. Каждый запуск — независимый snapshot.
 #
 # Запуск:
@@ -1510,64 +1619,47 @@ GUARD_BIN="/usr/local/bin/guard"
 
 cat > "$GUARD_BIN" <<'GUARD_EOF'
 #!/bin/bash
-# guard — снимок состояния защиты VPN-ноды.
+# guard — minimalist snapshot dashboard для VPN-ноды.
 #
-# v2.0: один вызов = один снимок. Никаких циклов, никакого CPU-лоада.
-# Хочешь обновить — запусти ещё раз. Хочешь "live" — `watch -n 5 sudo guard`.
-#
-# Использование:
-#   sudo guard          — текстовый снимок (default)
-#   sudo guard --json   — JSON для интеграций (Zabbix, Prometheus, боты)
-#   sudo guard --watch  — подсказка как сделать "live" режим через watch(1)
+# v2.3: минималистичный английский интерфейс + интерактив.
+#   sudo guard            снимок + интерактивное меню (1/2/3/4/r/0)
+#   sudo guard --json     JSON для интеграций
+#   sudo guard --once     снимок без меню (для cron/мониторинга)
+#   sudo guard --help     помощь
 
-# --help и --watch не требуют root — выводим без проверки EUID
 case "${1:-}" in
-    --watch)
-        cat <<HELP
-Для "живого" режима используй стандартный watch(1):
-
-  sudo watch -n 5 guard
-
-Параметр -n задаёт интервал в секундах (5 — каждые 5 секунд).
-Чем больше интервал, тем меньше нагрузка на сервер.
-
-Альтернативы:
-  sudo guard          — снимок один раз
-  sudo guard --json   — JSON (для скриптов и мониторинга)
-
-HELP
-        exit 0
-        ;;
     --help|-h)
         cat <<HELP
-guard — дашборд защиты VPN-ноды (one-shot)
+guard — VPN node protection snapshot
 
-Использование:
-  sudo guard          — текстовый снимок состояния защиты
-  sudo guard --json   — JSON-вывод (для интеграций)
-  sudo guard --watch  — инструкция как сделать live-режим
+Usage:
+  sudo guard            snapshot + interactive menu (1/2/3/4/r/0)
+  sudo guard --once     snapshot only, no menu (for cron / monitoring)
+  sudo guard --json     JSON output (for integrations)
 
-Команда не запускает фоновых процессов и не нагружает систему между
-вызовами. Каждый запуск — независимый снимок текущего состояния.
+Interactive menu:
+  [1] show syn-flood IPs        [3] show whitelist IPs
+  [2] show crowdsec banned IPs  [4] show scanner blocklist samples
+  [r] refresh                   [0] exit
 
 HELP
         exit 0
         ;;
 esac
 
-# Для основного режима нужен root (читаем nft, cscli, sqlite)
 if [[ $EUID -ne 0 ]]; then
-    echo "Запустите через sudo: sudo guard"
+    echo "Run as root: sudo guard"
     exit 1
 fi
 
-MODE="text"
+MODE="interactive"
 case "${1:-}" in
     --json) MODE="json" ;;
+    --once) MODE="once" ;;
 esac
 
-# ANSI цвета (только для text-режима)
-if [ "$MODE" = "text" ]; then
+# ANSI цвета
+if [ "$MODE" != "json" ] && [ -t 1 ]; then
     R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
     M='\033[0;35m'; W='\033[1;37m'; B='\033[1m'; N='\033[0m'
     DIM='\033[2m'
@@ -1575,81 +1667,166 @@ else
     R=''; G=''; Y=''; C=''; M=''; W=''; B=''; N=''; DIM=''
 fi
 
-# === СБОР ВСЕХ МЕТРИК (один проход) ===
+CS_DB="/var/lib/crowdsec/data/crowdsec.db"
 
-# nft sets (быстро — < 50мс на все)
-SYN_BAN=$(nft list set inet ddos_protect syn_flood_v4 2>/dev/null | \
-    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
-SYN_BAN_V6=$(nft list set inet ddos_protect syn_flood_v6 2>/dev/null | grep -c 'expires')
-SYN_BAN_V6="${SYN_BAN_V6:-0}"
+# === СБОР МЕТРИК ===
+collect_stats() {
+    SYN_BAN=$(nft list set inet ddos_protect syn_flood_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+    SYN_BAN_V6=$(nft list set inet ddos_protect syn_flood_v6 2>/dev/null | grep -c 'expires')
+    SYN_BAN_V6="${SYN_BAN_V6:-0}"
 
-UDP_BAN=$(nft list set inet ddos_protect udp_flood_v4 2>/dev/null | \
-    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+    UDP_BAN=$(nft list set inet ddos_protect udp_flood_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
 
-PROTECTED_TCP_LIST=$(nft list set inet ddos_protect protected_ports_tcp 2>/dev/null | \
-    grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-PROTECTED_UDP_LIST=$(nft list set inet ddos_protect protected_ports_udp 2>/dev/null | \
-    grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-PROTECTED_TCP_LIST="${PROTECTED_TCP_LIST:-—}"
-PROTECTED_UDP_LIST="${PROTECTED_UDP_LIST:-—}"
+    PROTECTED_TCP_LIST=$(nft list set inet ddos_protect protected_ports_tcp 2>/dev/null | \
+        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+(-[0-9]+)?' | \
+        sort -un | tr '\n' ',' | sed 's/,$//')
+    PROTECTED_UDP_LIST=$(nft list set inet ddos_protect protected_ports_udp 2>/dev/null | \
+        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+(-[0-9]+)?' | \
+        sort -un | tr '\n' ',' | sed 's/,$//')
+    PROTECTED_TCP_LIST="${PROTECTED_TCP_LIST:-—}"
+    PROTECTED_UDP_LIST="${PROTECTED_UDP_LIST:-—}"
 
-BL_V4=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | \
-    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
-BL_V6=$(nft list set inet ddos_protect scanner_blocklist_v6 2>/dev/null | grep -cE '^\s+[0-9a-f]+:')
-BL_V6="${BL_V6:-0}"
+    BL_V4=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+    BL_V6=$(nft list set inet ddos_protect scanner_blocklist_v6 2>/dev/null | grep -cE '^\s+[0-9a-f]+:')
+    BL_V6="${BL_V6:-0}"
 
-MANUAL_WHITE=$(nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
-    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+    MANUAL_WHITE=$(nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
 
-# Сервисы (systemctl is-active быстрый, ~5мс)
-CS_ACTIVE="$(systemctl is-active crowdsec 2>/dev/null)"
-BOUNCER_ACTIVE="$(systemctl is-active crowdsec-firewall-bouncer 2>/dev/null)"
-WATCHER_ACTIVE="$(systemctl is-active cs-ssh-whitelist 2>/dev/null)"
-PORTS_PATH_ACTIVE="$(systemctl is-active protected-ports-update.path 2>/dev/null)"
+    CS_ACTIVE="$(systemctl is-active crowdsec 2>/dev/null)"
+    BOUNCER_ACTIVE="$(systemctl is-active crowdsec-firewall-bouncer 2>/dev/null)"
+    WATCHER_ACTIVE="$(systemctl is-active cs-ssh-whitelist 2>/dev/null)"
+    PORTS_PATH_ACTIVE="$(systemctl is-active protected-ports-update.path 2>/dev/null)"
 
-# Цветные индикаторы для text-режима
+    CS_BANS=0
+    CS_WHITE=0
+    if [ -r "$CS_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+        CS_BANS=$(sqlite3 "$CS_DB" "SELECT COUNT(*) FROM decisions WHERE type='ban' AND until > datetime('now')" 2>/dev/null)
+        CS_WHITE=$(sqlite3 "$CS_DB" "SELECT COUNT(*) FROM decisions WHERE type='whitelist' AND until > datetime('now')" 2>/dev/null)
+        CS_BANS="${CS_BANS:-0}"
+        CS_WHITE="${CS_WHITE:-0}"
+    elif command -v cscli >/dev/null 2>&1; then
+        CS_BANS=$(cscli decisions list --type ban -o raw 2>/dev/null | tail -n +2 | wc -l)
+        CS_WHITE=$(cscli decisions list --type whitelist -o raw 2>/dev/null | tail -n +2 | wc -l)
+    fi
+
+    LAST_UPDATE=$(systemctl show scanner-blocklist-update.service \
+        --property=ExecMainExitTimestamp --value 2>/dev/null | \
+        xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
+    LAST_UPDATE="${LAST_UPDATE:-—}"
+}
+
 fmt_status() {
     case "$1" in
-        active)        echo -e "${G}● работает${N}" ;;
-        inactive)      echo -e "${Y}● выключен${N}" ;;
-        failed)        echo -e "${R}● упал${N}" ;;
-        *)             echo -e "${Y}● $1${N}" ;;
+        active)        echo -e "${G}active${N}" ;;
+        inactive)      echo -e "${Y}inactive${N}" ;;
+        failed)        echo -e "${R}failed${N}" ;;
+        activating)    echo -e "${Y}activating${N}" ;;
+        *)             echo -e "${Y}${1:-—}${N}" ;;
     esac
 }
-CS_STATUS=$(fmt_status "$CS_ACTIVE")
-BOUNCER_STATUS=$(fmt_status "$BOUNCER_ACTIVE")
-WATCHER_STATUS=$(fmt_status "$WATCHER_ACTIVE")
-PORTS_STATUS=$(fmt_status "$PORTS_PATH_ACTIVE")
-
-# CrowdSec decisions — через sqlite3 (быстро) или fallback на cscli
-CS_DB="/var/lib/crowdsec/data/crowdsec.db"
-CS_BANS=0
-CS_WHITE=0
-if [ -r "$CS_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
-    CS_BANS=$(sqlite3 "$CS_DB" "
-        SELECT COUNT(*) FROM decisions
-        WHERE type='ban' AND until > datetime('now')
-    " 2>/dev/null)
-    CS_WHITE=$(sqlite3 "$CS_DB" "
-        SELECT COUNT(*) FROM decisions
-        WHERE type='whitelist' AND until > datetime('now')
-    " 2>/dev/null)
-    CS_BANS="${CS_BANS:-0}"
-    CS_WHITE="${CS_WHITE:-0}"
-elif command -v cscli >/dev/null 2>&1; then
-    CS_BANS=$(cscli decisions list --type ban -o raw 2>/dev/null | tail -n +2 | wc -l)
-    CS_WHITE=$(cscli decisions list --type whitelist -o raw 2>/dev/null | tail -n +2 | wc -l)
-fi
-
-# Когда последний раз обновлялся blocklist
-LAST_UPDATE=$(systemctl show scanner-blocklist-update.service \
-    --property=ExecMainExitTimestamp --value 2>/dev/null | \
-    xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
-LAST_UPDATE="${LAST_UPDATE:-—}"
 
 # === ВЫВОД ===
+draw_snapshot() {
+    local now=$(date '+%Y-%m-%d %H:%M:%S')
+    local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 
+    echo ""
+    echo -e "${C}╔══════════════════════════════════════════════════════════════════╗${N}"
+    printf "${C}║${N}  ${B}VPN GUARD${N} · %-15s · %s              ${C}║${N}\n" "$ip" "$now"
+    echo -e "${C}╚══════════════════════════════════════════════════════════════════╝${N}"
+    echo ""
+
+    echo -e "  ${B}Services${N}"
+    printf "  ├─ %-22s %b\n" "crowdsec"             "$(fmt_status "$CS_ACTIVE")"
+    printf "  ├─ %-22s %b\n" "firewall-bouncer"     "$(fmt_status "$BOUNCER_ACTIVE")"
+    printf "  ├─ %-22s %b\n" "cs-ssh-whitelist"     "$(fmt_status "$WATCHER_ACTIVE")"
+    printf "  └─ %-22s %b\n" "ports-path-watcher"   "$(fmt_status "$PORTS_PATH_ACTIVE")"
+    echo ""
+
+    echo -e "  ${B}Protected ports${N}"
+    printf "  ├─ %-10s ${C}%s${N}\n" "tcp" "$PROTECTED_TCP_LIST"
+    printf "  └─ %-10s ${C}%s${N}\n" "udp" "$PROTECTED_UDP_LIST"
+    echo ""
+
+    echo -e "  ${B}Blocked${N}"
+    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "syn-flood v4"            "$SYN_BAN"
+    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "syn-flood v6"            "$SYN_BAN_V6"
+    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "udp-flood v4"            "$UDP_BAN"
+    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "crowdsec bans"           "$CS_BANS"
+    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "scanner blocklist v4"    "$BL_V4"
+    printf "  └─ %-25s ${R}${B}%5d${N}\n" "scanner blocklist v6"    "$BL_V6"
+    echo ""
+
+    echo -e "  ${B}Whitelist${N}"
+    printf "  ├─ %-22s ${G}${B}%5d${N}\n" "ssh-key auto"   "$CS_WHITE"
+    printf "  └─ %-22s ${G}${B}%5d${N}\n" "manual"         "$MANUAL_WHITE"
+    echo ""
+
+    printf "  ${DIM}Scanner blocklist updated: %s${N}\n" "$LAST_UPDATE"
+}
+
+# === Просмотр списков ===
+show_syn_flood_ips() {
+    echo ""
+    echo -e "${B}SYN-flood IPs (TCP rate-limit)${N}"
+    echo -e "${DIM}─────────────────────────────────${N}"
+    nft list set inet ddos_protect syn_flood_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ expires [^,}]+' | \
+        awk '{printf "  %-18s %s\n", $1, $3}'
+    nft list set inet ddos_protect syn_flood_v6 2>/dev/null | \
+        grep -oE '[0-9a-f:]+ expires [^,}]+' | head -50 | \
+        awk '{printf "  %-40s %s\n", $1, $3}'
+    echo ""
+}
+
+show_crowdsec_bans() {
+    echo ""
+    echo -e "${B}CrowdSec banned IPs${N}"
+    echo -e "${DIM}─────────────────────────────────${N}"
+    if command -v cscli >/dev/null 2>&1; then
+        cscli decisions list --type ban 2>/dev/null | head -50
+    fi
+    echo ""
+}
+
+show_whitelist_ips() {
+    echo ""
+    echo -e "${B}Auto whitelist (SSH-key)${N}"
+    echo -e "${DIM}─────────────────────────────────${N}"
+    if command -v cscli >/dev/null 2>&1; then
+        cscli decisions list --type whitelist 2>/dev/null | head -50
+    fi
+    echo ""
+    echo -e "${B}Manual whitelist (nftables)${N}"
+    echo -e "${DIM}─────────────────────────────────${N}"
+    nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
+        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | \
+        sed 's/^/  /'
+    nft list set inet ddos_protect manual_whitelist_v6 2>/dev/null | \
+        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9a-f:]+(/[0-9]+)?' | \
+        sed 's/^/  /'
+    echo ""
+}
+
+show_scanner_samples() {
+    echo ""
+    echo -e "${B}Scanner blocklist (first 30 entries)${N}"
+    echo -e "${DIM}─────────────────────────────────${N}"
+    nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[0-9.]+)?(/[0-9]+)?' | \
+        head -30 | sed 's/^/  /'
+    echo ""
+    printf "  Total: ${B}%d${N} IPv4 + ${B}%d${N} IPv6\n" "$BL_V4" "$BL_V6"
+    echo ""
+}
+
+# === MODE: JSON ===
 if [ "$MODE" = "json" ]; then
+    collect_stats
     cat <<JSON
 {
   "timestamp": "$(date -Iseconds)",
@@ -1683,48 +1860,39 @@ JSON
     exit 0
 fi
 
-# Text-режим
-NOW_TS=$(date '+%Y-%m-%d %H:%M:%S')
-HOSTNAME_=$(hostname)
-SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# === MODE: ONCE (без интерактива) ===
+if [ "$MODE" = "once" ]; then
+    collect_stats
+    draw_snapshot
+    exit 0
+fi
 
-echo -e "${C}╔══════════════════════════════════════════════════════════════════╗${N}"
-echo -e "${C}║${N}  ${B}🛡  VPN GUARD — Снимок состояния защиты${N}                       ${C}║${N}"
-echo -e "${C}║${N}  ${DIM}$HOSTNAME_ ($SERVER_IP) · $NOW_TS${N}            ${C}║${N}"
-echo -e "${C}╚══════════════════════════════════════════════════════════════════╝${N}"
-echo ""
+# === MODE: INTERACTIVE ===
+while true; do
+    collect_stats
+    clear 2>/dev/null
+    draw_snapshot
+    echo -e "${C}──────────────────────────────────────────────────────────────────${N}"
+    echo -e "  [${B}1${N}] syn-flood IPs    [${B}2${N}] crowdsec bans   [${B}3${N}] whitelist IPs"
+    echo -e "  [${B}4${N}] scanner samples  [${B}r${N}] refresh         [${B}0${N}] exit"
+    echo -ne "  > "
 
-echo -e "  ${B}СЕРВИСЫ${N}"
-echo -e "  ├─ CrowdSec:           $CS_STATUS"
-echo -e "  ├─ Firewall bouncer:   $BOUNCER_STATUS"
-echo -e "  ├─ SSH-key watcher:    $WATCHER_STATUS"
-echo -e "  └─ Ports path-watcher: $PORTS_STATUS"
-echo ""
+    read -r CHOICE
+    case "$CHOICE" in
+        1) show_syn_flood_ips    ;;
+        2) show_crowdsec_bans    ;;
+        3) show_whitelist_ips    ;;
+        4) show_scanner_samples  ;;
+        r|R|"") continue ;;
+        0|q|quit|exit) clear 2>/dev/null; exit 0 ;;
+        *) echo -e "  ${Y}Unknown: $CHOICE${N}" ;;
+    esac
 
-echo -e "  ${B}ЗАЩИЩАЕМЫЕ ПОРТЫ${N} ${DIM}(автоматически из правил фаервола)${N}"
-echo -e "  ├─ TCP: ${C}$PROTECTED_TCP_LIST${N}"
-echo -e "  └─ UDP: ${C}$PROTECTED_UDP_LIST${N}"
-echo ""
-
-echo -e "  ${B}ЗАБЛОКИРОВАНО ПРЯМО СЕЙЧАС${N}"
-printf "  ├─ ${R}SYN-flood${N} (TCP rate-limit): ${B}%5d${N} IPv4 + ${B}%d${N} IPv6\n" "$SYN_BAN" "$SYN_BAN_V6"
-printf "  ├─ ${R}UDP-flood${N} (UDP rate-limit): ${B}%5d${N} IPv4\n" "$UDP_BAN"
-printf "  ├─ ${R}CrowdSec баны${N} (поведение):  ${B}%5d${N} IP\n" "$CS_BANS"
-printf "  └─ ${R}Сканеры${N} (pre-emptive):     ${B}%5d${N} подсетей IPv4 + ${B}%d${N} IPv6\n" "$BL_V4" "$BL_V6"
-echo ""
-
-echo -e "  ${B}WHITELIST (доверенные)${N}"
-printf "  ├─ ${G}SSH-key auto-whitelist:${N}  ${B}%d${N} IP (12h после входа по ключу)\n" "$CS_WHITE"
-printf "  └─ ${G}Manual whitelist:${N}       ${B}%d${N} IP (добавлены вручную)\n" "$MANUAL_WHITE"
-echo ""
-
-echo -e "  ${B}СЛУЖЕБНОЕ${N}"
-echo -e "  └─ Последний апдейт scanner blocklist: ${DIM}$LAST_UPDATE${N}"
-echo ""
-
-echo -e "${C}──────────────────────────────────────────────────────────────────${N}"
-echo -e "  ${DIM}Снимок один раз. Запусти ${C}sudo guard${DIM} ещё раз для актуальных данных.${N}"
-echo -e "  ${DIM}JSON-вывод: ${C}sudo guard --json${DIM}  ·  Live-режим: ${C}sudo watch -n 5 guard${N}"
+    if [ "$CHOICE" != "r" ] && [ "$CHOICE" != "R" ] && [ "$CHOICE" != "" ]; then
+        echo -ne "  ${DIM}Press Enter to return...${N}"
+        read -r _
+    fi
+done
 GUARD_EOF
 
 chmod 0755 "$GUARD_BIN"
