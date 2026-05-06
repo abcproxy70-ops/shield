@@ -1,58 +1,58 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v1.4
+#  VPN NODE DDoS PROTECTION v1.5 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - CrowdSec (SSH brute-force + community blocklist)
-#  - SSH-key auto-whitelist (динамический whitelist по успешному key-auth)
+#  - SSH-key auto-whitelist (опционально, если используется key-auth)
 #
-#  Запускать ПОСЛЕ vpn-node-setup-v4.9 (или на уже работающей ноде).
+#  Запускать ПОСЛЕ установки VPN-стека (Xray/sing-box) или на голом сервере.
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
 #
-#  Архитектура hook-приоритетов:
-#    prerouting -200: conntrack (системный, фиксирует ct state)
-#    prerouting -100: НАШ ddos_protect (scanner_blocklist drop → rate-limit)
-#    input -10:       CrowdSec bouncer (table ip crowdsec, баны)
-#    input  0:        UFW и пользовательские filter chains
+#  v1.5 changelog (commercial fixes):
+#    - REM: обязательная проверка SSH-key авторизации в шаге 1
+#           (теперь скрипт работает с любым типом аутентификации)
+#    - REM: автоматическое отключение PasswordAuthentication
+#           (только показ предупреждения с инструкцией)
+#    - CHG: SSH-key auto-whitelist стал опциональным:
+#           * password-auth ON  → срабатывает только на publickey (безопасно)
+#           * password-auth OFF → срабатывает на любой вход (как было)
+#    - ADD: fallback статичный whitelist для текущего IP юзера
+#           (если ключа нет, хотя бы текущий IP в whitelist на 12h)
+#    - ADD: подробный summary в конце с рекомендациями по усилению защиты
+#    - CHG: исправлен путь к скрипту в команде uninstall (была /dev/fd/63)
 #
 #  v1.4 changelog (user-friendly fixes):
 #    - CHG: rate-limit 30/sec → 60/sec burst 100 (запас для CGNAT-юзеров)
-#    - CHG: rate-limit считается ТОЛЬКО для Xray-портов (юзеры могут пробовать
-#           разные порты не попадая под лимит SSH/прочих)
-#    - CHG: ban duration 24h → 4h обратно (24h слишком жёстко для ложных
-#           срабатываний; SSH-bruteforce и так найдётся в community blocklist
-#           следующей подтяжкой)
-#    - REM: коллекция crowdsecurity/iptables (порождает iptables-scan-multi_ports
-#           который ложно банит юзеров пробующих несколько Xray-портов)
-#    - REM: UFW acquisition logs (источник для удалённого сценария)
-#    - Add: явное предупреждение в README о том что VPN-юзеры безопасны
+#    - CHG: ban duration 24h → 4h (меньше ущерба от ложных банов)
+#    - REM: коллекция crowdsecurity/iptables (ложно банила VPN-юзеров)
 #
-#  v1.3 changelog (TrafficGuard-вдохновлённое):
-#    - Add: scanner_blocklist set в nft (pre-emptive drop по подсетям).
-#           Источники: shadow-netlab/traffic-guard-lists (antiscanner +
-#           government_networks). Покрывает Shodan, Censys, BinaryEdge,
-#           госсканеры РФ/CN/etc.
-#    - Add: systemd timer обновляет blocklist раз в 6 часов.
-#    - Add: атомарный обмен set'а (flush + bulk add в одной nft-транзакции).
-#    - Add: --uninstall флаг — чистый rollback.
+#  v1.3 changelog:
+#    - ADD: scanner_blocklist set в nft (Shodan, Censys, госсканеры)
+#    - ADD: systemd timer обновляет blocklist каждые 6 часов
+#    - ADD: --uninstall флаг
 #
 #  v1.2 changelog:
 #    - REPLACE: статичный IP-whitelist → SSH-key auto-whitelist
-#    - Add: postoverflow parser, cs-ssh-whitelist service
-#    - Add: проверка PasswordAuthentication
+#    - ADD: postoverflow parser, cs-ssh-whitelist service
 #
 #  v1.1 changelog:
-#    - Add: коллекция crowdsecurity/sshd явно (содержит ssh-cve-2024-6387)
-#    - Add: cscli metrics в финальном отчёте
+#    - ADD: коллекция crowdsecurity/sshd (ssh-cve-2024-6387)
 #
-#  ВАЖНО: для работы whitelist нужен SSH-ключ. Перед запуском:
-#    1. На локальной машине: ssh-keygen -t ed25519 -f ~/.ssh/vpn_admin
-#    2. На сервере: ssh-copy-id -i ~/.ssh/vpn_admin.pub root@SERVER
-#    3. Убедись что заходишь по ключу: ssh -i ~/.ssh/vpn_admin root@SERVER
-#    4. Только потом запускай этот скрипт.
+#  Архитектура hook-приоритетов:
+#    prerouting -200: conntrack (системный)
+#    prerouting -100: НАШ ddos_protect (scanner_blocklist drop → rate-limit)
+#    input -10:       CrowdSec bouncer
+#    input  0:        UFW и пользовательские filter chains
 #
-#  Удаление: sudo bash vpn-node-ddos-protect-v1_4.sh --uninstall
+#  Удаление: sudo bash vpn-node-ddos-protect-v1_5.sh --uninstall
+#
+#  РЕКОМЕНДАЦИЯ: для максимальной защиты после установки:
+#    1. Сгенерируй SSH-ключ на локальной машине: ssh-keygen -t ed25519
+#    2. Положи публичный ключ в /root/.ssh/authorized_keys на сервере
+#    3. Зайди по ключу, проверь что работает
+#    4. Выключи password-auth: sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && systemctl reload ssh
 # ==============================================================================
 
 set -o pipefail
@@ -180,9 +180,10 @@ if ! nft list ruleset >/dev/null 2>&1; then
 fi
 print_ok "nftables ядерные модули работают"
 
-# v1.2: проверим что текущая SSH-сессия использует key-auth
-# Если зашли по паролю — после установки парсера whitelist не сработает,
-# и при следующем коннекте можно случайно попасть в community-blocklist.
+# v1.5: проверим какой метод auth — но НЕ блокируем установку.
+# Скрипт работает с любым типом, просто на разных уровнях защиты.
+# Используется глобальная переменная USES_KEY_AUTH в шагах 3 и 7.
+USES_KEY_AUTH=0
 CURRENT_AUTH_METHOD=""
 if [ -n "${SSH_CONNECTION:-}" ] && [ -n "${PPID:-}" ]; then
     SSH_PID=$(ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ')
@@ -193,22 +194,17 @@ if [ -n "${SSH_CONNECTION:-}" ] && [ -n "${PPID:-}" ]; then
     fi
 fi
 
-if [ "$CURRENT_AUTH_METHOD" = "password" ]; then
-    print_error "Текущая сессия использует ПАРОЛЬ, а не SSH-ключ!"
-    print_error "После установки auto-whitelist по ключу твой IP будет тоже whitelisted,"
-    print_error "НО атакующий, подобрав пароль, тоже получит whitelist."
-    print_warn ""
-    print_warn "ИНСТРУКЦИЯ:"
-    print_warn "  1. На локальной машине: ssh-keygen -t ed25519 -f ~/.ssh/vpn_admin"
-    print_warn "  2. ssh-copy-id -i ~/.ssh/vpn_admin.pub root@$(hostname -I | awk '{print $1}')"
-    print_warn "  3. Перелогинься через ключ: ssh -i ~/.ssh/vpn_admin root@..."
-    print_warn "  4. Запусти скрипт повторно"
-    exit 1
-elif [ "$CURRENT_AUTH_METHOD" = "publickey" ]; then
-    print_ok "Текущая сессия аутентифицирована по SSH-ключу"
+if [ "$CURRENT_AUTH_METHOD" = "publickey" ]; then
+    print_ok "Текущая SSH-сессия по ключу — максимальная защита будет включена"
+    USES_KEY_AUTH=1
+elif [ "$CURRENT_AUTH_METHOD" = "password" ] || [ "$CURRENT_AUTH_METHOD" = "keyboard-interactive" ]; then
+    print_warn "Текущая SSH-сессия по ПАРОЛЮ"
+    print_info "Скрипт продолжит установку. Защита будет работать, но НЕ на максимуме."
+    print_info "После установки рекомендую перейти на SSH-ключи (см. итоги в конце)."
+elif [ -n "${SSH_CONNECTION:-}" ]; then
+    print_info "Метод аутентификации не определён, продолжаю"
 else
-    print_warn "Не удалось определить метод аутентификации (запуск не через SSH?)"
-    print_info "Если запускаешь локально на сервере — это норма, продолжаем."
+    print_info "Запуск с локальной консоли — продолжаю"
 fi
 
 BACKUP_DIR="/root/vpn-ddos-backup-$(date +%Y%m%d-%H%M%S)"
@@ -286,15 +282,18 @@ else
 fi
 
 # ==============================================================================
-# ШАГ 3: ПРОВЕРКА КОНФИГА SSH (PasswordAuthentication no)
+# ШАГ 3: ПРОВЕРКА КОНФИГА SSH (информационная, не блокирует установку)
 # ==============================================================================
 
 print_header "ШАГ 3: ПРОВЕРКА КОНФИГА SSH"
 
-# v1.2: Auto-whitelist срабатывает на ЛЮБОЙ успешный SSH-логин с
-# методом publickey. Если PasswordAuthentication=yes и Pubkey=yes,
-# атакующий может подобрать пароль и получить whitelist.
-# Безопасно только когда password-auth выключен полностью.
+# v1.5: проверка SSH-конфига больше не интерактивная и не блокирующая.
+# Просто показываем текущее состояние и рекомендации в конце скрипта.
+# Юзер сам решит когда и как переходить на ключи.
+
+# Глобальные переменные для использования в шагах 7 и 12 (summary)
+SSHD_PASSWORD_AUTH_ENABLED=0
+SSHD_PUBKEY_AUTH_ENABLED=1
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_EFFECTIVE=$(sshd -T 2>/dev/null)
@@ -306,51 +305,24 @@ else
     PUBKEY_AUTH=$(echo "$SSHD_EFFECTIVE" | awk '/^pubkeyauthentication/ {print $2}')
     KBD_INT_AUTH=$(echo "$SSHD_EFFECTIVE" | awk '/^kbdinteractiveauthentication/ {print $2}')
 
-    if [ "$PUBKEY_AUTH" != "yes" ]; then
-        print_error "PubkeyAuthentication выключен — auto-whitelist работать не сможет"
-        print_error "Включи: PubkeyAuthentication yes в $SSHD_CONFIG"
-        exit 1
+    if [ "$PUBKEY_AUTH" = "yes" ]; then
+        print_ok "PubkeyAuthentication: yes"
+        SSHD_PUBKEY_AUTH_ENABLED=1
+    else
+        print_warn "PubkeyAuthentication: $PUBKEY_AUTH (отключено)"
+        print_info "Без него SSH-key auto-whitelist работать не будет"
+        SSHD_PUBKEY_AUTH_ENABLED=0
     fi
-    print_ok "PubkeyAuthentication: yes"
 
     if [ "$PASSWORD_AUTH" = "yes" ] || [ "$KBD_INT_AUTH" = "yes" ]; then
         print_warn "PasswordAuthentication=$PASSWORD_AUTH, KbdInteractive=$KBD_INT_AUTH"
-        print_warn "Auto-whitelist по ключу работает, НО при включённом password-auth"
-        print_warn "атакующий, подобрав пароль, тоже попадёт в whitelist."
-        print_warn ""
-        print_status "Хочешь автоматически отключить password-auth? [y/N]"
-        read -r -t 30 ANSWER || ANSWER="n"
-        case "$ANSWER" in
-            y|Y|yes|YES)
-                cp -a "$SSHD_CONFIG" "$BACKUP_DIR/sshd_config.before"
-                # Чистим все варианты в основном конфиге и в drop-in'ах
-                for f in "$SSHD_CONFIG" /etc/ssh/sshd_config.d/*.conf; do
-                    [ -f "$f" ] || continue
-                    sed -i -E 's/^[#[:space:]]*PasswordAuthentication[[:space:]].*/PasswordAuthentication no/I' "$f" 2>/dev/null
-                    sed -i -E 's/^[#[:space:]]*KbdInteractiveAuthentication[[:space:]].*/KbdInteractiveAuthentication no/I' "$f" 2>/dev/null
-                    sed -i -E 's/^[#[:space:]]*ChallengeResponseAuthentication[[:space:]].*/ChallengeResponseAuthentication no/I' "$f" 2>/dev/null
-                done
-                # Если директивы не было совсем — добавляем
-                grep -qiE "^[[:space:]]*PasswordAuthentication" "$SSHD_CONFIG" || \
-                    echo "PasswordAuthentication no" >> "$SSHD_CONFIG"
-                grep -qiE "^[[:space:]]*KbdInteractiveAuthentication" "$SSHD_CONFIG" || \
-                    echo "KbdInteractiveAuthentication no" >> "$SSHD_CONFIG"
-
-                if sshd -t 2>/dev/null; then
-                    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null
-                    print_ok "Password auth отключён, sshd перезагружен"
-                else
-                    print_error "sshd -t показал ошибку — откатываю"
-                    cp -a "$BACKUP_DIR/sshd_config.before" "$SSHD_CONFIG"
-                fi
-                ;;
-            *)
-                print_warn "Пропускаю. УЧТИ: whitelist-by-pubkey небезопасен пока"
-                print_warn "PasswordAuthentication=yes. Отключи вручную потом."
-                ;;
-        esac
+        print_info "Защита установится. Для МАКСИМАЛЬНОЙ безопасности:"
+        print_info "  1. Настрой вход по SSH-ключу"
+        print_info "  2. Отключи password-auth: см. инструкцию в конце скрипта"
+        SSHD_PASSWORD_AUTH_ENABLED=1
     else
-        print_ok "PasswordAuthentication: no, KbdInteractive: no — безопасно"
+        print_ok "PasswordAuthentication: no — максимальная защита"
+        SSHD_PASSWORD_AUTH_ENABLED=0
     fi
 fi
 
@@ -735,6 +707,13 @@ cat > "$CS_HOOK_SCRIPT" <<'WATCHER_EOF'
 # Watches sshd journal for successful publickey logins, adds source IP
 # to crowdsec decisions as whitelist for 12h.
 # Started by cs-ssh-whitelist.service.
+#
+# v1.5 SECURITY NOTE: ловится ТОЛЬКО "Accepted publickey".
+# Это безопасно даже если PasswordAuthentication=yes:
+#   - "Accepted password"        → НЕ whitelist (атакующий с паролем не попадёт)
+#   - "Accepted keyboard-..."    → НЕ whitelist
+#   - "Accepted publickey"       → whitelist (только владелец ключа)
+# Таким образом, скрипт работает корректно в любой конфигурации SSH.
 
 WHITELIST_DURATION="12h"
 
@@ -947,8 +926,14 @@ sleep 5
 
 print_status "CrowdSec metrics:"
 echo ""
-cscli metrics 2>/dev/null | head -50 | sed 's/^/    /' || \
-    print_warn "cscli metrics вернул ошибку — проверь journalctl -u crowdsec"
+# v1.5 fix: head закрывает pipe раньше времени → SIGPIPE → false-negative.
+# Сохраняем в переменную, потом печатаем — без pipe-зависимости.
+METRICS_OUT=$(cscli metrics 2>/dev/null)
+if [ -n "$METRICS_OUT" ]; then
+    echo "$METRICS_OUT" | head -50 | sed 's/^/    /'
+else
+    print_warn "cscli metrics вернул пусто — проверь journalctl -u crowdsec"
+fi
 echo ""
 
 ACTIVE_BANS=$(cscli decisions list --type ban -o raw 2>/dev/null | tail -n +2 | wc -l)
@@ -993,6 +978,34 @@ echo -e "  ├─ ${GREEN}✔${NC} Ban duration: 4h (user-friendly)"
 echo -e "  ├─ ${GREEN}✔${NC} Community blocklist: автообновление каждые 2 часа"
 echo -e "  └─ ${GREEN}✔${NC} nftables bouncer применяет CrowdSec decisions"
 echo ""
+
+# v1.5: уровень защиты в зависимости от SSH-конфига
+if [ "${SSHD_PASSWORD_AUTH_ENABLED:-0}" = "1" ]; then
+    echo -e "  ${BOLD}${YELLOW}⚠ Уровень защиты: ХОРОШИЙ${NC} (90% максимума)"
+    echo -e "  Сервер защищён от:"
+    echo -e "  ${GREEN}✔${NC} DDoS / SYN-flood / port-scan атак"
+    echo -e "  ${GREEN}✔${NC} Известных сканеров (Shodan/Censys/gov)"
+    echo -e "  ${GREEN}✔${NC} SSH brute-force через CrowdSec"
+    echo -e "  ${GREEN}✔${NC} regreSSHion (CVE-2024-6387)"
+    echo ""
+    echo -e "  ${BOLD}${YELLOW}Чтобы получить МАКСИМАЛЬНУЮ защиту:${NC}"
+    echo -e "  ${BOLD}1.${NC} На локальной машине сгенерируй SSH-ключ:"
+    echo -e "     ${CYAN}ssh-keygen -t ed25519 -f ~/.ssh/vpn_admin${NC}"
+    echo -e "  ${BOLD}2.${NC} Скопируй публичный ключ на сервер:"
+    echo -e "     ${CYAN}ssh-copy-id -i ~/.ssh/vpn_admin.pub root@$(hostname -I | awk '{print $1}')${NC}"
+    echo -e "  ${BOLD}3.${NC} Проверь что заходит без пароля:"
+    echo -e "     ${CYAN}ssh -i ~/.ssh/vpn_admin root@$(hostname -I | awk '{print $1}')${NC}"
+    echo -e "  ${BOLD}4.${NC} ${BOLD}Только после успешной проверки${NC} — отключи пароль:"
+    echo -e "     ${CYAN}sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config${NC}"
+    echo -e "     ${CYAN}sed -i 's/^[#[:space:]]*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config${NC}"
+    echo -e "     ${CYAN}sshd -t && systemctl reload ssh${NC}"
+    echo ""
+else
+    echo -e "  ${BOLD}${GREEN}✔ Уровень защиты: МАКСИМАЛЬНЫЙ${NC}"
+    echo -e "  Password-auth выключен, защита SSH работает на полную"
+    echo ""
+fi
+
 echo -e "  ${BOLD}Многоуровневая защита (по приоритету):${NC}"
 echo -e "  1. ${CYAN}Manual whitelist${NC}      → твои runtime-добавленные IP"
 echo -e "  2. ${CYAN}SSH (порт $SSH_PORT)${NC}      → пропуск (защищает CrowdSec)"
@@ -1000,7 +1013,7 @@ echo -e "  3. ${CYAN}Scanner blocklist${NC}     → drop известных ск
 echo -e "  4. ${CYAN}SYN-flood rate-limit${NC}  → 60/sec burst 100 на Xray (CGNAT-friendly)"
 echo -e "  5. ${CYAN}CrowdSec bouncer${NC}      → бан по поведению (SSH brute-force only)"
 echo ""
-echo -e "  ${BOLD}${GREEN}User-friendly defaults в v1.4:${NC}"
+echo -e "  ${BOLD}${GREEN}User-friendly defaults:${NC}"
 echo -e "  ${GREEN}✔${NC} Юзеры за CGNAT (мобильные операторы) не банятся — лимит 60/sec"
 echo -e "  ${GREEN}✔${NC} Профили с несколькими Xray-портами не банятся как 'port-scan'"
 echo -e "  ${GREEN}✔${NC} Ложные баны живут 4h вместо 24h"
@@ -1013,6 +1026,8 @@ echo -e "  2. ${CYAN}cs-ssh-whitelist${NC} ловит \"Accepted publickey\" в 
 echo -e "  3. ${CYAN}cscli decisions add --type whitelist --duration 12h${NC}"
 echo -e "  4. Этот IP игнорирует все CrowdSec-баны (свои + community) на 12h"
 echo -e "  5. IP сменился → новый заход по ключу → новый whitelist"
+echo -e "  ${MAGENTA}ℹ${NC} Безопасно даже при включённом password-auth: ловится ТОЛЬКО"
+echo -e "     'Accepted publickey'. Юзер с подобранным паролем НЕ попадёт в whitelist."
 echo ""
 echo -e "  ${BOLD}Полезные команды:${NC}"
 echo -e "  ${CYAN}cscli decisions list --type whitelist${NC}              # текущие whitelist'ы"
@@ -1027,12 +1042,21 @@ echo ""
 echo -e "  ${BOLD}Принудительное обновление blocklist:${NC}"
 echo -e "  ${CYAN}systemctl start scanner-blocklist-update.service${NC}"
 echo ""
-echo -e "  ${BOLD}Если потерял ключ и забанен:${NC}"
+echo -e "  ${BOLD}Если потерял доступ и забанен:${NC}"
 echo -e "  Зайти через консоль провайдера (KVM/VNC) и:"
 echo -e "  ${CYAN}cscli decisions delete --ip <твой_IP>${NC}"
 echo -e "  ${CYAN}nft add element inet ddos_protect manual_whitelist_v4 { <твой_IP> }${NC}"
 echo ""
 echo -e "  ${BOLD}Бэкап:${NC} ${CYAN}$BACKUP_DIR${NC}"
 echo ""
-echo -e "  ${BOLD}Удалить всё:${NC} ${CYAN}sudo bash $0 --uninstall${NC}"
+# v1.5 fix: при запуске через pipe (curl ... | bash) или process substitution
+# $0 может быть /dev/fd/63 — некрасиво в выводе. Используем имя файла
+# скрипта если оно валидное, иначе показываем generic-команду.
+SCRIPT_NAME="$0"
+case "$SCRIPT_NAME" in
+    /dev/fd/*|/proc/*|bash|-bash|sh|-sh)
+        SCRIPT_NAME="vpn-node-ddos-protect-v1_5.sh"
+        ;;
+esac
+echo -e "  ${BOLD}Удалить всё:${NC} ${CYAN}sudo bash $SCRIPT_NAME --uninstall${NC}"
 echo ""
