@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.0 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v3.1 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - CrowdSec (SSH brute-force + community blocklist)
@@ -11,6 +11,18 @@
 #
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
+#
+#  v3.1 changelog (КРИТИЧЕСКИЙ FIX UFW conflict):
+#    - FIX: после установки скрипта UFW переставал работать после ребута.
+#      Причина: /etc/nftables.conf содержит `flush ruleset` который при
+#      загрузке nftables.service удаляет ВСЕ правила, включая UFW.
+#      Мы добавляли свой include в этот же файл — после ребута nftables
+#      load чистил UFW и не загружал его обратно.
+#    - SOLUTION: использовать отдельный systemd-сервис shieldnode-nftables
+#      который загружает только нашу таблицу /etc/nftables.d/ddos-protect.conf
+#      БЕЗ flush ruleset. UFW и наш сервис не конфликтуют.
+#    - При апгрейде с v3.0 — миграция автоматическая, удалит include из
+#      /etc/nftables.conf и установит свой сервис.
 #
 #  v3.0 changelog (UI redesign):
 #    - REWRITE: полностью переработан guard — современный UI с двойными
@@ -237,7 +249,8 @@ if [ "${1:-}" = "--uninstall" ]; then
     for unit in cs-ssh-whitelist scanner-blocklist-update.timer scanner-blocklist-update.service \
                 protected-ports-update.timer protected-ports-update.service \
                 protected-ports-update.path \
-                shieldnode-aggregator.timer shieldnode-aggregator.service; do
+                shieldnode-aggregator.timer shieldnode-aggregator.service \
+                shieldnode-nftables.service; do
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
     done
@@ -1033,14 +1046,56 @@ else
     exit 1
 fi
 
-# Подключаем в /etc/nftables.conf для автозагрузки при boot
+# v3.1: НЕ встраиваемся в /etc/nftables.conf!
+# Тот файл содержит `flush ruleset` который убивает UFW при ребуте.
+# Вместо этого создаём свой systemd-сервис shieldnode-nftables.service
+# который загружает только нашу таблицу БЕЗ flush.
+
+# Если предыдущая версия добавила include — удаляем (миграция с v3.0)
 NFTABLES_MAIN="/etc/nftables.conf"
-if [ -f "$NFTABLES_MAIN" ] && ! grep -q "$NFT_DDOS_CONF" "$NFTABLES_MAIN"; then
+if [ -f "$NFTABLES_MAIN" ] && grep -q "$NFT_DDOS_CONF" "$NFTABLES_MAIN"; then
+    print_status "Удаляю старый include из $NFTABLES_MAIN (миграция v3.0→v3.1)"
     cp -a "$NFTABLES_MAIN" "$BACKUP_DIR/nftables.conf.before"
-    echo "" >> "$NFTABLES_MAIN"
-    echo "# DDoS protection (vpn-node-ddos-protect)" >> "$NFTABLES_MAIN"
-    echo "include \"$NFT_DDOS_CONF\"" >> "$NFTABLES_MAIN"
-    print_ok "Подключено в $NFTABLES_MAIN (автозагрузка при boot)"
+    sed -i '/# DDoS protection (vpn-node-ddos-protect)/d' "$NFTABLES_MAIN"
+    sed -i "\|include \"$NFT_DDOS_CONF\"|d" "$NFTABLES_MAIN"
+    print_ok "Старый include удалён"
+fi
+
+# Создаём свой systemd-сервис для загрузки нашей таблицы
+cat > /etc/systemd/system/shieldnode-nftables.service <<EOF
+[Unit]
+Description=Shieldnode DDoS protection nftables ruleset
+Documentation=https://github.com/abcproxy70-ops/shield
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+After=nftables.service
+# Запускаемся ПОСЛЕ ufw чтобы наши правила не пересекались
+After=ufw.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Загружаем ТОЛЬКО нашу таблицу БЕЗ flush ruleset
+# Это сохраняет UFW и любые другие nft-правила
+ExecStart=/usr/sbin/nft -f $NFT_DDOS_CONF
+# При остановке/restart удаляем только нашу таблицу
+ExecStop=/usr/sbin/nft delete table inet ddos_protect
+ExecReload=/usr/sbin/nft -f $NFT_DDOS_CONF
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable shieldnode-nftables.service >/dev/null 2>&1
+
+# Перезапускаем чтобы наш ruleset точно загрузился
+if systemctl restart shieldnode-nftables.service 2>/dev/null; then
+    print_ok "Сервис shieldnode-nftables.service установлен и активен"
+    print_info "Загружает только нашу таблицу — UFW не пересекается"
+else
+    print_warn "shieldnode-nftables не стартанул — проверь: journalctl -u shieldnode-nftables -n 30"
 fi
 
 systemctl enable nftables >/dev/null 2>&1 || true
