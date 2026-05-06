@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v2.4 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v2.7 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - CrowdSec (SSH brute-force + community blocklist)
@@ -11,6 +11,52 @@
 #
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
+#
+#  v2.7 changelog (статистика блокировок):
+#    - ADD: nftables counters на каждом drop-правиле (kernel-level, бесплатные).
+#      Считают сколько пакетов/байт дропнуто с момента старта nft-сервиса.
+#    - ADD: новый раздел "Total blocked" в guard:
+#      • scanner blocklist drops (пакетов и байт)
+#      • confirmed attack drops
+#      • счётчики сбрасываются при ребуте/переустановке правил
+#    - Сброс счётчиков вручную: nft reset counter inet ddos_protect <name>
+#
+#  v2.6 changelog (защита от детекции VPN российскими госсканерами):
+#    - ADD: новые источники для scanner_blocklist:
+#      • tread-lightly/CyberOK_Skipa_ips — 146 verified scanner IP конкретно
+#        для SKIPA scan-XX, ГРЧЦ (РКН), НКЦКИ (ФСБ-related). Курируется
+#        вручную автором с верификацией по логам.
+#      • MISP/misp-warninglists/skipa-nt-scanning — honeypot-verified IP
+#        от CIRCL Luxembourg (государственный CSIRT). Минимум ложных банов.
+#    - ЭФФЕКТ: блокирует SKIPA от CyberOK (агент РКН) — отсрочка попадания
+#      твоего IP в "VPN-blocklist" Роскомнадзора на месяцы. Юзеры из РФ
+#      продолжают подключаться к ноде дольше.
+#    - ADD: ASCII-art баннер при установке (брендинг для коммерческой версии)
+#
+#  v2.5 changelog (защита от ложных банов VPN-юзеров):
+#    - CHG: лимиты подняты в 5 раз — TCP 300 SYN/sec (было 60), UDP 600/sec (было 200).
+#      Реальный DDoS режется (он >>1000/sec), но CGNAT мобильных операторов
+#      (МТС/Билайн/МегаФон) не задевается даже с сотней одновременно
+#      подключающихся юзеров.
+#    - ADD: "BAN ONCE" архитектура — двухэтапная проверка перед баном.
+#      Раньше: одно превышение лимита → drop на 1 минуту.
+#      Теперь:
+#        1. Первое превышение → IP попадает в suspect_v4 на 5 минут.
+#           Трафик НЕ дропается, IP под наблюдением.
+#        2. Если IP в suspect_v4 опять превышает → в confirmed_attack_v4
+#           на 1 час. Только теперь дропаем.
+#      Случайные CGNAT-всплески → не банятся (через 5 мин suspect истекает).
+#      Настоящие атакующие → банятся подтверждённо.
+#    - ADD: новые сеты в guard — suspect и confirmed
+#
+#  v2.4 changelog (bugfixes):
+#    - FIX: race condition в watcher (path-unit triggered многократно,
+#      пустые результаты затирали правильные данные). Добавлен safety guard.
+#    - FIX: SYN-flood IPs не отображались в guard (regex не учитывал
+#      'limit rate' в формате nft). Заменён на JSON-парсинг через jq.
+#
+#  v2.3 changelog (bugfix):
+#    - FIX: cs-ssh-whitelist падал с status 226/NAMESPACE — fix optional path.
 #
 #  v2.2 changelog:
 #    - ADD: автоматический whitelist management-IP из правил фаервола.
@@ -730,7 +776,43 @@ $XRAY_PORTS_UDP_INIT
         size 131072
     }
 
-    # --- Dynamic SYN-flood detection (TCP) ---
+    # --- v2.5: STAGE 1 — SUSPECT (наблюдение 5 минут) ---
+    # IP попадает сюда при первом превышении лимита.
+    # Трафик НЕ дропается. Если за 5 минут IP опять превышает — переводим в confirmed.
+    # Если не превышает — таймер истекает, забываем про IP (false positive).
+    set suspect_v4 {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 5m
+        size 65536
+    }
+    set suspect_v6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 5m
+        size 65536
+    }
+
+    # --- v2.5: STAGE 2 — CONFIRMED ATTACK (бан 1 час) ---
+    # Сюда IP попадает если уже сидел в suspect и опять превысил лимит.
+    # Это значит — точно атака, баним всерьёз.
+    set confirmed_attack_v4 {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 1h
+        size 65536
+    }
+    set confirmed_attack_v6 {
+        type ipv6_addr
+        flags dynamic, timeout
+        timeout 1h
+        size 65536
+    }
+
+    # --- LEGACY: syn_flood/udp_flood (для совместимости с guard и rate-limit) ---
+    # Используются как rate-counter — IP попадает сюда при превышении.
+    # Сами по себе не дропают трафик — это делают вышестоящие правила
+    # на основе наличия IP в suspect/confirmed.
     set syn_flood_v4 {
         type ipv4_addr
         flags dynamic, timeout
@@ -743,8 +825,6 @@ $XRAY_PORTS_UDP_INIT
         timeout 1m
         size 65536
     }
-
-    # --- Dynamic UDP-flood detection ---
     set udp_flood_v4 {
         type ipv4_addr
         flags dynamic, timeout
@@ -775,6 +855,18 @@ $MANUAL_WHITELIST_V4_INIT
 $MANUAL_WHITELIST_V6_INIT
     }
 
+    # v2.7: Named counters для статистики "всего заблокировано".
+    # Каждый counter сохраняет packets и bytes с момента старта nft.
+    # Сбрасываются при ребуте/перезагрузке правил.
+    counter scanner_drops_v4 { }
+    counter scanner_drops_v6 { }
+    counter confirmed_drops_v4 { }
+    counter confirmed_drops_v6 { }
+    counter syn_confirmed_v4 { }
+    counter syn_confirmed_v6 { }
+    counter udp_confirmed_v4 { }
+    counter udp_confirmed_v6 { }
+
     chain prerouting {
         type filter hook prerouting priority -100; policy accept;
 
@@ -788,28 +880,56 @@ $MANUAL_WHITELIST_V6_INIT
         # SSH — без блокировок (защищает CrowdSec)
         tcp dport $SSH_PORT accept
 
-        # Pre-emptive drop известных сканеров.
+        # Pre-emptive drop известных сканеров (с counter v2.7).
         # Стоит ПЕРЕД rate-limit — экономит conntrack-слоты и CPU.
-        ip  saddr @scanner_blocklist_v4 drop
-        ip6 saddr @scanner_blocklist_v6 drop
+        ip  saddr @scanner_blocklist_v4 counter name scanner_drops_v4 drop
+        ip6 saddr @scanner_blocklist_v6 counter name scanner_drops_v6 drop
 
-        # TCP SYN rate-limit на защищаемых портах: 60 SYN/sec, burst 100.
-        # Лимит подобран чтобы:
-        #   - Real SYN-flood (1000+/sec) — режется
-        #   - CGNAT мобильных операторов (100+ юзеров на IP) — проходит
-        #   - Обычный юзер делает 1-3 SYN/sec при подключении — не задевается
+        # === v2.5: BAN-ONCE АРХИТЕКТУРА ===
+        # Двухэтапная проверка перед баном — снижает ложные баны CGNAT/мобильных.
+        #
+        # Этап 0: Если IP в confirmed_attack — он уже подтверждённый атакующий, дропаем.
+        ip  saddr @confirmed_attack_v4 counter name confirmed_drops_v4 drop
+        ip6 saddr @confirmed_attack_v6 counter name confirmed_drops_v6 drop
+
+        # === TCP SYN rate-limit на защищаемых портах ===
+        # Лимит: 300 SYN/sec, burst 500. CGNAT-friendly.
+        #
+        # Этап 2: IP уже в suspect и опять превышает → переводим в confirmed + drop.
+        tcp dport @protected_ports_tcp ct state new ip saddr @suspect_v4 \\
+            add @syn_flood_v4 { ip saddr limit rate over 300/second burst 500 packets } \\
+            add @confirmed_attack_v4 { ip saddr } counter name syn_confirmed_v4 drop
+        tcp dport @protected_ports_tcp ct state new ip6 saddr @suspect_v6 \\
+            add @syn_flood_v6 { ip6 saddr limit rate over 300/second burst 500 packets } \\
+            add @confirmed_attack_v6 { ip6 saddr } counter name syn_confirmed_v6 drop
+
+        # Этап 1: IP не в suspect, но превышает → добавляем в suspect (не дропаем!).
+        # Цель: дать IP "испытательный срок" 5 минут. Случайные всплески пройдут.
         tcp dport @protected_ports_tcp ct state new meta nfproto ipv4 \\
-            add @syn_flood_v4 { ip saddr limit rate over 60/second burst 100 packets } drop
+            add @syn_flood_v4 { ip saddr limit rate over 300/second burst 500 packets } \\
+            add @suspect_v4 { ip saddr }
         tcp dport @protected_ports_tcp ct state new meta nfproto ipv6 \\
-            add @syn_flood_v6 { ip6 saddr limit rate over 60/second burst 100 packets } drop
+            add @syn_flood_v6 { ip6 saddr limit rate over 300/second burst 500 packets } \\
+            add @suspect_v6 { ip6 saddr }
 
-        # UDP rate-limit на защищаемых портах: 200 packets/sec, burst 300.
-        # UDP-flood через Hysteria/TUIC/QUIC — типичная атака.
-        # Лимит выше TCP потому что UDP-протоколы шлют много мелких пакетов.
+        # === UDP rate-limit на защищаемых портах ===
+        # Лимит: 600 packets/sec, burst 1000. UDP шлёт больше мелких пакетов.
+        #
+        # Этап 2: подтверждённый атакующий
+        udp dport @protected_ports_udp ip saddr @suspect_v4 \\
+            add @udp_flood_v4 { ip saddr limit rate over 600/second burst 1000 packets } \\
+            add @confirmed_attack_v4 { ip saddr } counter name udp_confirmed_v4 drop
+        udp dport @protected_ports_udp ip6 saddr @suspect_v6 \\
+            add @udp_flood_v6 { ip6 saddr limit rate over 600/second burst 1000 packets } \\
+            add @confirmed_attack_v6 { ip6 saddr } counter name udp_confirmed_v6 drop
+
+        # Этап 1: первое превышение
         udp dport @protected_ports_udp meta nfproto ipv4 \\
-            add @udp_flood_v4 { ip saddr limit rate over 200/second burst 300 packets } drop
+            add @udp_flood_v4 { ip saddr limit rate over 600/second burst 1000 packets } \\
+            add @suspect_v4 { ip saddr }
         udp dport @protected_ports_udp meta nfproto ipv6 \\
-            add @udp_flood_v6 { ip6 saddr limit rate over 200/second burst 300 packets } drop
+            add @udp_flood_v6 { ip6 saddr limit rate over 600/second burst 1000 packets } \\
+            add @suspect_v6 { ip6 saddr }
     }
 }
 EOF
@@ -1180,10 +1300,19 @@ cat > "$UPDATER_SCRIPT" <<'UPDATER_EOF'
 
 set -o pipefail
 
+# v2.6: множественные источники blocklist'а для максимального покрытия
+# российских госсканеров с минимальным риском ложных банов.
 LISTS=(
+    # Основной общий blocklist (Shodan, Censys, общие сканеры, RU gov частично)
     "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list"
     "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list"
+    # v2.6: SKIPA scanner-серверы (CyberOK, ГРЧЦ, НКЦКИ).
+    # Курируется вручную автором с верификацией по логам — низкий риск ложных банов.
+    "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
 )
+
+# v2.6: MISP/CIRCL — honeypot-verified scanner IPs (JSON-формат, требует jq для парсинга)
+MISP_LIST="https://raw.githubusercontent.com/MISP/misp-warninglists/main/lists/skipa-nt-scanning/list.json"
 
 LOG_TAG="scanner-blocklist"
 
@@ -1204,6 +1333,18 @@ for url in "${LISTS[@]}"; do
         logger -t "$LOG_TAG" "WARN: не смог скачать $url"
     fi
 done
+
+# v2.6: MISP/CIRCL JSON-список — отдельный парсинг через jq
+if [ -n "$MISP_LIST" ] && command -v jq >/dev/null 2>&1; then
+    if curl -fsSL --max-time 30 --retry 2 "$MISP_LIST" -o "$TMP/misp.json" 2>/dev/null; then
+        # MISP-формат: {"list": ["IP1/CIDR1", "IP2/CIDR2", ...]}
+        jq -r '.list[]?' "$TMP/misp.json" 2>/dev/null >> "$TMP/all.raw"
+        MISP_COUNT=$(jq -r '.list | length' "$TMP/misp.json" 2>/dev/null || echo "0")
+        logger -t "$LOG_TAG" "MISP/CIRCL: добавлено $MISP_COUNT honeypot-verified IP"
+    else
+        logger -t "$LOG_TAG" "WARN: не смог скачать MISP/CIRCL список"
+    fi
+fi
 
 if [ ! -s "$TMP/all.raw" ]; then
     logger -t "$LOG_TAG" "ERROR: пустой результат скачивания, не обновляю set"
@@ -1722,6 +1863,12 @@ collect_stats() {
     UDP_BAN=$(nft list set inet ddos_protect udp_flood_v4 2>/dev/null | \
         grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
 
+    # v2.5: suspect (под наблюдением 5 мин) + confirmed (бан 1 час)
+    SUSPECT_COUNT=$(nft list set inet ddos_protect suspect_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+    CONFIRMED_COUNT=$(nft list set inet ddos_protect confirmed_attack_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+
     PROTECTED_TCP_LIST=$(nft list set inet ddos_protect protected_ports_tcp 2>/dev/null | \
         tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+(-[0-9]+)?' | \
         sort -un | tr '\n' ',' | sed 's/,$//')
@@ -1760,6 +1907,52 @@ collect_stats() {
         --property=ExecMainExitTimestamp --value 2>/dev/null | \
         xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
     LAST_UPDATE="${LAST_UPDATE:-—}"
+
+    # v2.7: nftables counters — статистика "всего заблокировано"
+    # Формат вывода: "counter packets X bytes Y"
+    read_counter() {
+        local name="$1"
+        local out
+        out=$(nft list counter inet ddos_protect "$name" 2>/dev/null | \
+            grep -oE 'packets [0-9]+ bytes [0-9]+' | head -1)
+        if [ -n "$out" ]; then
+            local pkts bytes
+            pkts=$(echo "$out" | awk '{print $2}')
+            bytes=$(echo "$out" | awk '{print $4}')
+            echo "${pkts:-0} ${bytes:-0}"
+        else
+            echo "0 0"
+        fi
+    }
+
+    read SCANNER_PKTS_V4 SCANNER_BYTES_V4 <<< "$(read_counter scanner_drops_v4)"
+    read SCANNER_PKTS_V6 SCANNER_BYTES_V6 <<< "$(read_counter scanner_drops_v6)"
+    read CONFIRMED_PKTS_V4 CONFIRMED_BYTES_V4 <<< "$(read_counter confirmed_drops_v4)"
+    read CONFIRMED_PKTS_V6 CONFIRMED_BYTES_V6 <<< "$(read_counter confirmed_drops_v6)"
+    read SYN_CONF_PKTS_V4 SYN_CONF_BYTES_V4 <<< "$(read_counter syn_confirmed_v4)"
+    read UDP_CONF_PKTS_V4 UDP_CONF_BYTES_V4 <<< "$(read_counter udp_confirmed_v4)"
+
+    # Когда nft started — для "stats since"
+    NFT_SINCE=$(systemctl show nftables.service --property=ActiveEnterTimestamp --value 2>/dev/null | \
+        xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
+    NFT_SINCE="${NFT_SINCE:-—}"
+}
+
+# v2.7: human-readable bytes formatter (1234567 → 1.18M)
+human_bytes() {
+    local b="${1:-0}"
+    awk -v b="$b" 'BEGIN {
+        if (b < 1024) printf "%dB", b
+        else if (b < 1048576) printf "%.1fK", b/1024
+        else if (b < 1073741824) printf "%.1fM", b/1048576
+        else if (b < 1099511627776) printf "%.1fG", b/1073741824
+        else printf "%.1fT", b/1099511627776
+    }'
+}
+
+# v2.7: human-readable numbers (1234567 → 1,234,567)
+human_num() {
+    printf "%'d" "${1:-0}" 2>/dev/null || echo "${1:-0}"
 }
 
 fmt_status() {
@@ -1795,10 +1988,15 @@ draw_snapshot() {
     printf "  └─ %-10s ${C}%s${N}\n" "udp" "$PROTECTED_UDP_LIST"
     echo ""
 
+    echo -e "  ${B}Suspect${N} ${DIM}(under watch, 5min)${N}"
+    printf "  └─ %-25s ${Y}${B}%5d${N}\n"        "suspect IPs"         "$SUSPECT_COUNT"
+    echo ""
+
     echo -e "  ${B}Blocked${N}"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "syn-flood v4"            "$SYN_BAN"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "syn-flood v6"            "$SYN_BAN_V6"
-    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "udp-flood v4"            "$UDP_BAN"
+    printf "  ├─ %-25s ${R}${B}%5d${N}\n" "confirmed attack"        "$CONFIRMED_COUNT"
+    printf "  ├─ %-25s ${DIM}%5d${N}\n"  "syn-flood v4 (limit hits)" "$SYN_BAN"
+    printf "  ├─ %-25s ${DIM}%5d${N}\n"  "syn-flood v6 (limit hits)" "$SYN_BAN_V6"
+    printf "  ├─ %-25s ${DIM}%5d${N}\n"  "udp-flood v4 (limit hits)" "$UDP_BAN"
     printf "  ├─ %-25s ${R}${B}%5d${N}\n" "crowdsec bans"           "$CS_BANS"
     printf "  ├─ %-25s ${R}${B}%5d${N}\n" "scanner blocklist v4"    "$BL_V4"
     printf "  └─ %-25s ${R}${B}%5d${N}\n" "scanner blocklist v6"    "$BL_V6"
@@ -1809,47 +2007,62 @@ draw_snapshot() {
     printf "  └─ %-22s ${G}${B}%5d${N}\n" "manual"         "$MANUAL_WHITE"
     echo ""
 
+    # v2.7: Total blocked (counter-based, since nft started)
+    local total_pkts=$((SCANNER_PKTS_V4 + SCANNER_PKTS_V6 + CONFIRMED_PKTS_V4 + CONFIRMED_PKTS_V6 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4))
+    local total_bytes=$((SCANNER_BYTES_V4 + SCANNER_BYTES_V6 + CONFIRMED_BYTES_V4 + CONFIRMED_BYTES_V6 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4))
+
+    echo -e "  ${B}Total blocked${N} ${DIM}(since $NFT_SINCE)${N}"
+    printf "  ├─ %-22s ${R}${B}%15s${N} pkts / %s\n" "scanners (v4)"     "$(human_num "$SCANNER_PKTS_V4")"   "$(human_bytes "$SCANNER_BYTES_V4")"
+    printf "  ├─ %-22s ${R}${B}%15s${N} pkts / %s\n" "scanners (v6)"     "$(human_num "$SCANNER_PKTS_V6")"   "$(human_bytes "$SCANNER_BYTES_V6")"
+    printf "  ├─ %-22s ${R}${B}%15s${N} pkts / %s\n" "confirmed attacks"  "$(human_num "$CONFIRMED_PKTS_V4")" "$(human_bytes "$CONFIRMED_BYTES_V4")"
+    printf "  ├─ %-22s ${R}${B}%15s${N} pkts / %s\n" "syn-flood→confirmed" "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
+    printf "  ├─ %-22s ${R}${B}%15s${N} pkts / %s\n" "udp-flood→confirmed" "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
+    printf "  └─ %-22s ${B}${B}%15s${N} pkts / %s\n" "TOTAL"             "$(human_num "$total_pkts")"        "$(human_bytes "$total_bytes")"
+    echo ""
+
     printf "  ${DIM}Scanner blocklist updated: %s${N}\n" "$LAST_UPDATE"
 }
 
 # === Просмотр списков ===
 show_syn_flood_ips() {
     echo ""
-    echo -e "${B}SYN-flood IPs (TCP rate-limit)${N}"
+    echo -e "${R}${B}Confirmed attack IPs${N} ${DIM}(banned, 1h)${N}"
     echo -e "${DIM}─────────────────────────────────${N}"
 
-    # v2.4: используем JSON-вывод nft (надёжнее regex'а на текстовом формате)
-    local json4 json6
-    json4=$(nft -j list set inet ddos_protect syn_flood_v4 2>/dev/null)
-    json6=$(nft -j list set inet ddos_protect syn_flood_v6 2>/dev/null)
-
-    if command -v jq >/dev/null 2>&1 && [ -n "$json4" ]; then
-        echo "$json4" | jq -r '
+    local json_conf
+    json_conf=$(nft -j list set inet ddos_protect confirmed_attack_v4 2>/dev/null)
+    if command -v jq >/dev/null 2>&1 && [ -n "$json_conf" ]; then
+        echo "$json_conf" | jq -r '
             .nftables[]?.set?.elem[]? |
             (.elem.val // .val) as $ip |
             (.elem.expires // .expires // 0) as $exp |
-            "  \($ip)  expires \($exp)s"
+            "  \($ip)  expires in \($exp)s"
         ' 2>/dev/null | head -50
-    else
-        # Fallback: текстовый парсинг (формат: "IP limit rate ... expires Xs")
-        nft list set inet ddos_protect syn_flood_v4 2>/dev/null | \
-            tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ limit rate[^,}]+expires [0-9smh]+' | \
-            awk '{
-                ip=$1
-                # expires — последнее поле
-                exp=$NF
-                printf "  %-18s expires %s\n", ip, exp
-            }' | head -50
     fi
+    [ -z "$json_conf" ] || [ "$(echo "$json_conf" | jq -r '.nftables[]?.set?.elem? | length // 0' 2>/dev/null)" = "0" ] && \
+        echo -e "  ${DIM}(empty — no confirmed attacks now)${N}"
 
-    if [ -n "$json6" ] && command -v jq >/dev/null 2>&1; then
-        echo "$json6" | jq -r '
+    echo ""
+    echo -e "${Y}${B}Suspect IPs${N} ${DIM}(under watch, 5min — first offence)${N}"
+    echo -e "${DIM}─────────────────────────────────${N}"
+
+    local json_susp
+    json_susp=$(nft -j list set inet ddos_protect suspect_v4 2>/dev/null)
+    if command -v jq >/dev/null 2>&1 && [ -n "$json_susp" ]; then
+        echo "$json_susp" | jq -r '
             .nftables[]?.set?.elem[]? |
             (.elem.val // .val) as $ip |
             (.elem.expires // .expires // 0) as $exp |
-            "  \($ip)  expires \($exp)s"
-        ' 2>/dev/null | head -20
+            "  \($ip)  expires in \($exp)s"
+        ' 2>/dev/null | head -50
     fi
+    [ -z "$json_susp" ] || [ "$(echo "$json_susp" | jq -r '.nftables[]?.set?.elem? | length // 0' 2>/dev/null)" = "0" ] && \
+        echo -e "  ${DIM}(empty — all clean)${N}"
+
+    echo ""
+    echo -e "${DIM}Logic:${N}"
+    echo -e "  ${DIM}1st limit hit → suspect (5min watch, no drop)${N}"
+    echo -e "  ${DIM}2nd hit while suspect → confirmed_attack (1h drop)${N}"
     echo ""
 }
 
@@ -1923,6 +2136,17 @@ if [ "$MODE" = "json" ]; then
   "whitelist": {
     "ssh_key_auto": $CS_WHITE,
     "manual": $MANUAL_WHITE
+  },
+  "total_blocked": {
+    "since": "$NFT_SINCE",
+    "scanners_v4_packets": $SCANNER_PKTS_V4,
+    "scanners_v4_bytes": $SCANNER_BYTES_V4,
+    "scanners_v6_packets": $SCANNER_PKTS_V6,
+    "scanners_v6_bytes": $SCANNER_BYTES_V6,
+    "confirmed_v4_packets": $CONFIRMED_PKTS_V4,
+    "confirmed_v4_bytes": $CONFIRMED_BYTES_V4,
+    "syn_confirmed_v4_packets": $SYN_CONF_PKTS_V4,
+    "udp_confirmed_v4_packets": $UDP_CONF_PKTS_V4
   },
   "last_blocklist_update": "$LAST_UPDATE"
 }
@@ -2019,9 +2243,12 @@ fi
 print_header "ГОТОВО"
 
 echo -e "  ${BOLD}Что настроено:${NC}"
-echo -e "  ├─ ${GREEN}✔${NC} nft rate-limit: 60 SYN/sec TCP, 200 packets/sec UDP (CGNAT-friendly)"
-echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Scanner blocklist:${NC} pre-emptive drop известных сканеров"
-echo -e "  │   └─ обновление каждые 6 часов из shadow-netlab/traffic-guard-lists"
+echo -e "  ├─ ${GREEN}✔${NC} nft rate-limit: 300 SYN/sec TCP, 600 packets/sec UDP (CGNAT-friendly, ban-once)"
+echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Scanner blocklist:${NC} pre-emptive drop российских госсканеров"
+echo -e "  │   ├─ traffic-guard-lists (общие сканеры, Shodan, Censys)"
+echo -e "  │   ├─ ${BOLD}tread-lightly/CyberOK_Skipa_ips${NC} (SKIPA scan-XX, ГРЧЦ, НКЦКИ)"
+echo -e "  │   ├─ ${BOLD}MISP/CIRCL${NC} (honeypot-verified scanner IPs)"
+echo -e "  │   └─ обновление каждые 6 часов из 3 источников"
 echo -e "  ├─ ${GREEN}✔${NC} Защищённые TCP-порты: ${CYAN}$XRAY_PORTS_TCP${NC}"
 [ -n "$XRAY_PORTS_UDP" ] && echo -e "  ├─ ${GREEN}✔${NC} Защищённые UDP-порты: ${CYAN}$XRAY_PORTS_UDP${NC}"
 echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Auto-sync портов с фаерволом:${NC} мгновенно через inotify + 60с safety"
