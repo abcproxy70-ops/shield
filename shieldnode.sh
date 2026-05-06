@@ -1,16 +1,83 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.2 (Commercial Edition)
-#  - nftables rate-limit (kernel-level SYN flood protection)
+#  VPN NODE DDoS PROTECTION v3.6 (Commercial Edition)
+#  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
+#  - nftables connection-flood + slowloris защита (ct count + new-conn rate)
+#  - nftables TCP flag sanity (drop invalid combinations)
 #  - CrowdSec (SSH brute-force + community blocklist)
-#  - SSH-key auto-whitelist (опционально, с дебаунсом)
 #  - guard CLI — снимок состояния защиты (one-shot, no live updates)
+#  - Человекочитаемые логи в /var/log/shieldnode/events.log
 #  - Мгновенное отслеживание изменений в фаерволе через inotify
 #
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
+#  Совместимо с vpn-node-setup.sh v4.0 (XanMod + IPv6 disabled).
+#
+#  v3.6 changelog (compatibility с vpn-node-setup.sh + IPv6 dropped):
+#    - REMOVED: ВСЯ IPv6-логика. Причина: vpn-node-setup.sh отключает IPv6
+#      через /etc/sysctl.d/99-disable-ipv6.conf, и оставленные ip6 sets +
+#      rules были мёртвым кодом, расходовавшим память и засорявшим guard.
+#      Удалено: scanner_blocklist_v6, suspect_v6, confirmed_attack_v6,
+#      syn_flood_v6, udp_flood_v6, newconn_rate_v6, manual_whitelist_v6,
+#      все *_v6 counters, ip6 saddr правила, meta nfproto ipv4/ipv6 фильтры,
+#      MGMT_IPV6 detection в UFW/iptables/firewalld/nftables, BL_V6/SYN_BAN_V6
+#      в guard, *_v6_packets/_bytes в JSON output.
+#    - REMOVED: net.ipv4.tcp_max_syn_backlog из 99-shieldnode.conf.
+#      Причина: vpn-node-setup.sh ставит =65535 в /etc/sysctl.d/99-xray-tuning.conf;
+#      shieldnode перетирал на 4096 (по алфавиту 99-shieldnode > 99-xray).
+#      Не наша зона ответственности — backlog настраивается под профиль RAM.
+#    - REMOVED: net.ipv6.conf.all.accept_source_route, accept_redirects из
+#      99-shieldnode.conf (IPv6 отключён глобально).
+#    - FIX: stale changelog (v3.3) говорил rp_filter=1; фактически с v3.4
+#      ставится =2 (loose). Привёл комментарий в соответствие.
+#
+#  v3.5 changelog (HTTP-flood защита + читаемые логи + cleanup):
+#    - REMOVED: SSH-key auto-whitelist полностью удалён.
+#      Причина: cs-ssh-whitelist на одном из серверов перестал пускать
+#      админа (race condition между journald и cscli decisions). CrowdSec
+#      sshd-bf и ssh-cve коллекции защищают SSH самостоятельно. Manual
+#      whitelist (через UFW ALLOW from <IP>) остаётся.
+#      Удалено: cs-ssh-key-whitelist.sh, cs-ssh-whitelist.service,
+#      postoverflow ssh-key-whitelist.yaml, ШАГ 8, $CS_WHITE/ssh_key_auto.
+#    - ADD: Connection-flood / slowloris / HTTP-flood защита (ШАГ 4):
+#      • ct count limit на src IP для TCP DPT 443: max 50 concurrent → suspect
+#      • new connections rate-limit: 50 new conn/min на src
+#      • TCP flag sanity: drop invalid combinations (FIN+SYN, RST+SYN, all flags)
+#      • manual_whitelist обходит все три проверки
+#    - ADD: Человекочитаемый /var/log/shieldnode/events.log:
+#      • формат: [TS] EVENT_TYPE ip=X port=Y type=Z hits=N
+#      • агрегатор пишет туда параллельно с sqlite
+#      • в guard новый раздел "Recent events" + кнопка [9] view full log
+#    - ADD: /var/log/shieldnode/install.log — все шаги установки через tee
+#    - ADD: /etc/logrotate.d/shieldnode (compress, rotate 30, daily, maxsize 50M)
+#    - CLEANUP: удалены legacy fallback'и парсинга nft через grep/awk (jq есть всегда)
+#    - CLEANUP: удалены закомментированные блоки и дубли apt install jq
+#
+#  v3.4 changelog (VPN forwarding fix):
+#    - FIX: rp_filter=1 (strict) → rp_filter=2 (loose). Strict mode мог
+#      ломать VPN-форвардинг — пакет приходит на eth0, ответ через tun0,
+#      strict rp_filter дропает asymmetric routing. Loose mode (RFC 3704)
+#      разрешает legitimate routing и при этом защищает от IP-spoofing.
+#      Это значение совпадает с vpn-node-setup.sh (XanMod tuning).
+#
+#  v3.3 changelog (security hardening 2026):
+#    - ADD: apt upgrade openssh-server при установке.
+#      Закрывает критические CVE 2025-2026:
+#      • CVE-2025-26466 — pre-auth DoS через SSH2_MSG_PING (введён в 9.5p1)
+#      • CVE-2025-26465 — MitM при VerifyHostKeyDNS=yes
+#      • CVE-2026-35414 — AuthorizedKeysCommand bypass (нужен OpenSSH ≥10.3)
+#    - ADD: sysctl kernel hardening (через /etc/sysctl.d/99-shieldnode.conf):
+#      • net.ipv4.tcp_syncookies=1 — защита от SYN-flood даже при переполнении backlog
+#      • net.ipv4.tcp_max_syn_backlog=4096 — больше места для SYN-RECV соединений
+#      • net.ipv4.tcp_synack_retries=2 — быстрее освобождать слоты при атаке
+#      • net.ipv4.conf.all.rp_filter=2 — защита от IP-spoofing (loose, см. v3.4 fix)
+#      • net.ipv4.conf.all.accept_source_route=0 — отключить source routing
+#      • net.ipv4.icmp_echo_ignore_broadcasts=1 — защита от smurf-атак
+#      • net.ipv4.tcp_rfc1337=1 — защита от TIME_WAIT assassination
+#    - ВНИМАНИЕ: после установки рекомендуется ребут чтобы apt upgrade
+#      применил новый sshd binary.
 #
 #  v3.2 changelog (UI polish + актуализация документации):
 #    - FIX: рамки меню в guard съезжали из-за 2-cell ширины эмодзи в терминалах.
@@ -241,9 +308,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     print_warn "Это удалит:"
     echo "  - nft table inet ddos_protect (rate-limit + scanner-blocklist)"
     echo "  - /etc/nftables.d/ddos-protect.conf"
-    echo "  - cs-ssh-whitelist.service + watcher script"
     echo "  - scanner-blocklist updater + timer"
-    echo "  - postoverflow parser"
     echo ""
     echo "  НЕ удалит:"
     echo "  - сам CrowdSec и bouncer (apt purge crowdsec вручную)"
@@ -257,7 +322,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     esac
 
     # Systemd units
-    for unit in cs-ssh-whitelist scanner-blocklist-update.timer scanner-blocklist-update.service \
+    for unit in scanner-blocklist-update.timer scanner-blocklist-update.service \
                 protected-ports-update.timer protected-ports-update.service \
                 protected-ports-update.path \
                 shieldnode-aggregator.timer shieldnode-aggregator.service \
@@ -265,6 +330,9 @@ if [ "${1:-}" = "--uninstall" ]; then
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
     done
+    # v3.5: legacy unit от ≤v3.4 — удаляем если осталось от старой установки
+    systemctl disable --now cs-ssh-whitelist 2>/dev/null || true
+    rm -f /etc/systemd/system/cs-ssh-whitelist.service
     systemctl daemon-reload
     print_ok "Systemd units удалены"
 
@@ -278,6 +346,18 @@ if [ "${1:-}" = "--uninstall" ]; then
 
     # БД истории событий (v2.9)
     rm -rf /var/lib/shieldnode
+
+    # v3.5: human-readable логи + logrotate
+    rm -rf /var/log/shieldnode
+    rm -f /etc/logrotate.d/shieldnode
+    print_ok "Логи и logrotate-конфиг удалены"
+
+    # Sysctl hardening (v3.3)
+    if [ -f /etc/sysctl.d/99-shieldnode.conf ]; then
+        rm -f /etc/sysctl.d/99-shieldnode.conf
+        sysctl --system >/dev/null 2>&1 || true
+        print_ok "Sysctl hardening удалён (применятся defaults)"
+    fi
 
     # CrowdSec parser
     rm -f /etc/crowdsec/postoverflows/s01-whitelist/ssh-key-whitelist.yaml
@@ -308,6 +388,31 @@ if [ "${1:-}" = "--uninstall" ]; then
     print_header "UNINSTALL ЗАВЕРШЁН"
     echo "Бэкапы остались в /root/vpn-ddos-backup-*"
     exit 0
+fi
+
+# ==============================================================================
+# v3.5: install.log — все шаги установки в /var/log/shieldnode/install.log
+# ==============================================================================
+# Поднимаем тут (до ШАГ 1), чтобы покрыть проверки и весь output установки.
+# Используем tee + process substitution: stdout и stderr идут И на терминал,
+# И в файл. Если tee недоступен или /var/log не пишется — продолжаем без лога.
+INSTALL_LOG_DIR="/var/log/shieldnode"
+INSTALL_LOG="$INSTALL_LOG_DIR/install.log"
+if mkdir -p "$INSTALL_LOG_DIR" 2>/dev/null && touch "$INSTALL_LOG" 2>/dev/null; then
+    chmod 0750 "$INSTALL_LOG_DIR" 2>/dev/null || true
+    chmod 0640 "$INSTALL_LOG" 2>/dev/null || true
+    {
+        echo ""
+        echo "═══════════════════════════════════════════════════════════════"
+        echo "shieldnode install run — $(date '+%Y-%m-%d %H:%M:%S %z')"
+        echo "  host: $(hostname)"
+        echo "  user: $(id -un) (uid=$EUID)"
+        echo "  args: $*"
+        echo "═══════════════════════════════════════════════════════════════"
+    } >> "$INSTALL_LOG"
+    # Перенаправляем stdout И stderr в tee (видим на экране + пишем в лог).
+    # Это ставится ДО первого print_* — все шаги установки попадут в файл.
+    exec > >(tee -a "$INSTALL_LOG") 2>&1
 fi
 
 # ==============================================================================
@@ -392,6 +497,73 @@ if ! nft list ruleset >/dev/null 2>&1; then
     exit 1
 fi
 print_ok "nftables ядерные модули работают"
+
+# v3.3: SECURITY HARDENING
+# Закрытие свежих CVE 2025-2026 + sysctl kernel hardening.
+
+# 1) Апгрейд OpenSSH (закрывает CVE-2025-26465/26466, CVE-2026-35414)
+SSH_VERSION=$(ssh -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+(p[0-9]+)?' | head -1)
+if [ -n "$SSH_VERSION" ]; then
+    print_info "OpenSSH: $SSH_VERSION"
+    # Проверяем версию: < 9.9p2 уязвим к CVE-2025-26466
+    SSH_MAJOR=$(echo "$SSH_VERSION" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if dpkg --compare-versions "$SSH_MAJOR" "lt" "10.3" 2>/dev/null; then
+        print_warn "Версия OpenSSH потенциально уязвима к CVE-2025-26466 / CVE-2026-35414"
+        print_status "Обновляю openssh-server (apt upgrade)..."
+        wait_for_apt_lock
+        if DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y openssh-server openssh-client >/dev/null 2>&1; then
+            NEW_VERSION=$(ssh -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+(p[0-9]+)?' | head -1)
+            if [ "$NEW_VERSION" != "$SSH_VERSION" ]; then
+                print_ok "OpenSSH обновлён: $SSH_VERSION → $NEW_VERSION"
+                print_info "Перезагрузи ssh: systemctl restart ssh (или ребут)"
+            else
+                print_info "OpenSSH уже последней версии в репо ($SSH_VERSION)"
+                print_info "Если репо старый — обнови дистрибутив или через backports"
+            fi
+        else
+            print_warn "Не удалось обновить openssh — продолжаю установку"
+        fi
+    else
+        print_ok "OpenSSH версия не уязвима к известным CVE"
+    fi
+fi
+
+# 2) Sysctl kernel hardening
+print_status "Применяю sysctl kernel hardening..."
+SYSCTL_FILE="/etc/sysctl.d/99-shieldnode.conf"
+cat > "$SYSCTL_FILE" <<'SYSCTL_EOF'
+# Shieldnode kernel hardening v3.6
+# Только то, что НЕ покрыто vpn-node-setup.sh.
+# Перекрывающиеся ключи (tcp_syncookies, tcp_max_syn_backlog, tcp_rfc1337,
+# rp_filter, accept_redirects, send_redirects, icmp_echo_ignore_broadcasts,
+# nf_conntrack_*) — зона ответственности vpn-node-setup.sh, мы их не трогаем.
+
+# === SYN-flood mitigation (дополнительно к syncookies из setup) ===
+# Сколько раз отправлять SYN+ACK перед сдачей (по умолчанию 5 — слишком много)
+net.ipv4.tcp_synack_retries = 2
+# Сколько раз ретраить SYN при исходящих (по умолчанию 6)
+net.ipv4.tcp_syn_retries = 3
+
+# === Source routing (древняя угроза, всё ещё актуально) ===
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+
+# === ICMP hardening ===
+# Игнорировать bogus ICMP responses (setup уже игнорит broadcast)
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# === Logging ===
+# Логировать martian packets (странные source IP — ранний сигнал атаки)
+net.ipv4.conf.all.log_martians = 1
+SYSCTL_EOF
+
+# Применяем
+if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
+    print_ok "Sysctl hardening применён ($SYSCTL_FILE)"
+else
+    print_warn "Не все sysctl применились (некоторые модули могут отсутствовать)"
+    print_info "Проверь: sysctl -p $SYSCTL_FILE"
+fi
 
 # v1.5: проверим какой метод auth — но НЕ блокируем установку.
 # Скрипт работает с любым типом, просто на разных уровнях защиты.
@@ -514,7 +686,6 @@ detect_firewall_ports() {
     local tcp_list=""
     local udp_list=""
     local mgmt_ipv4=""
-    local mgmt_ipv6=""
 
     case "$fw" in
         ufw)
@@ -546,17 +717,11 @@ detect_firewall_ports() {
                 }
             ' | sort -un | tr '\n' ',' | sed 's/,$//')
 
-            # v2.2: management IPs из правил "ALLOW from <IP>"
+            # v2.2: management IPs из правил "ALLOW from <IP>" (только IPv4, v3.6)
             # Формат: "2222/tcp  ALLOW  213.165.55.166" (3й колонкой идёт IP вместо Anywhere)
             mgmt_ipv4=$(echo "$ufw_out" | awk '
                 $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 != "Anywhere" {
                     if ($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $3
-                }
-            ' | sort -u | tr '\n' ',' | sed 's/,$//')
-
-            mgmt_ipv6=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" {
-                    if ($3 ~ /:/ && $3 !~ /^Anywhere/) print $3
                 }
             ' | sort -u | tr '\n' ',' | sed 's/,$//')
             ;;
@@ -608,10 +773,10 @@ detect_firewall_ports() {
             ;;
 
         nftables)
-            # nft -j: ищем accept-правила с tcp/udp dport
+            # nft -j: ищем accept-правила с tcp/udp dport (jq mandatory, см. ШАГ 1)
             local nft_json
             nft_json=$(nft -j list ruleset 2>/dev/null)
-            if [ -n "$nft_json" ] && command -v jq >/dev/null 2>&1; then
+            if [ -n "$nft_json" ]; then
                 tcp_list=$(echo "$nft_json" | jq -r '
                     .nftables[] | select(.rule?) | .rule
                     | select(any(.expr[]?; .accept))
@@ -632,22 +797,12 @@ detect_firewall_ports() {
                     | tostring
                 ' 2>/dev/null | grep -E '^[0-9]+$' | sort -un | tr '\n' ',' | sed 's/,$//')
             fi
-            # Fallback: regex-парсинг если jq не установлен
-            if [ -z "$tcp_list" ] && [ -z "$udp_list" ]; then
-                local rules
-                rules=$(nft list ruleset 2>/dev/null | grep -E "(tcp|udp) dport" | grep "accept")
-                tcp_list=$(echo "$rules" | grep "tcp dport" | grep -oE 'dport [{0-9 ,}]+' | \
-                    grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-                udp_list=$(echo "$rules" | grep "udp dport" | grep -oE 'dport [{0-9 ,}]+' | \
-                    grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-            fi
             ;;
     esac
 
     echo "$tcp_list"
     echo "$udp_list"
     echo "$mgmt_ipv4"
-    echo "$mgmt_ipv6"
 }
 
 # Получаем сырые списки портов из фаервола
@@ -655,7 +810,6 @@ FW_OUTPUT=$(detect_firewall_ports "$FIREWALL_TYPE")
 RAW_TCP=$(echo "$FW_OUTPUT" | sed -n '1p')
 RAW_UDP=$(echo "$FW_OUTPUT" | sed -n '2p')
 MGMT_IPV4=$(echo "$FW_OUTPUT" | sed -n '3p')
-MGMT_IPV6=$(echo "$FW_OUTPUT" | sed -n '4p')
 
 # Определяем SSH порт чтобы исключить его из защиты
 SSH_PORT=$(ss -tlnpH 2>/dev/null | awk '
@@ -693,12 +847,9 @@ else
     print_info "В фаерволе нет открытых UDP-портов (Hysteria/TUIC/QUIC будет нечего защищать)"
 fi
 
-# v2.2: автоматический whitelist для management-IP (правила "ALLOW from <IP>")
+# v2.2: manual whitelist для management-IP (правила UFW "ALLOW from <IP>")
 if [ -n "$MGMT_IPV4" ]; then
-    print_ok "Management IPv4 (auto-whitelist): ${BOLD}$MGMT_IPV4${NC}"
-fi
-if [ -n "$MGMT_IPV6" ]; then
-    print_ok "Management IPv6 (auto-whitelist): ${BOLD}$MGMT_IPV6${NC}"
+    print_ok "Management IPv4 (manual whitelist): ${BOLD}$MGMT_IPV4${NC}"
 fi
 
 if [ -z "$PROTECTED_TCP" ] && [ -z "$PROTECTED_UDP" ]; then
@@ -714,14 +865,10 @@ XRAY_PORTS_TCP="$PROTECTED_TCP"
 XRAY_PORTS_UDP="$PROTECTED_UDP"
 XRAY_PORTS=$(echo "${XRAY_PORTS_TCP},${XRAY_PORTS_UDP}" | tr ',' '\n' | grep -v '^$' | sort -un | tr '\n' ',' | sed 's/,$//')
 
-# v2.2: management IPs для nft set
+# v2.2: management IPs для nft set (только IPv4, v3.6)
 MANUAL_WHITELIST_V4_INIT=""
-MANUAL_WHITELIST_V6_INIT=""
 if [ -n "$MGMT_IPV4" ]; then
     MANUAL_WHITELIST_V4_INIT="        elements = { $(echo "$MGMT_IPV4" | sed 's/,/, /g') }"
-fi
-if [ -n "$MGMT_IPV6" ]; then
-    MANUAL_WHITELIST_V6_INIT="        elements = { $(echo "$MGMT_IPV6" | sed 's/,/, /g') }"
 fi
 
 # Инициализирующие elements для nft-set
@@ -831,13 +978,13 @@ cat > "$NFT_DDOS_CONF" <<EOF
 # Списки обновляются каждые 6 часов через scanner-blocklist-update.timer.
 #
 # Whitelist в ЭТОЙ таблице — только runtime-добавленные IP (для ручного
-# исключения). Основной whitelist админа управляется CrowdSec'ом
-# через ssh-key auto-whitelist (см. /etc/crowdsec/postoverflows/...).
+# исключения). Manual whitelist управляется через UFW (ALLOW from <IP>):
+# скрипт update-protected-ports.sh синхронит management-IP из UFW в nft.
 #
 # Test:    hping3 -S -p ${XRAY_PORTS%%,*} -i u100 <YOUR_VPN_IP>
 # Monitor: nft list set inet ddos_protect syn_flood_v4
 #          nft list set inet ddos_protect scanner_blocklist_v4 | wc -l
-# Remove:  bash vpn-node-ddos-protect-v1_4.sh --uninstall
+# Remove:  bash vpn-node-ddos-protect-v3_5.sh --uninstall
 
 # Идемпотентность
 table inet ddos_protect
@@ -870,13 +1017,6 @@ $XRAY_PORTS_UDP_INIT
         # Размер для ~50k подсетей с запасом
         size 131072
     }
-    set scanner_blocklist_v6 {
-        type ipv6_addr
-        flags interval
-        auto-merge
-        size 131072
-    }
-
     # --- v2.5: STAGE 1 — SUSPECT (наблюдение 5 минут) ---
     # IP попадает сюда при первом превышении лимита.
     # Трафик НЕ дропается. Если за 5 минут IP опять превышает — переводим в confirmed.
@@ -887,24 +1027,12 @@ $XRAY_PORTS_UDP_INIT
         timeout 5m
         size 65536
     }
-    set suspect_v6 {
-        type ipv6_addr
-        flags dynamic, timeout
-        timeout 5m
-        size 65536
-    }
 
     # --- v2.5: STAGE 2 — CONFIRMED ATTACK (бан 1 час) ---
     # Сюда IP попадает если уже сидел в suspect и опять превысил лимит.
     # Это значит — точно атака, баним всерьёз.
     set confirmed_attack_v4 {
         type ipv4_addr
-        flags dynamic, timeout
-        timeout 1h
-        size 65536
-    }
-    set confirmed_attack_v6 {
-        type ipv6_addr
         flags dynamic, timeout
         timeout 1h
         size 65536
@@ -920,20 +1048,19 @@ $XRAY_PORTS_UDP_INIT
         timeout 1m
         size 65536
     }
-    set syn_flood_v6 {
-        type ipv6_addr
-        flags dynamic, timeout
-        timeout 1m
-        size 65536
-    }
     set udp_flood_v4 {
         type ipv4_addr
         flags dynamic, timeout
         timeout 1m
         size 65536
     }
-    set udp_flood_v6 {
-        type ipv6_addr
+
+    # v3.5: rate-limit новых TCP-соединений (отдельно от SYN-flood — SYN считает ВСЕ
+    # SYN-пакеты включая retry, а это считает уникальные new-conn по conntrack).
+    # Дополняет SYN-rate-limit для случаев когда атакующий шлёт мало SYN, но
+    # быстро открывает/закрывает много соединений (HTTP-flood через TLS).
+    set newconn_rate_v4 {
+        type ipv4_addr
         flags dynamic, timeout
         timeout 1m
         size 65536
@@ -949,24 +1076,18 @@ $XRAY_PORTS_UDP_INIT
         auto-merge
 $MANUAL_WHITELIST_V4_INIT
     }
-    set manual_whitelist_v6 {
-        type ipv6_addr
-        flags interval
-        auto-merge
-$MANUAL_WHITELIST_V6_INIT
-    }
 
     # v2.7: Named counters для статистики "всего заблокировано".
     # Каждый counter сохраняет packets и bytes с момента старта nft.
     # Сбрасываются при ребуте/перезагрузке правил.
     counter scanner_drops_v4 { }
-    counter scanner_drops_v6 { }
     counter confirmed_drops_v4 { }
-    counter confirmed_drops_v6 { }
     counter syn_confirmed_v4 { }
-    counter syn_confirmed_v6 { }
     counter udp_confirmed_v4 { }
-    counter udp_confirmed_v6 { }
+    # v3.5: counters для HTTP/connection-flood защиты
+    counter conn_flood_v4 { }     # ct count > 50 на src
+    counter newconn_flood_v4 { }  # >50 new conn/min на src
+    counter tcp_invalid { }       # invalid TCP flag combos
 
     chain prerouting {
         type filter hook prerouting priority -100; policy accept;
@@ -975,37 +1096,83 @@ $MANUAL_WHITELIST_V6_INIT
         ct state established,related accept
 
         # Manual whitelist (всегда первым приоритетом)
-        ip  saddr @manual_whitelist_v4 accept
-        ip6 saddr @manual_whitelist_v6 accept
+        ip saddr @manual_whitelist_v4 accept
 
         # SSH — без блокировок (защищает CrowdSec)
         tcp dport $SSH_PORT accept
 
+        # === v3.5: TCP FLAG SANITY ===
+        # Дропаем пакеты с невозможными комбинациями TCP-флагов.
+        # Используются port-сканерами (nmap -sN/-sF/-sX), evasion-сценариями,
+        # и stateless-атаками. Легитимный трафик их не использует.
+        # tcp flags syn,fin    → SYN+FIN одновременно (XMAS-вариант)
+        # tcp flags syn,rst    → SYN+RST одновременно (невозможно в TCP)
+        # tcp flags fin,rst    → FIN+RST одновременно (нет смысла)
+        # tcp flags == 0x0     → null scan (все флаги выключены)
+        # tcp flags == fin,psh,urg → XMAS scan (nmap -sX)
+        tcp flags & (fin|syn) == (fin|syn) counter name tcp_invalid drop
+        tcp flags & (syn|rst) == (syn|rst) counter name tcp_invalid drop
+        tcp flags & (fin|rst) == (fin|rst) counter name tcp_invalid drop
+        tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter name tcp_invalid drop
+        tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|psh|urg) counter name tcp_invalid drop
+
         # Pre-emptive drop известных сканеров (с counter v2.7).
         # Стоит ПЕРЕД rate-limit — экономит conntrack-слоты и CPU.
         # v2.9: log с rate-limit 1/sec на IP — для history БД (агрегатор парсит journald)
-        ip  saddr @scanner_blocklist_v4 limit rate 1/second \\
+        ip saddr @scanner_blocklist_v4 limit rate 1/second \\
             log prefix "[shield:scanner] " level info flags ip options \\
             counter name scanner_drops_v4 drop
-        ip  saddr @scanner_blocklist_v4 counter name scanner_drops_v4 drop
-        ip6 saddr @scanner_blocklist_v6 limit rate 1/second \\
-            log prefix "[shield:scanner] " level info \\
-            counter name scanner_drops_v6 drop
-        ip6 saddr @scanner_blocklist_v6 counter name scanner_drops_v6 drop
+        ip saddr @scanner_blocklist_v4 counter name scanner_drops_v4 drop
 
         # === v2.5: BAN-ONCE АРХИТЕКТУРА ===
         # Двухэтапная проверка перед баном — снижает ложные баны CGNAT/мобильных.
         #
         # Этап 0: Если IP в confirmed_attack — он уже подтверждённый атакующий, дропаем.
         # v2.9: log с rate-limit 1/sec на IP — для history БД
-        ip  saddr @confirmed_attack_v4 limit rate 1/second \\
+        ip saddr @confirmed_attack_v4 limit rate 1/second \\
             log prefix "[shield:ddos] " level info flags ip options \\
             counter name confirmed_drops_v4 drop
-        ip  saddr @confirmed_attack_v4 counter name confirmed_drops_v4 drop
-        ip6 saddr @confirmed_attack_v6 limit rate 1/second \\
-            log prefix "[shield:ddos] " level info \\
-            counter name confirmed_drops_v6 drop
-        ip6 saddr @confirmed_attack_v6 counter name confirmed_drops_v6 drop
+        ip saddr @confirmed_attack_v4 counter name confirmed_drops_v4 drop
+
+        # === v3.5: CONNECTION-FLOOD / SLOWLORIS ЗАЩИТА ===
+        # Защищает от: тысяч одновременных TCP-соединений с одного IP,
+        # медленного TLS handshake (slowloris), HTTP-flood через established TCP.
+        # Применяется только к защищаемым TCP-портам (Xray/Reality/sing-box).
+        # manual_whitelist уже пропущен выше.
+        #
+        # Лимиты подобраны для VPN-трафика:
+        #   ct count    > 50  — concurrent connections per src IP (mux=5-20 норма,
+        #                       CGNAT с 50 юзерами = до 1000, но это редкость
+        #                       одновременно — большинство idle)
+        #   new conn    > 50/min — скорость открытия новых соединений
+        #
+        # Поведение: первое нарушение → suspect (5 мин watch, no drop),
+        # второе → confirmed_attack (1h drop). Та же ban-once что у SYN-flood.
+
+        # Этап 2: IP уже в suspect и снова превышает ct count → confirmed + drop.
+        tcp dport @protected_ports_tcp ct state new ip saddr @suspect_v4 \\
+            ct count over 50 \\
+            add @confirmed_attack_v4 { ip saddr } counter name conn_flood_v4 drop
+
+        # Этап 1: первое превышение ct count → suspect (no drop).
+        tcp dport @protected_ports_tcp ct state new \\
+            ct count over 50 \\
+            add @suspect_v4 { ip saddr } counter name conn_flood_v4
+
+        # === v3.5: NEW CONNECTION RATE-LIMIT ===
+        # Отдельно от SYN — считает уникальные new-conn по conntrack
+        # (SYN-rate ловит retry/duplicate, а это — реальную скорость подключений).
+        # Лимит: 50 new-conn/минуту на src IP.
+
+        # Этап 2: suspect + снова превышает → confirmed.
+        tcp dport @protected_ports_tcp ct state new ip saddr @suspect_v4 \\
+            add @newconn_rate_v4 { ip saddr limit rate over 50/minute burst 100 packets } \\
+            add @confirmed_attack_v4 { ip saddr } counter name newconn_flood_v4 drop
+
+        # Этап 1: первое превышение → suspect.
+        tcp dport @protected_ports_tcp ct state new \\
+            add @newconn_rate_v4 { ip saddr limit rate over 50/minute burst 100 packets } \\
+            add @suspect_v4 { ip saddr } counter name newconn_flood_v4
 
         # === TCP SYN rate-limit на защищаемых портах ===
         # Лимит: 300 SYN/sec, burst 500. CGNAT-friendly.
@@ -1014,18 +1181,12 @@ $MANUAL_WHITELIST_V6_INIT
         tcp dport @protected_ports_tcp ct state new ip saddr @suspect_v4 \\
             add @syn_flood_v4 { ip saddr limit rate over 300/second burst 500 packets } \\
             add @confirmed_attack_v4 { ip saddr } counter name syn_confirmed_v4 drop
-        tcp dport @protected_ports_tcp ct state new ip6 saddr @suspect_v6 \\
-            add @syn_flood_v6 { ip6 saddr limit rate over 300/second burst 500 packets } \\
-            add @confirmed_attack_v6 { ip6 saddr } counter name syn_confirmed_v6 drop
 
         # Этап 1: IP не в suspect, но превышает → добавляем в suspect (не дропаем!).
         # Цель: дать IP "испытательный срок" 5 минут. Случайные всплески пройдут.
-        tcp dport @protected_ports_tcp ct state new meta nfproto ipv4 \\
+        tcp dport @protected_ports_tcp ct state new \\
             add @syn_flood_v4 { ip saddr limit rate over 300/second burst 500 packets } \\
             add @suspect_v4 { ip saddr }
-        tcp dport @protected_ports_tcp ct state new meta nfproto ipv6 \\
-            add @syn_flood_v6 { ip6 saddr limit rate over 300/second burst 500 packets } \\
-            add @suspect_v6 { ip6 saddr }
 
         # === UDP rate-limit на защищаемых портах ===
         # Лимит: 600 packets/sec, burst 1000. UDP шлёт больше мелких пакетов.
@@ -1034,17 +1195,11 @@ $MANUAL_WHITELIST_V6_INIT
         udp dport @protected_ports_udp ip saddr @suspect_v4 \\
             add @udp_flood_v4 { ip saddr limit rate over 600/second burst 1000 packets } \\
             add @confirmed_attack_v4 { ip saddr } counter name udp_confirmed_v4 drop
-        udp dport @protected_ports_udp ip6 saddr @suspect_v6 \\
-            add @udp_flood_v6 { ip6 saddr limit rate over 600/second burst 1000 packets } \\
-            add @confirmed_attack_v6 { ip6 saddr } counter name udp_confirmed_v6 drop
 
         # Этап 1: первое превышение
-        udp dport @protected_ports_udp meta nfproto ipv4 \\
+        udp dport @protected_ports_udp \\
             add @udp_flood_v4 { ip saddr limit rate over 600/second burst 1000 packets } \\
             add @suspect_v4 { ip saddr }
-        udp dport @protected_ports_udp meta nfproto ipv6 \\
-            add @udp_flood_v6 { ip6 saddr limit rate over 600/second burst 1000 packets } \\
-            add @suspect_v6 { ip6 saddr }
     }
 }
 EOF
@@ -1155,7 +1310,6 @@ detect_firewall_ports() {
     local tcp_list=""
     local udp_list=""
     local mgmt_ipv4=""
-    local mgmt_ipv6=""
 
     case "$fw" in
         ufw)
@@ -1183,15 +1337,10 @@ detect_firewall_ports() {
                     }
                 }
             ' | sort -un | tr '\n' ',' | sed 's/,$//')
-            # v2.2: management IPs
+            # v2.2: management IPs (только IPv4, v3.6)
             mgmt_ipv4=$(echo "$ufw_out" | awk '
                 $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 != "Anywhere" {
                     if ($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $3
-                }
-            ' | sort -u | tr '\n' ',' | sed 's/,$//')
-            mgmt_ipv6=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" {
-                    if ($3 ~ /:/ && $3 !~ /^Anywhere/) print $3
                 }
             ' | sort -u | tr '\n' ',' | sed 's/,$//')
             ;;
@@ -1226,19 +1375,35 @@ detect_firewall_ports() {
                 grep -v '^0\.0\.0\.0' | sort -u | tr '\n' ',' | sed 's/,$//')
             ;;
         nftables)
-            local rules
-            rules=$(nft list ruleset 2>/dev/null | grep -E "(tcp|udp) dport" | grep "accept")
-            tcp_list=$(echo "$rules" | grep "tcp dport" | grep -oE 'dport [{0-9 ,}]+' | \
-                grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
-            udp_list=$(echo "$rules" | grep "udp dport" | grep -oE 'dport [{0-9 ,}]+' | \
-                grep -oE '[0-9]+' | sort -un | tr '\n' ',' | sed 's/,$//')
+            # v3.5: jq-парсинг (jq mandatory, ставится в ШАГ 1).
+            local nft_json
+            nft_json=$(nft -j list ruleset 2>/dev/null)
+            if [ -n "$nft_json" ]; then
+                tcp_list=$(echo "$nft_json" | jq -r '
+                    .nftables[] | select(.rule?) | .rule
+                    | select(any(.expr[]?; .accept))
+                    | .expr[] | select(.match?)
+                    | select(.match.left.payload.protocol == "tcp")
+                    | .match.right
+                    | if type == "object" and .set then .set[] elif type == "array" then .[] else . end
+                    | tostring
+                ' 2>/dev/null | grep -E '^[0-9]+$' | sort -un | tr '\n' ',' | sed 's/,$//')
+                udp_list=$(echo "$nft_json" | jq -r '
+                    .nftables[] | select(.rule?) | .rule
+                    | select(any(.expr[]?; .accept))
+                    | .expr[] | select(.match?)
+                    | select(.match.left.payload.protocol == "udp")
+                    | .match.right
+                    | if type == "object" and .set then .set[] elif type == "array" then .[] else . end
+                    | tostring
+                ' 2>/dev/null | grep -E '^[0-9]+$' | sort -un | tr '\n' ',' | sed 's/,$//')
+            fi
             ;;
     esac
 
     echo "$tcp_list"
     echo "$udp_list"
     echo "$mgmt_ipv4"
-    echo "$mgmt_ipv6"
 }
 
 exclude_port() {
@@ -1251,7 +1416,6 @@ FW_OUTPUT=$(detect_firewall_ports "$FIREWALL_TYPE")
 NEW_TCP=$(echo "$FW_OUTPUT" | sed -n '1p')
 NEW_UDP=$(echo "$FW_OUTPUT" | sed -n '2p')
 NEW_MGMT_V4=$(echo "$FW_OUTPUT" | sed -n '3p')
-NEW_MGMT_V6=$(echo "$FW_OUTPUT" | sed -n '4p')
 
 # Исключаем SSH из TCP
 NEW_TCP=$(exclude_port "$NEW_TCP" "$SSH_PORT")
@@ -1296,8 +1460,9 @@ fi
 
 # v2.4: Lock-файл — предотвращает одновременный запуск (path-unit + timer).
 # flock с -n (non-blocking) — если уже запущен другой instance, выходим.
-LOCKFILE="/run/cs-ssh-whitelist/.ports-update.lock"
-mkdir -p /run/cs-ssh-whitelist 2>/dev/null
+# v3.5: переехали в /run/shieldnode (cs-ssh-whitelist удалён).
+LOCKFILE="/run/shieldnode/.ports-update.lock"
+mkdir -p /run/shieldnode 2>/dev/null
 exec 200>"$LOCKFILE"
 if ! flock -n 200; then
     logger -t "$LOG_TAG" "SKIP: another update already in progress"
@@ -1317,14 +1482,10 @@ trap 'rm -f "$TMP"' EXIT
     if [ -n "$NEW_UDP" ]; then
         echo "add element inet ddos_protect protected_ports_udp { $(echo "$NEW_UDP" | sed 's/,/, /g') }"
     fi
-    # v2.2: синхронизируем management whitelist
+    # v2.2: синхронизируем management whitelist (только IPv4, v3.6)
     echo "flush set inet ddos_protect manual_whitelist_v4"
     if [ -n "$NEW_MGMT_V4" ]; then
         echo "add element inet ddos_protect manual_whitelist_v4 { $(echo "$NEW_MGMT_V4" | sed 's/,/, /g') }"
-    fi
-    echo "flush set inet ddos_protect manual_whitelist_v6"
-    if [ -n "$NEW_MGMT_V6" ]; then
-        echo "add element inet ddos_protect manual_whitelist_v6 { $(echo "$NEW_MGMT_V6" | sed 's/,/, /g') }"
     fi
 } > "$TMP"
 
@@ -1358,6 +1519,11 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# v3.5: lock-файл /run/shieldnode/.ports-update.lock (раньше использовался
+# /run/cs-ssh-whitelist, удалён вместе с auto-whitelist).
+RuntimeDirectory=shieldnode
+RuntimeDirectoryMode=0755
+ReadWritePaths=/run/shieldnode
 EOF
 
 # v1.8: Timer как safety net каждые 60 секунд
@@ -1440,7 +1606,7 @@ fi
 print_header "ШАГ 6: SCANNER-BLOCKLIST UPDATER"
 
 # v1.3: качаем подсети известных сканеров (Shodan, Censys, BinaryEdge,
-# госсканеры РФ/CN/etc) и кладём их в nft set scanner_blocklist_v4/v6.
+# госсканеры РФ/CN/etc) и кладём их в nft set scanner_blocklist_v4.
 # Источник: https://github.com/shadow-netlab/traffic-guard-lists
 #
 # Обновляется раз в 6 часов через systemd timer.
@@ -1508,18 +1674,11 @@ if [ ! -s "$TMP/all.raw" ]; then
     exit 1
 fi
 
-# Извлекаем валидные IPv4-подсети (с CIDR или без)
+# Извлекаем валидные IPv4-подсети (с CIDR или без). v3.6: IPv6 убран — ядро отключает v6.
 grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$TMP/all.raw" | \
     sort -u > "$TMP/v4.list"
 
-# IPv6: строки содержащие ':' и валидные hex
-grep ':' "$TMP/all.raw" | \
-    grep -oE '^[0-9a-fA-F:]+(/[0-9]+)?' | \
-    grep -E '[0-9a-fA-F]{1,4}:[0-9a-fA-F:]*' | \
-    sort -u > "$TMP/v6.list"
-
 V4_COUNT=$(wc -l < "$TMP/v4.list")
-V6_COUNT=$(wc -l < "$TMP/v6.list")
 
 # Sanity: если в списке слишком мало — что-то сломалось, не применяем
 if [ "$V4_COUNT" -lt 10 ]; then
@@ -1534,14 +1693,10 @@ fi
         # Группами по 1000 элементов на add (производительнее чем по одному)
         awk 'NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet ddos_protect scanner_blocklist_v4 { " } { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 } END { print " }" }' "$TMP/v4.list"
     fi
-    echo "flush set inet ddos_protect scanner_blocklist_v6"
-    if [ -s "$TMP/v6.list" ]; then
-        awk 'NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet ddos_protect scanner_blocklist_v6 { " } { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 } END { print " }" }' "$TMP/v6.list"
-    fi
 } > "$TMP/nft-batch"
 
 if nft -f "$TMP/nft-batch" 2>"$TMP/nft.err"; then
-    logger -t "$LOG_TAG" "Updated: $V4_COUNT IPv4, $V6_COUNT IPv6 подсетей"
+    logger -t "$LOG_TAG" "Updated: $V4_COUNT IPv4 подсетей"
     exit 0
 else
     logger -t "$LOG_TAG" "ERROR: nft -f failed: $(cat "$TMP/nft.err")"
@@ -1593,9 +1748,8 @@ print_status "Качаю scanner blocklist (первый запуск)..."
 if systemctl start scanner-blocklist-update.service; then
     sleep 2
     BLOCKLIST_V4_SIZE=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | grep -c '/' || echo 0)
-    BLOCKLIST_V6_SIZE=$(nft list set inet ddos_protect scanner_blocklist_v6 2>/dev/null | grep -c '/' || echo 0)
     if [ "$BLOCKLIST_V4_SIZE" -gt 0 ]; then
-        print_ok "Blocklist загружен: $BLOCKLIST_V4_SIZE v4 / $BLOCKLIST_V6_SIZE v6 подсетей"
+        print_ok "Blocklist загружен: $BLOCKLIST_V4_SIZE v4 подсетей"
     else
         print_warn "Blocklist пуст — проверь логи: journalctl -u scanner-blocklist-update"
     fi
@@ -1665,160 +1819,10 @@ if cscli collections list 2>/dev/null | grep -q "^crowdsecurity/iptables"; then
 fi
 
 # ==============================================================================
-# ШАГ 8: SSH-KEY AUTO-WHITELIST
+# ШАГ 8: BAN DURATION (4h — баланс между защитой и ложными срабатываниями)
 # ==============================================================================
 
-print_header "ШАГ 8: SSH-KEY AUTO-WHITELIST"
-
-# v1.2: динамический whitelist по успешному key-auth.
-# Двойная защита:
-#   1. Postoverflow-парсер — отбрасывает алерты от whitelisted IP до того,
-#      как они дойдут до bouncer'а (защита от собственных сценариев типа
-#      ssh-bf, http-crawl-non_statics).
-#   2. Decision-whitelist через cscli — перебивает community blocklist.
-#      Если твой IP вдруг попал в общий бан-лист (бывает на shared NAT
-#      или мобильных провайдерах), ты всё равно зайдёшь.
-
-# --- 6a. Postoverflow parser ---
-WHITELIST_PARSER="/etc/crowdsec/postoverflows/s01-whitelist/ssh-key-whitelist.yaml"
-mkdir -p "$(dirname "$WHITELIST_PARSER")"
-
-# v1.2: используем уже существующий decision-whitelist через cscli.
-# Postoverflow-фильтр проверяет наличие decision'а с типом whitelist.
-cat > "$WHITELIST_PARSER" <<'EOF'
-# Generated by vpn-node-ddos-protect v1.2
-# Сбрасывает overflow-сигналы для IP, которые уже в decisions whitelist.
-# Парные decision'ы создаёт сервис cs-ssh-whitelist.service (см. ниже).
-name: admin/ssh-key-whitelist
-description: "Drop alerts from IPs whitelisted via successful SSH publickey auth"
-whitelist:
-  reason: "ssh-key-auth dynamic whitelist"
-  expression:
-    - "evt.Overflow.Sources != nil"
-EOF
-
-chmod 0644 "$WHITELIST_PARSER"
-print_ok "Postoverflow parser: $WHITELIST_PARSER"
-
-# --- 6b. Watcher script ---
-CS_HOOK_SCRIPT="/usr/local/sbin/cs-ssh-key-whitelist.sh"
-
-cat > "$CS_HOOK_SCRIPT" <<'WATCHER_EOF'
-#!/bin/bash
-# Watches sshd journal for successful publickey logins, adds source IP
-# to crowdsec decisions as whitelist for 12h.
-# Started by cs-ssh-whitelist.service.
-#
-# v1.5 SECURITY NOTE: ловится ТОЛЬКО "Accepted publickey".
-# Это безопасно даже если PasswordAuthentication=yes:
-#   - "Accepted password"        → НЕ whitelist (атакующий с паролем не попадёт)
-#   - "Accepted keyboard-..."    → НЕ whitelist
-#   - "Accepted publickey"       → whitelist (только владелец ключа)
-# Таким образом, скрипт работает корректно в любой конфигурации SSH.
-
-WHITELIST_DURATION="12h"
-DEBOUNCE_SEC=60  # v1.9: не обновлять whitelist для того же IP чаще раз в 60 сек
-DEBOUNCE_DIR="/run/cs-ssh-whitelist"
-mkdir -p "$DEBOUNCE_DIR"
-
-# Используем journalctl с --since=now чтобы не обрабатывать старые записи
-# при перезапуске сервиса (иначе при рестарте можно whitelist'ить IP'шки
-# которых давно не существует).
-journalctl _SYSTEMD_UNIT=ssh.service _SYSTEMD_UNIT=sshd.service \
-    -f -n 0 --output=cat --since=now 2>/dev/null | \
-while IFS= read -r line; do
-    case "$line" in
-        *"Accepted publickey for"*)
-            # Парсим: Accepted publickey for USER from IP port PORT ssh2: KEYTYPE FP
-            IP=$(printf '%s\n' "$line" | grep -oE 'from [0-9a-fA-F.:]+' | awk '{print $2}')
-            USER=$(printf '%s\n' "$line" | grep -oE 'for [^ ]+' | awk '{print $2}')
-
-            # Sanity checks
-            case "$IP" in
-                ""|127.0.0.1|::1) continue ;;
-                *[!0-9a-fA-F.:]*)  continue ;;
-            esac
-
-            # v1.9: debounce — пропускаем cscli если этот IP логинился < 60 сек назад.
-            # Защита от шторма forks при множественных одновременных логинах
-            # (например, ansible / fabric / parallel-ssh).
-            DEBOUNCE_FILE="$DEBOUNCE_DIR/$(echo "$IP" | tr ':' '_')"
-            NOW=$(date +%s)
-            if [ -f "$DEBOUNCE_FILE" ]; then
-                LAST=$(cat "$DEBOUNCE_FILE" 2>/dev/null)
-                if [ -n "$LAST" ] && [ $((NOW - LAST)) -lt "$DEBOUNCE_SEC" ]; then
-                    # Слишком частые логины с этого IP — пропускаем cscli
-                    continue
-                fi
-            fi
-            echo "$NOW" > "$DEBOUNCE_FILE"
-
-            # Идемпотентность: если IP уже в whitelist — продлеваем (delete + add)
-            cscli decisions delete --ip "$IP" --type whitelist >/dev/null 2>&1 || true
-            cscli decisions add \
-                --ip "$IP" \
-                --type whitelist \
-                --duration "$WHITELIST_DURATION" \
-                --reason "ssh-key-auth user=$USER" >/dev/null 2>&1
-
-            logger -t cs-ssh-whitelist "Whitelisted $IP for $WHITELIST_DURATION (user=$USER)"
-            ;;
-    esac
-done
-WATCHER_EOF
-
-chmod 0755 "$CS_HOOK_SCRIPT"
-print_ok "Watcher: $CS_HOOK_SCRIPT"
-
-# --- 6c. Systemd unit ---
-cat > /etc/systemd/system/cs-ssh-whitelist.service <<EOF
-[Unit]
-Description=CrowdSec SSH key-auth auto-whitelist
-After=crowdsec.service ssh.service systemd-journald.service
-Wants=crowdsec.service
-
-[Service]
-Type=simple
-ExecStart=$CS_HOOK_SCRIPT
-Restart=always
-RestartSec=10
-# Безопасность сервиса
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=/var/log
-# Сервису нужны: journalctl (read), cscli (запись decisions через socket).
-# v2.3 fix: leading "-" делает путь optional — если каталога нет, systemd
-# не падает с "Failed to set up mount namespacing". Это бывает когда
-# crowdsec ещё не создал /var/run/crowdsec (новая установка, до первого старта).
-ReadWritePaths=-/var/run/crowdsec
-ReadWritePaths=-/run/crowdsec
-# v2.1.1: дебаунс-кэш для предотвращения шторма cscli при множественных логинах
-ReadWritePaths=/run/cs-ssh-whitelist
-# Системд автоматически создаст каталог по этому пути перед стартом
-RuntimeDirectory=cs-ssh-whitelist
-RuntimeDirectoryMode=0700
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-
-# --- 6d. Bootstrap текущего IP ---
-# Сервис стартует ПОСЛЕ crowdsec, но чтобы не ждать первого ре-логина —
-# сразу добавим текущий админский IP в whitelist.
-if [ -n "$ADMIN_IP" ]; then
-    # Сохраним bootstrap-команду на потом — выполним после старта crowdsec
-    BOOTSTRAP_IP="$ADMIN_IP"
-fi
-
-# ==============================================================================
-# ШАГ 9: BAN DURATION (4h — баланс между защитой и ложными срабатываниями)
-# ==============================================================================
-
-print_header "ШАГ 9: BAN DURATION"
+print_header "ШАГ 8: BAN DURATION"
 
 # v1.4: ban duration возвращён к дефолтным 4h (было 24h в v1.1-1.3).
 # Причина: при ложном срабатывании (юзер за CGNAT, общий IP с атакующим)
@@ -1848,10 +1852,10 @@ else
 fi
 
 # ==============================================================================
-# ШАГ 10: ACQUISITION (источники логов для CrowdSec)
+# ШАГ 9: ACQUISITION (источники логов для CrowdSec)
 # ==============================================================================
 
-print_header "ШАГ 10: ACQUISITION"
+print_header "ШАГ 9: ACQUISITION"
 
 # v1.4: убрана UFW/iptables acquisition. В v1.1-1.3 она питала сценарий
 # crowdsecurity/iptables-scan-multi_ports который ложно срабатывал на
@@ -1883,10 +1887,10 @@ else
 fi
 
 # ==============================================================================
-# ШАГ 11: NFTABLES BOUNCER
+# ШАГ 10: NFTABLES BOUNCER
 # ==============================================================================
 
-print_header "ШАГ 11: NFTABLES BOUNCER"
+print_header "ШАГ 10: NFTABLES BOUNCER"
 
 if dpkg -l crowdsec-firewall-bouncer-nftables &>/dev/null; then
     print_info "Bouncer уже установлен"
@@ -1911,20 +1915,8 @@ fi
 
 systemctl enable --now crowdsec >/dev/null 2>&1 || true
 systemctl enable --now crowdsec-firewall-bouncer >/dev/null 2>&1 || true
-systemctl enable --now cs-ssh-whitelist >/dev/null 2>&1 || true
 
 sleep 3
-
-# Bootstrap: добавляем текущий IP в whitelist (после старта crowdsec)
-if [ -n "${BOOTSTRAP_IP:-}" ]; then
-    if cscli decisions add --ip "$BOOTSTRAP_IP" --type whitelist \
-        --duration 12h --reason "ssh-key-auth bootstrap" >/dev/null 2>&1; then
-        print_ok "Bootstrap whitelist: $BOOTSTRAP_IP на 12h"
-    else
-        print_warn "Не удалось добавить bootstrap whitelist (crowdsec не готов)"
-        print_info "Это ок — при следующем SSH-логине сработает auto-whitelist"
-    fi
-fi
 
 if systemctl is-active --quiet crowdsec && systemctl is-active --quiet crowdsec-firewall-bouncer; then
     print_ok "crowdsec + bouncer активны"
@@ -1935,18 +1927,11 @@ else
     print_info "Логи: journalctl -u crowdsec -u crowdsec-firewall-bouncer -n 50"
 fi
 
-if systemctl is-active --quiet cs-ssh-whitelist; then
-    print_ok "cs-ssh-whitelist активен (мониторит SSH-логины)"
-else
-    print_warn "cs-ssh-whitelist НЕ active"
-    print_info "Логи: journalctl -u cs-ssh-whitelist -n 50"
-fi
-
 # ==============================================================================
-# ШАГ 12: HISTORY AGGREGATOR (события из journald → sqlite)
+# ШАГ 11: HISTORY AGGREGATOR (события из journald → sqlite)
 # ==============================================================================
 
-print_header "ШАГ 12: HISTORY AGGREGATOR"
+print_header "ШАГ 11: HISTORY AGGREGATOR"
 
 # v2.9: парсим логи nftables [shield:scanner] / [shield:ddos] из journald
 # и пишем в /var/lib/shieldnode/events.db с агрегацией.
@@ -1955,6 +1940,31 @@ DB_DIR="/var/lib/shieldnode"
 DB_FILE="$DB_DIR/events.db"
 mkdir -p "$DB_DIR"
 chmod 0750 "$DB_DIR"
+
+# v3.5: human-readable лог-каталог для events.log
+LOG_DIR="/var/log/shieldnode"
+EVENTS_LOG="$LOG_DIR/events.log"
+mkdir -p "$LOG_DIR"
+chmod 0750 "$LOG_DIR"
+touch "$EVENTS_LOG"
+chmod 0640 "$EVENTS_LOG"
+
+# v3.5: logrotate для events.log + install.log
+cat > /etc/logrotate.d/shieldnode <<'LOGROTATE_EOF'
+/var/log/shieldnode/*.log {
+    daily
+    rotate 30
+    maxsize 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+    create 0640 root root
+}
+LOGROTATE_EOF
+print_ok "Logrotate: /etc/logrotate.d/shieldnode (daily, rotate 30, maxsize 50M)"
 
 # Инициализируем БД
 sqlite3 "$DB_FILE" <<'SQL_EOF'
@@ -1985,12 +1995,18 @@ AGG_SCRIPT="/usr/local/sbin/shieldnode-aggregator.sh"
 cat > "$AGG_SCRIPT" <<'AGG_EOF'
 #!/bin/bash
 # Парсит journald на предмет log-сообщений от nft и пишет в sqlite.
+# v3.5: дополнительно пишет человекочитаемый лог в /var/log/shieldnode/events.log
 
 DB="/var/lib/shieldnode/events.db"
+EVENTS_LOG="/var/log/shieldnode/events.log"
 LOG_TAG="shieldnode-agg"
 
 # Если БД нет — выходим
 [ -r "$DB" ] || { logger -t "$LOG_TAG" "DB not found: $DB"; exit 0; }
+
+# v3.5: убедимся что events.log пишется (создан в установщике, но защита от удаления)
+mkdir -p "$(dirname "$EVENTS_LOG")" 2>/dev/null
+touch "$EVENTS_LOG" 2>/dev/null
 
 # Получаем cursor (где остановились в прошлый раз)
 CURSOR=$(sqlite3 "$DB" "SELECT value FROM aggregator_state WHERE key='cursor' LIMIT 1" 2>/dev/null)
@@ -2012,8 +2028,10 @@ fi
 NEW_CURSOR=$(grep -oE '^-- cursor: .+$' "$TMP" | tail -1 | sed 's/^-- cursor: //')
 
 # Парсим сообщения [shield:scanner] и [shield:ddos]
-# Формат kernel-лога: "[shield:scanner] IN=eth0 SRC=85.142.100.2 DST=... PROTO=TCP ..."
+# Формат kernel-лога: "[shield:scanner] IN=eth0 SRC=85.142.100.2 DST=... PROTO=TCP DPT=8443 ..."
 declare -A scanner_ips ddos_ips
+# v3.5: для events.log — собираем порт назначения и тип flood'а
+declare -A ddos_ports ddos_proto
 
 while IFS= read -r line; do
     case "$line" in
@@ -2023,10 +2041,77 @@ while IFS= read -r line; do
             ;;
         *"[shield:ddos]"*)
             ip=$(echo "$line" | grep -oE 'SRC=[^ ]+' | head -1 | cut -d= -f2)
-            [ -n "$ip" ] && ddos_ips[$ip]=$((${ddos_ips[$ip]:-0} + 1))
+            port=$(echo "$line" | grep -oE 'DPT=[0-9]+' | head -1 | cut -d= -f2)
+            proto=$(echo "$line" | grep -oE 'PROTO=[A-Z]+' | head -1 | cut -d= -f2)
+            if [ -n "$ip" ]; then
+                ddos_ips[$ip]=$((${ddos_ips[$ip]:-0} + 1))
+                # Запоминаем последний порт/proto виденный для этого IP
+                [ -n "$port" ] && ddos_ports[$ip]="$port"
+                [ -n "$proto" ] && ddos_proto[$ip]="$proto"
+            fi
             ;;
     esac
 done < "$TMP"
+
+# v3.5: пишем человекочитаемые строки в events.log
+TS=$(date '+%Y-%m-%d %H:%M:%S')
+{
+    for ip in "${!scanner_ips[@]}"; do
+        cnt=${scanner_ips[$ip]}
+        echo "[$TS] SCANNER ip=$ip hits=$cnt"
+    done
+    for ip in "${!ddos_ips[@]}"; do
+        cnt=${ddos_ips[$ip]}
+        port=${ddos_ports[$ip]:-?}
+        proto=${ddos_proto[$ip]:-?}
+        # Тип flood'а: TCP=SYN-flood, UDP=UDP-flood (грубо, более точно — counters в guard)
+        case "$proto" in
+            TCP) ftype="SYN-flood" ;;
+            UDP) ftype="UDP-flood" ;;
+            *)   ftype="$proto-flood" ;;
+        esac
+        echo "[$TS] DDOS BLOCK ip=$ip port=$port type=$ftype hits=$cnt"
+    done
+} >> "$EVENTS_LOG" 2>/dev/null
+
+# v3.5: CrowdSec bans — читаем из decisions, дописываем НОВЫЕ в events.log
+CS_DB="/var/lib/crowdsec/data/crowdsec.db"
+LAST_CS_ID_FILE="/var/lib/shieldnode/.last_crowdsec_decision_id"
+if [ -r "$CS_DB" ]; then
+    LAST_ID=$(cat "$LAST_CS_ID_FILE" 2>/dev/null || echo 0)
+    LAST_ID="${LAST_ID:-0}"
+    NEW_DECISIONS=$(sqlite3 -separator '|' "$CS_DB" \
+        "SELECT id, value, scenario, until FROM decisions WHERE type='ban' AND id > $LAST_ID ORDER BY id" 2>/dev/null)
+    if [ -n "$NEW_DECISIONS" ]; then
+        MAX_ID=$LAST_ID
+        while IFS='|' read -r did val scen until; do
+            [ -z "$did" ] && continue
+            # value формата "Ip:1.2.3.4" или "Range:1.2.3.0/24"
+            ip=${val#*:}
+            # Краткий reason из scenario
+            reason=${scen##*/}
+            # duration: пытаемся прикинуть из until - now
+            if [ -n "$until" ]; then
+                until_ts=$(date -d "$until" +%s 2>/dev/null)
+                now_ts=$(date +%s)
+                if [ -n "$until_ts" ] && [ "$until_ts" -gt "$now_ts" ]; then
+                    dur_sec=$((until_ts - now_ts))
+                    if [ $dur_sec -lt 3600 ]; then dur="${dur_sec}s"
+                    elif [ $dur_sec -lt 86400 ]; then dur="$((dur_sec/3600))h"
+                    else dur="$((dur_sec/86400))d"
+                    fi
+                else
+                    dur="?"
+                fi
+            else
+                dur="?"
+            fi
+            echo "[$TS] CROWDSEC BAN ip=$ip reason=$reason duration=$dur" >> "$EVENTS_LOG"
+            [ "$did" -gt "$MAX_ID" ] && MAX_ID=$did
+        done <<< "$NEW_DECISIONS"
+        echo "$MAX_ID" > "$LAST_CS_ID_FILE" 2>/dev/null
+    fi
+fi
 
 # Bulk-update в БД через одну транзакцию (быстро)
 NOW=$(date +%s)
@@ -2073,6 +2158,7 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=$DB_DIR
+ReadWritePaths=$LOG_DIR
 EOF
 
 cat > /etc/systemd/system/shieldnode-aggregator.timer <<'EOF'
@@ -2095,10 +2181,10 @@ systemctl enable --now shieldnode-aggregator.timer >/dev/null 2>&1
 print_ok "Aggregator timer активен (запуск раз в минуту)"
 
 # ==============================================================================
-# ШАГ 13: УСТАНОВКА КОМАНДЫ guard (снимок состояния)
+# ШАГ 12: УСТАНОВКА КОМАНДЫ guard (снимок состояния)
 # ==============================================================================
 
-print_header "ШАГ 13: УСТАНОВКА КОМАНДЫ guard"
+print_header "ШАГ 12: УСТАНОВКА КОМАНДЫ guard"
 
 # Команда показывает текущее состояние защиты ОДНИМ снимком:
 #   - Статус всех сервисов (CrowdSec, bouncer, watcher'ы)
@@ -2133,13 +2219,15 @@ case "${1:-}" in
 guard — VPN node protection snapshot
 
 Usage:
-  sudo guard            snapshot + interactive menu (1/2/3/4/r/0)
+  sudo guard            snapshot + interactive menu
   sudo guard --once     snapshot only, no menu (for cron / monitoring)
   sudo guard --json     JSON output (for integrations)
 
 Interactive menu:
-  [1] show syn-flood IPs        [3] show whitelist IPs
-  [2] show crowdsec banned IPs  [4] show scanner blocklist samples
+  [1] active attacks            [4] scanner blocklist samples
+  [2] crowdsec banned IPs       [6] recent history
+  [3] whitelist IPs             [7] top attackers (all-time)
+                                [9] view full /var/log/shieldnode/events.log
   [r] refresh                   [0] exit
 
 HELP
@@ -2173,8 +2261,6 @@ CS_DB="/var/lib/crowdsec/data/crowdsec.db"
 collect_stats() {
     SYN_BAN=$(nft list set inet ddos_protect syn_flood_v4 2>/dev/null | \
         grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
-    SYN_BAN_V6=$(nft list set inet ddos_protect syn_flood_v6 2>/dev/null | grep -c 'expires')
-    SYN_BAN_V6="${SYN_BAN_V6:-0}"
 
     UDP_BAN=$(nft list set inet ddos_protect udp_flood_v4 2>/dev/null | \
         grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
@@ -2196,27 +2282,20 @@ collect_stats() {
 
     BL_V4=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | \
         grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
-    BL_V6=$(nft list set inet ddos_protect scanner_blocklist_v6 2>/dev/null | grep -cE '^\s+[0-9a-f]+:')
-    BL_V6="${BL_V6:-0}"
 
     MANUAL_WHITE=$(nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
         grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
 
     CS_ACTIVE="$(systemctl is-active crowdsec 2>/dev/null)"
     BOUNCER_ACTIVE="$(systemctl is-active crowdsec-firewall-bouncer 2>/dev/null)"
-    WATCHER_ACTIVE="$(systemctl is-active cs-ssh-whitelist 2>/dev/null)"
     PORTS_PATH_ACTIVE="$(systemctl is-active protected-ports-update.path 2>/dev/null)"
 
     CS_BANS=0
-    CS_WHITE=0
     if [ -r "$CS_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
         CS_BANS=$(sqlite3 "$CS_DB" "SELECT COUNT(*) FROM decisions WHERE type='ban' AND until > datetime('now')" 2>/dev/null)
-        CS_WHITE=$(sqlite3 "$CS_DB" "SELECT COUNT(*) FROM decisions WHERE type='whitelist' AND until > datetime('now')" 2>/dev/null)
         CS_BANS="${CS_BANS:-0}"
-        CS_WHITE="${CS_WHITE:-0}"
     elif command -v cscli >/dev/null 2>&1; then
         CS_BANS=$(cscli decisions list --type ban -o raw 2>/dev/null | tail -n +2 | wc -l)
-        CS_WHITE=$(cscli decisions list --type whitelist -o raw 2>/dev/null | tail -n +2 | wc -l)
     fi
 
     LAST_UPDATE=$(systemctl show scanner-blocklist-update.service \
@@ -2242,11 +2321,13 @@ collect_stats() {
     }
 
     read SCANNER_PKTS_V4 SCANNER_BYTES_V4 <<< "$(read_counter scanner_drops_v4)"
-    read SCANNER_PKTS_V6 SCANNER_BYTES_V6 <<< "$(read_counter scanner_drops_v6)"
     read CONFIRMED_PKTS_V4 CONFIRMED_BYTES_V4 <<< "$(read_counter confirmed_drops_v4)"
-    read CONFIRMED_PKTS_V6 CONFIRMED_BYTES_V6 <<< "$(read_counter confirmed_drops_v6)"
     read SYN_CONF_PKTS_V4 SYN_CONF_BYTES_V4 <<< "$(read_counter syn_confirmed_v4)"
     read UDP_CONF_PKTS_V4 UDP_CONF_BYTES_V4 <<< "$(read_counter udp_confirmed_v4)"
+    # v3.5: HTTP/conn-flood counters
+    read CONN_FLOOD_PKTS_V4 CONN_FLOOD_BYTES_V4 <<< "$(read_counter conn_flood_v4)"
+    read NEWCONN_FLOOD_PKTS_V4 NEWCONN_FLOOD_BYTES_V4 <<< "$(read_counter newconn_flood_v4)"
+    read TCP_INVALID_PKTS TCP_INVALID_BYTES <<< "$(read_counter tcp_invalid)"
 
     # Когда nft started — для "stats since"
     NFT_SINCE=$(systemctl show nftables.service --property=ActiveEnterTimestamp --value 2>/dev/null | \
@@ -2345,7 +2426,6 @@ draw_snapshot() {
     local svc_line=""
     svc_line+=$(svc_dot "$CS_ACTIVE" "crowdsec")"  "
     svc_line+=$(svc_dot "$BOUNCER_ACTIVE" "bouncer")"  "
-    svc_line+=$(svc_dot "$WATCHER_ACTIVE" "ssh-key")"  "
     svc_line+=$(svc_dot "$PORTS_PATH_ACTIVE" "ports")
     echo -e "  ${B}⚙  Services${N}"
     echo -e "  $svc_line"
@@ -2363,18 +2443,21 @@ draw_snapshot() {
     printf  "  ├─ ${Y}suspect (watched)${N}     ${Y}${B}%5d${N} IPs ${DIM}(observed 5min)${N}\n"        "$SUSPECT_COUNT"
     printf  "  ├─ ${R}crowdsec bans${N}         ${R}${B}%5d${N} IPs ${DIM}(behavioural detection)${N}\n" "$CS_BANS"
     printf  "  ├─ ${R}scanner blocklist${N}     ${R}${B}%5d${N} IPs ${DIM}(IPv4)${N}\n"                  "$BL_V4"
-    printf  "  └─ ${G}whitelist${N}             ${G}${B}%5d${N} IPs ${DIM}(ssh-key %d + manual %d)${N}\n" "$((CS_WHITE + MANUAL_WHITE))" "$CS_WHITE" "$MANUAL_WHITE"
+    printf  "  └─ ${G}whitelist${N}             ${G}${B}%5d${N} IPs ${DIM}(manual)${N}\n" "$MANUAL_WHITE"
     echo ""
 
     # ===== TOTAL BLOCKED (since boot) =====
-    local total_pkts=$((SCANNER_PKTS_V4 + SCANNER_PKTS_V6 + CONFIRMED_PKTS_V4 + CONFIRMED_PKTS_V6 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4))
-    local total_bytes=$((SCANNER_BYTES_V4 + SCANNER_BYTES_V6 + CONFIRMED_BYTES_V4 + CONFIRMED_BYTES_V6 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4))
+    local total_pkts=$((SCANNER_PKTS_V4 + CONFIRMED_PKTS_V4 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4 + CONN_FLOOD_PKTS_V4 + NEWCONN_FLOOD_PKTS_V4 + TCP_INVALID_PKTS))
+    local total_bytes=$((SCANNER_BYTES_V4 + CONFIRMED_BYTES_V4 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4 + CONN_FLOOD_BYTES_V4 + NEWCONN_FLOOD_BYTES_V4 + TCP_INVALID_BYTES))
 
     echo -e "  ${B}📊 Since reboot${N} ${DIM}($NFT_SINCE)${N}"
-    printf  "  ├─ ${DIM}scanner drops:${N}        %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$((SCANNER_PKTS_V4 + SCANNER_PKTS_V6))")" "$(human_bytes "$((SCANNER_BYTES_V4 + SCANNER_BYTES_V6))")"
-    printf  "  ├─ ${DIM}attack drops:${N}         %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$((CONFIRMED_PKTS_V4 + CONFIRMED_PKTS_V6))")" "$(human_bytes "$((CONFIRMED_BYTES_V4 + CONFIRMED_BYTES_V6))")"
+    printf  "  ├─ ${DIM}scanner drops:${N}        %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SCANNER_PKTS_V4")" "$(human_bytes "$SCANNER_BYTES_V4")"
+    printf  "  ├─ ${DIM}attack drops:${N}         %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONFIRMED_PKTS_V4")" "$(human_bytes "$CONFIRMED_BYTES_V4")"
     printf  "  ├─ ${DIM}rate-limit (syn):${N}     %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
     printf  "  ├─ ${DIM}rate-limit (udp):${N}     %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
+    printf  "  ├─ ${DIM}conn-flood (ct>50):${N}   %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONN_FLOOD_PKTS_V4")" "$(human_bytes "$CONN_FLOOD_BYTES_V4")"
+    printf  "  ├─ ${DIM}new-conn flood:${N}       %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$NEWCONN_FLOOD_BYTES_V4")"
+    printf  "  ├─ ${DIM}TCP flag invalid:${N}     %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$TCP_INVALID_PKTS")" "$(human_bytes "$TCP_INVALID_BYTES")"
     printf  "  └─ ${B}total:${N}                ${B}%12s${N} pkts  ${DIM}/${N} ${B}%s${N}\n" "$(human_num "$total_pkts")" "$(human_bytes "$total_bytes")"
     echo ""
 
@@ -2384,6 +2467,20 @@ draw_snapshot() {
     printf  "  ├─ ${M}💥 ddos blocked:${N}        %12s unique IPs ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_DDOS")"       "$(human_num "$ALLTIME_DDOS_PKTS")"
     printf  "  └─ ${M}🔑 ssh brute attempts:${N}  %12s unique IPs ${DIM}(crowdsec)${N}\n" "$(human_num "$CS_ALLTIME_BANS")"
     echo ""
+
+    # ===== RECENT EVENTS (v3.5) =====
+    local events_log="/var/log/shieldnode/events.log"
+    if [ -r "$events_log" ]; then
+        echo -e "  ${B}🕒 Recent events${N} ${DIM}(last 5 from $events_log — [9] for full log)${N}"
+        local last_lines
+        last_lines=$(tail -5 "$events_log" 2>/dev/null)
+        if [ -z "$last_lines" ]; then
+            echo -e "  ${DIM}└─ (empty — no events yet)${N}"
+        else
+            echo "$last_lines" | sed 's/^/  /'
+        fi
+        echo ""
+    fi
 
     printf "  ${DIM}🔄 Scanner blocklist updated: %s${N}\n" "$LAST_UPDATE"
 }
@@ -2467,9 +2564,6 @@ show_whitelist_ips() {
     nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
         tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | \
         sed 's/^/  /'
-    nft list set inet ddos_protect manual_whitelist_v6 2>/dev/null | \
-        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9a-f:]+(/[0-9]+)?' | \
-        sed 's/^/  /'
     echo ""
 }
 
@@ -2481,7 +2575,7 @@ show_scanner_samples() {
         grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[0-9.]+)?(/[0-9]+)?' | \
         head -30 | sed 's/^/  /'
     echo ""
-    printf "  Total: ${B}%d${N} IPv4 + ${B}%d${N} IPv6\n" "$BL_V4" "$BL_V6"
+    printf "  Total: ${B}%d${N} IPv4 subnets\n" "$BL_V4"
     echo ""
 }
 
@@ -2556,6 +2650,31 @@ show_top_attackers() {
     echo ""
 }
 
+# v3.5: показать /var/log/shieldnode/events.log через less
+show_full_log() {
+    echo ""
+    local log="/var/log/shieldnode/events.log"
+    if [ ! -r "$log" ]; then
+        echo -e "${Y}events.log not available${N} ${DIM}($log)${N}"
+        echo -e "${DIM}Aggregator пишет туда раз в минуту. Запусти вручную:${N}"
+        echo -e "${DIM}  sudo systemctl start shieldnode-aggregator.service${N}"
+        echo ""
+        return
+    fi
+    local lines
+    lines=$(wc -l < "$log" 2>/dev/null)
+    lines="${lines:-0}"
+    echo -e "${B}Full events log${N} ${DIM}($log, $lines lines)${N}"
+    echo -e "${DIM}─────────────────────────────────${N}"
+    if command -v less >/dev/null 2>&1; then
+        less -R "$log"
+    else
+        # fallback — последние 200 строк
+        tail -200 "$log"
+    fi
+    echo ""
+}
+
 # === MODE: JSON ===
 if [ "$MODE" = "json" ]; then
     collect_stats
@@ -2567,7 +2686,6 @@ if [ "$MODE" = "json" ]; then
   "services": {
     "crowdsec": "$CS_ACTIVE",
     "bouncer": "$BOUNCER_ACTIVE",
-    "ssh_watcher": "$WATCHER_ACTIVE",
     "ports_path_watcher": "$PORTS_PATH_ACTIVE"
   },
   "protected_ports": {
@@ -2576,26 +2694,24 @@ if [ "$MODE" = "json" ]; then
   },
   "blocked_now": {
     "syn_flood_v4": $SYN_BAN,
-    "syn_flood_v6": $SYN_BAN_V6,
     "udp_flood_v4": $UDP_BAN,
     "crowdsec_bans": $CS_BANS,
-    "scanner_blocklist_v4": $BL_V4,
-    "scanner_blocklist_v6": $BL_V6
+    "scanner_blocklist_v4": $BL_V4
   },
   "whitelist": {
-    "ssh_key_auto": $CS_WHITE,
     "manual": $MANUAL_WHITE
   },
   "total_blocked": {
     "since": "$NFT_SINCE",
     "scanners_v4_packets": $SCANNER_PKTS_V4,
     "scanners_v4_bytes": $SCANNER_BYTES_V4,
-    "scanners_v6_packets": $SCANNER_PKTS_V6,
-    "scanners_v6_bytes": $SCANNER_BYTES_V6,
     "confirmed_v4_packets": $CONFIRMED_PKTS_V4,
     "confirmed_v4_bytes": $CONFIRMED_BYTES_V4,
     "syn_confirmed_v4_packets": $SYN_CONF_PKTS_V4,
-    "udp_confirmed_v4_packets": $UDP_CONF_PKTS_V4
+    "udp_confirmed_v4_packets": $UDP_CONF_PKTS_V4,
+    "conn_flood_v4_packets": $CONN_FLOOD_PKTS_V4,
+    "newconn_flood_v4_packets": $NEWCONN_FLOOD_PKTS_V4,
+    "tcp_invalid_packets": $TCP_INVALID_PKTS
   },
   "last_blocklist_update": "$LAST_UPDATE"
 }
@@ -2624,6 +2740,7 @@ while true; do
     echo -e "${C}│${N}  [${B}1${N}] Active attacks         [${B}2${N}] CrowdSec bans                   ${C}│${N}"
     echo -e "${C}│${N}  [${B}3${N}] Whitelist IPs          [${B}4${N}] Scanner blocklist               ${C}│${N}"
     echo -e "${C}│${N}  [${B}6${N}] Recent history         [${B}7${N}] Top attackers                   ${C}│${N}"
+    echo -e "${C}│${N}  [${B}9${N}] View full events.log                                       ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
     echo -e "${C}│${N}  [${B}r${N}] Refresh                [${B}0${N}] Exit                            ${C}│${N}"
     echo -e "${C}└─────────────────────────────────────────────────────────────────┘${N}"
@@ -2637,6 +2754,7 @@ while true; do
         4) show_scanner_samples  ;;
         6) show_history          ;;
         7) show_top_attackers    ;;
+        9) show_full_log         ;;
         r|R|"") continue ;;
         0|q|quit|exit) clear 2>/dev/null; exit 0 ;;
         *) echo -e "  ${Y}Unknown: $CHOICE${N}" ;;
@@ -2654,10 +2772,10 @@ print_ok "Команда установлена: $GUARD_BIN"
 print_info "Снимок состояния: ${BOLD}sudo guard${NC}  (или ${BOLD}sudo guard --json${NC})"
 
 # ==============================================================================
-# ШАГ 14: HEALTHCHECK
+# ШАГ 13: HEALTHCHECK
 # ==============================================================================
 
-print_header "ШАГ 14: HEALTHCHECK"
+print_header "ШАГ 13: HEALTHCHECK"
 
 print_info "Жду 5 секунд чтобы парсеры успели прочитать логи..."
 sleep 5
@@ -2675,7 +2793,6 @@ fi
 echo ""
 
 ACTIVE_BANS=$(cscli decisions list --type ban -o raw 2>/dev/null | tail -n +2 | wc -l)
-ACTIVE_WHITELIST=$(cscli decisions list --type whitelist -o raw 2>/dev/null | tail -n +2 | wc -l)
 
 if [ "$ACTIVE_BANS" -gt 0 ]; then
     print_ok "Активных банов: $ACTIVE_BANS"
@@ -2683,27 +2800,23 @@ else
     print_info "Активных банов нет (норма для свежей установки)"
 fi
 
-if [ "$ACTIVE_WHITELIST" -gt 0 ]; then
-    print_ok "Активных whitelist-decision'ов: $ACTIVE_WHITELIST"
-fi
-
 # v1.3: scanner blocklist size
 BL_V4=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
-BL_V6=$(nft list set inet ddos_protect scanner_blocklist_v6 2>/dev/null | grep -c ':' || echo 0)
-if [ "$BL_V4" -gt 0 ] || [ "$BL_V6" -gt 0 ]; then
-    print_ok "Scanner blocklist: $BL_V4 v4 / $BL_V6 v6 подсетей"
+if [ "$BL_V4" -gt 0 ]; then
+    print_ok "Scanner blocklist: $BL_V4 IPv4 подсетей"
 else
     print_warn "Scanner blocklist пуст — проверь journalctl -u scanner-blocklist-update"
 fi
 
 # ==============================================================================
-# ШАГ 15: ИТОГИ
+# ШАГ 14: ИТОГИ
 # ==============================================================================
 
 print_header "ГОТОВО"
 
 echo -e "  ${BOLD}Что настроено:${NC}"
 echo -e "  ├─ ${GREEN}✔${NC} nft rate-limit: 300 SYN/sec TCP, 600 packets/sec UDP (CGNAT-friendly, ban-once)"
+echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}HTTP/conn-flood защита (v3.5):${NC} ct count 50 + new-conn 50/min + TCP flag sanity"
 echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Scanner blocklist:${NC} pre-emptive drop российских госсканеров"
 echo -e "  │   ├─ traffic-guard-lists (общие сканеры, Shodan, Censys)"
 echo -e "  │   ├─ ${BOLD}tread-lightly/CyberOK_Skipa_ips${NC} (SKIPA scan-XX, ГРЧЦ, НКЦКИ)"
@@ -2714,8 +2827,6 @@ echo -e "  ├─ ${GREEN}✔${NC} Защищённые TCP-порты: ${CYAN}$
 echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Auto-sync портов с фаерволом:${NC} мгновенно через inotify + 60с safety"
 echo -e "  │   └─ Открыл порт в UFW → защита подхватит за < 1 секунды"
 echo -e "  ├─ ${GREEN}✔${NC} SSH порт ${CYAN}$SSH_PORT${NC} исключён из rate-limit"
-echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}SSH-key auto-whitelist:${NC} 12h после успешного входа по ключу"
-[ -n "$ADMIN_IP" ] && echo -e "  ├─ ${GREEN}✔${NC} Bootstrap whitelist: ${CYAN}$ADMIN_IP${NC}"
 echo -e "  ├─ ${GREEN}✔${NC} CrowdSec collections: linux + sshd"
 echo -e "  ├─ ${GREEN}✔${NC} ssh-cve-2024-6387 (regreSSHion) активен"
 echo -e "  ├─ ${GREEN}✔${NC} Ban duration: 4h (user-friendly)"
@@ -2768,7 +2879,10 @@ echo -e "      └─ MISP/CIRCL warninglists (honeypot-verified)"
 echo -e "  4. ${CYAN}Confirmed attack${NC}      → drop IP подтверждённых атакующих (1 час)"
 echo -e "  5. ${CYAN}Rate-limit ban-once${NC}   → 1й удар = suspect (5 мин), 2й = бан"
 echo -e "      ├─ TCP SYN: ${BOLD}300/sec burst 500${NC} (CGNAT-friendly)"
-echo -e "      └─ UDP:     ${BOLD}600/sec burst 1000${NC}"
+echo -e "      ├─ UDP:     ${BOLD}600/sec burst 1000${NC}"
+echo -e "      ├─ ct count: ${BOLD}50 concurrent${NC} на src IP (slowloris/conn-flood)"
+echo -e "      ├─ new-conn: ${BOLD}50/min burst 100${NC} (HTTP-flood через TLS)"
+echo -e "      └─ TCP flags: drop XMAS/NULL/SYN+FIN/SYN+RST/FIN+RST"
 echo -e "  6. ${CYAN}CrowdSec bouncer${NC}      → бан по поведению (SSH brute, regreSSHion)"
 echo ""
 echo -e "  ${BOLD}${GREEN}User-friendly defaults:${NC}"
@@ -2778,26 +2892,26 @@ echo -e "  ${GREEN}✔${NC} Профили с несколькими Xray-пор
 echo -e "  ${GREEN}✔${NC} Ложные баны от CrowdSec живут 4h вместо 24h"
 echo -e "  ${GREEN}✔${NC} Юзеры из подсетей в blocklist — реально госсканеры, не домашние"
 echo ""
-echo -e "  ${BOLD}Как работает auto-whitelist:${NC}"
-echo -e "  1. Заходишь по SSH с приватным ключом с ЛЮБОГО IP"
-echo -e "  2. ${CYAN}cs-ssh-whitelist${NC} ловит \"Accepted publickey\" в журнале"
-echo -e "  3. ${CYAN}cscli decisions add --type whitelist --duration 12h${NC}"
-echo -e "  4. Этот IP игнорирует все CrowdSec-баны (свои + community) на 12h"
-echo -e "  5. IP сменился → новый заход по ключу → новый whitelist"
-echo -e "  ${MAGENTA}ℹ${NC} Безопасно даже при включённом password-auth: ловится ТОЛЬКО"
-echo -e "     'Accepted publickey'. Юзер с подобранным паролем НЕ попадёт в whitelist."
+echo -e "  ${BOLD}Как работает manual whitelist (v3.5):${NC}"
+echo -e "  1. Открой свой management-IP в UFW: ${CYAN}sudo ufw allow from <IP>${NC}"
+echo -e "  2. Path-watcher (${CYAN}protected-ports-update.path${NC}) подхватит изменение"
+echo -e "  3. IP попадёт в ${CYAN}nft set manual_whitelist_v4${NC} (обходит scanner+rate-limit+ct count)"
+echo -e "  4. CrowdSec-баны для этого IP переписать вручную: ${CYAN}cscli decisions delete --ip <IP>${NC}"
+echo -e "  ${MAGENTA}ℹ${NC} v3.5: SSH-key auto-whitelist удалён (вызывал баны админов на shared IP)."
+echo -e "     SSH защищён через CrowdSec sshd-bf + ssh-cve коллекции."
 echo ""
 echo -e "  ${BOLD}История блокировок (v2.9+):${NC}"
 echo -e "  ├─ ${CYAN}/var/lib/shieldnode/events.db${NC} — sqlite БД с историей всех IP"
+echo -e "  ├─ ${CYAN}/var/log/shieldnode/events.log${NC} — человекочитаемый лог (v3.5)"
 echo -e "  ├─ Агрегатор парсит journald раз в минуту, бесплатно по CPU"
-echo -e "  ├─ В guard: кнопка [6] history, [7] top attackers"
+echo -e "  ├─ В guard: [6] history, [7] top attackers, [9] view full log (v3.5)"
 echo -e "  └─ Smetka: \`sqlite3 /var/lib/shieldnode/events.db 'SELECT * FROM events'\`"
 echo ""
 echo -e "  ${BOLD}Полезные команды:${NC}"
 echo -e "  ${CYAN}sudo guard${NC}                                          # дашборд"
-echo -e "  ${CYAN}cscli decisions list --type whitelist${NC}               # whitelist'ы"
-echo -e "  ${CYAN}cscli decisions list --type ban${NC}                     # активные баны"
-echo -e "  ${CYAN}journalctl -u cs-ssh-whitelist -f${NC}                   # логи SSH-watcher'а"
+echo -e "  ${CYAN}tail -f /var/log/shieldnode/events.log${NC}              # human-readable события"
+echo -e "  ${CYAN}less /var/log/shieldnode/install.log${NC}                # лог установки (v3.5)"
+echo -e "  ${CYAN}cscli decisions list --type ban${NC}                     # активные CrowdSec-баны"
 echo -e "  ${CYAN}journalctl -u scanner-blocklist-update${NC}              # логи blocklist updater"
 echo -e "  ${CYAN}journalctl -t shieldnode-agg${NC}                        # логи агрегатора"
 echo -e "  ${CYAN}systemctl list-timers${NC}                               # когда след. обновления"
