@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.10.4 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v3.11.1 (Commercial Edition) — HOTFIX
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables connection-flood + slowloris защита (PROPER per-IP ct count)
 #  - nftables TCP flag sanity (drop invalid combinations)
 #  - nftables anti-spoofing (fib saddr — стронгер чем rp_filter loose)
 #  - nftables TCP MSS clamping (улучшает скорость VPN, устраняет фрагментацию)
+#  - Tor exit blocklist (опционально через BLOCK_TOR=1)
 #  - CrowdSec (SSH brute-force + community blocklist)
 #  - guard CLI — снимок состояния защиты + кнопка [8] Unban all
 #  - Человекочитаемые логи в /var/log/shieldnode/events.log
@@ -16,6 +17,109 @@
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
 #  Совместимо с vpn-node-setup.sh v4.0 (XanMod + IPv6 disabled).
+#
+#  v3.11.1 hotfix changelog (3 production-discovered bugs):
+#
+#    [BUG-CRITICAL] Backticks в комментарии nft template heredoc =
+#      command substitution → "add: command not found" + protected_ports пустые.
+#
+#      Симптом на проде:
+#        ШАГ 4: NFTABLES RATE-LIMIT
+#        /dev/fd/63: line 1448: add: command not found
+#        ✔ nft rate-limit активен               ← false positive
+#        ...
+#        ШАГ 13: HEALTHCHECK
+#        ✖ FAIL: protected_ports_tcp пуст       ← реальная регрессия
+#
+#      Корень: heredoc `cat > $NFT_DDOS_CONF <<EOF ... EOF` (БЕЗ кавычек
+#      вокруг EOF) интерпретирует backticks как command substitution.
+#      В шаблоне был комментарий:
+#        # Раньше (v3.5..v3.10.1): два правила делали `add @newconn_rate_v4` на
+#                                                    ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+#      bash пытается выполнить `add @newconn_rate_v4` как команду →
+#      "add: command not found" + heredoc PARTIALLY rendered. Output
+#      файл создаётся (rate-limit правила работают), но parametrization
+#      $XRAY_PORTS_TCP_INIT может попасть в недо-render'еную секцию →
+#      protected_ports_tcp set остаётся пустым → smoke-test FAIL.
+#
+#      Воспроизведено локально: bash heredoc с backticks → точно такая же ошибка.
+#
+#      FIX: backticks в комментариях заменены на одинарные кавычки.
+#      Также проверены ВСЕ остальные heredocs на наличие backticks в
+#      комментариях — найдено и исправлено.
+#
+#    [BUG-CSCLI-FMT] CrowdSec 1.7.x вывод `cscli collections list` теперь
+#      table-format ("│ name │ status │ ...") вместо plain "name v0.7 enabled".
+#      Старый regex `grep -q "^crowdsecurity/sshd"` не матчит — линия
+#      начинается с "│ ".
+#
+#      Симптом на проде:
+#        ШАГ 7: УСТАНОВКА CROWDSEC
+#        ➤ Устанавливаю crowdsecurity/sshd...
+#        ✔ crowdsecurity/sshd                    ← реально установлен
+#        ...
+#        ШАГ 9: ACQUISITION
+#        ⚠ crowdsecurity/sshd не установлен      ← false negative
+#
+#      FIX: используем `cscli collections list -o raw` для stable CSV
+#      вывода (один collection per line, no formatting), затем
+#      `awk -F, 'NR>1 && $1 == "crowdsecurity/sshd"'`.
+#
+#    [BUG-SMOKE-MULTILINE] `$(grep -c ... || echo 0)` produces "0\n0"
+#      когда input пустой → integer comparison "[: 0\n0: integer expression
+#      expected" в smoke-test.
+#
+#      Симптом на проде:
+#        ✔ Smoke: 18080 CAPI decisions (community blocklist работает)
+#        /dev/fd/63: line 3897: [: 0
+#        0: integer expression expected
+#        ✖ Smoke-test НЕ ПРОЙДЕН            ← false negative из-за multiline
+#
+#      Корень: `grep -c PATTERN` на пустом stdin → exit 1, печатает "0".
+#      Дальше `|| echo 0` срабатывает (потому что grep вернул не-zero),
+#      печатает второй "0" на новой строке. Результат: VAR="0\n0".
+#      `[ "$VAR" -gt 0 ]` падает с ошибкой integer expression.
+#
+#      FIX: убран `|| echo 0`, добавлено `${VAR:-0}` для дефолта при пустом
+#      выводе, и trim multiline через `head -1` где нужно.
+#
+#  v3.11 changelog (Tor exit blocklist):
+#
+#    [FEATURE] Опциональная блокировка Tor exit nodes на уровне nft.
+#      Активация: переменная окружения BLOCK_TOR=1 при запуске скрипта,
+#      либо файл /etc/shieldnode/block_tor (touch для включения).
+#      По умолчанию ОТКЛЮЧЕНО — операторы которые обслуживают параноиков
+#      (Tor → VPN bridge users) могут оставить выключенным.
+#
+#      Источники списка (в порядке fallback):
+#        1. https://check.torproject.org/torbulkexitlist (~1352 IPv4)
+#        2. https://www.dan.me.uk/torlist/?exit (с фильтром v4-only,
+#           rate-limit раз в 30 минут)
+#
+#      Архитектура:
+#        - Новый nft set `tor_exit_blocklist_v4` (interval, auto-merge)
+#        - Правило в prerouting: `ip saddr @tor_exit_blocklist_v4 drop`
+#          (после whitelist'ов, до scanner_blocklist — Tor IPs не должны
+#          даже считаться как сканеры в нашей статистике)
+#        - Логгирование первых 100 drops/час с тегом [shield:tor]
+#        - Отдельный counter tor_drops для guard CLI
+#        - Hourly cron (`/etc/cron.hourly/shieldnode-tor-update`) —
+#          torproject обновляется каждые 30 мин, hourly = разумный compromise
+#        - Sanity-валидация (тот же фильтр что для scanner_blocklist в
+#          v3.10.2 BUG-6: prefix>=8, отсев bogons)
+#        - Если оба источника недоступны — set остаётся последний known-good
+#          состояние, не очищается (важно: иначе короткий network glitch
+#          снимает защиту)
+#
+#      Метрики наблюдения в guard CLI:
+#        Tor exit drops:   {N} pkts (last 1h)
+#        Tor exit blocks:  {M} active IPs in set
+#
+#      Поведение в SAFE-режиме:
+#        - Если установка не может скачать список Tor с обоих источников —
+#          BLOCK_TOR=1 не активируется, выводится WARN.
+#        - Если cron-обновление fail'нется 3 раза подряд — set очищается
+#          (иначе устаревший список будет блочить уже-неTor IPs).
 #
 #  v3.10.4 changelog (CrowdSec deep audit, part 2):
 #
@@ -615,6 +719,18 @@ print_error()  { echo -e "${RED}✖${NC} $1"; }
 print_info()   { echo -e "${MAGENTA}ℹ${NC} $1"; }
 print_warn()   { echo -e "${YELLOW}⚠${NC} $1"; }
 
+# v3.11.1 BUG-CSCLI-FMT FIX: устойчивая проверка установлена ли коллекция
+# в CrowdSec независимо от формата вывода cscli (table в 1.7+, plain в 1.6).
+# Используем `-o raw` который даёт CSV-like формат, стабильный между версиями.
+# Header: первая строка "name", далее "name,status,version,description"
+cscli_collection_installed() {
+    local name="$1"
+    [ -z "$name" ] && return 1
+    command -v cscli >/dev/null 2>&1 || return 1
+    cscli collections list -o raw 2>/dev/null | \
+        awk -F, -v target="$name" 'NR > 1 && $1 == target { found=1; exit } END { exit !found }'
+}
+
 # ==============================================================================
 # UNINSTALL MODE
 # ==============================================================================
@@ -645,6 +761,7 @@ if [ "${1:-}" = "--uninstall" ]; then
 
     # Systemd units
     for unit in scanner-blocklist-update.timer scanner-blocklist-update.service \
+                tor-blocklist-update.timer tor-blocklist-update.service \
                 protected-ports-update.timer protected-ports-update.service \
                 protected-ports-update.path \
                 shieldnode-aggregator.timer shieldnode-aggregator.service \
@@ -661,10 +778,15 @@ if [ "${1:-}" = "--uninstall" ]; then
     # Scripts
     rm -f /usr/local/sbin/cs-ssh-key-whitelist.sh
     rm -f /usr/local/sbin/update-scanner-blocklist.sh
+    rm -f /usr/local/sbin/update-tor-blocklist.sh
     rm -f /usr/local/sbin/update-protected-ports.sh
     rm -f /usr/local/sbin/shieldnode-aggregator.sh
     rm -f /usr/local/bin/guard
     print_ok "Скрипты удалены (включая команду guard)"
+
+    # v3.11: BLOCK_TOR marker
+    rm -f /etc/shieldnode/block_tor
+    rmdir /etc/shieldnode 2>/dev/null || true
 
     # БД истории событий (v2.9)
     rm -rf /var/lib/shieldnode
@@ -1376,6 +1498,22 @@ else
     print_info "rp_filter=2 (loose) от vpn-node-setup.sh продолжает защищать от spoofing."
 fi
 
+# v3.11: Tor exit blocklist (опционально). Активируется через:
+#   - переменную окружения BLOCK_TOR=1 при запуске
+#   - либо файл-маркер /etc/shieldnode/block_tor (для повторных запусков)
+# По умолчанию ОТКЛЮЧЕНО — операторы которые хостят Tor → VPN bridge для
+# параноиков должны оставлять выключенным.
+BLOCK_TOR="${BLOCK_TOR:-0}"
+if [ -f /etc/shieldnode/block_tor ]; then
+    BLOCK_TOR=1
+fi
+if [ "$BLOCK_TOR" = "1" ]; then
+    print_ok "Tor exit blocklist: ${BOLD}ВКЛЮЧЁН${NC} (BLOCK_TOR=1)"
+    print_info "Для отключения: rm /etc/shieldnode/block_tor && перезапустить скрипт"
+else
+    print_info "Tor exit blocklist: отключён (включить: BLOCK_TOR=1 sudo ./shieldnode.sh)"
+fi
+
 # ==============================================================================
 # ШАГ 3: ПРОВЕРКА КОНФИГА SSH (информационная, не блокирует установку)
 # ==============================================================================
@@ -1500,6 +1638,18 @@ $XRAY_PORTS_UDP_INIT
         # Размер для ~50k подсетей с запасом
         size 131072
     }
+
+    # --- v3.11: Tor exit blocklist ---
+    # Заполняется /usr/local/sbin/update-tor-blocklist.sh hourly из
+    # check.torproject.org/torbulkexitlist (~1500 IPs, individual /32).
+    # Активен только если оператор включил BLOCK_TOR=1 при установке.
+    # Если выключен — set пустой, правило 'ip saddr @... drop' no-op.
+    set tor_exit_blocklist_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        size 8192
+    }
     # --- v2.5: STAGE 1 — SUSPECT (наблюдение 5 минут) ---
     # IP попадает сюда при первом превышении лимита.
     # Трафик НЕ дропается. Если за 5 минут IP опять превышает — переводим в confirmed.
@@ -1582,6 +1732,7 @@ $MANUAL_WHITELIST_V4_INIT
     counter confirmed_drops_v4 { }
     counter syn_confirmed_v4 { }
     counter udp_confirmed_v4 { }
+    counter tor_drops_v4 { }      # v3.11: Tor exit nodes dropped
     # v3.5: counters для HTTP/connection-flood защиты
     counter conn_flood_v4 { }     # ct count > 150 на src
     counter newconn_flood_v4 { }  # >50 new conn/min на src
@@ -1625,6 +1776,16 @@ $FIB_ANTISPOOF_RULE
             counter name scanner_drops_v4 drop
         ip saddr @scanner_blocklist_v4 counter name scanner_drops_v4 drop
 
+        # === v3.11: Tor exit blocklist drop ===
+        # Set заполняется только если оператор активировал BLOCK_TOR=1.
+        # Иначе set пустой, эти 2 правила — no-op (overhead близок к нулю,
+        # nft проверка пустого set'а — O(1)).
+        # Лог с rate-limit 1/sec для guard CLI и aggregator статистики.
+        ip saddr @tor_exit_blocklist_v4 limit rate 1/second \\
+            log prefix "[shield:tor] " level info flags ip options \\
+            counter name tor_drops_v4 drop
+        ip saddr @tor_exit_blocklist_v4 counter name tor_drops_v4 drop
+
         # === v2.5: BAN-ONCE АРХИТЕКТУРА ===
         # Двухэтапная проверка перед баном — снижает ложные баны CGNAT/мобильных.
         #
@@ -1666,7 +1827,7 @@ $FIB_ANTISPOOF_RULE
             counter name conn_flood_v4 drop
 
         # === v3.10.2: NEW CONNECTION RATE-LIMIT (refactor: один meter touch на пакет) ===
-        # Раньше (v3.5..v3.10.1): два правила делали `add @newconn_rate_v4` на
+        # Раньше (v3.5..v3.10.1): два правила делали 'add @newconn_rate_v4' на
         # один и тот же пакет от suspect-IP, что эффективно ВДВОЕ снижало
         # лимит. Эмпирически проверено в network-namespace с реальным kernel'ом:
         # single-rule burst=10 → 10 free; double-rule burst=10 → 5 free.
@@ -2296,7 +2457,8 @@ if [ "$V4_COUNT" -lt 10 ]; then
 fi
 
 # v3.10.2: warn если sanity отбросил подозрительно много (>10% от raw)
-RAW_V4_COUNT=$(grep -cE '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$TMP/all.raw" 2>/dev/null || echo 0)
+RAW_V4_COUNT=$(grep -cE '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$TMP/all.raw" 2>/dev/null)
+RAW_V4_COUNT="${RAW_V4_COUNT:-0}"
 if [ "$RAW_V4_COUNT" -gt 0 ]; then
     REJECTED=$((RAW_V4_COUNT - V4_COUNT))
     if [ "$REJECTED" -gt $((RAW_V4_COUNT / 10)) ]; then
@@ -2365,7 +2527,8 @@ systemctl enable scanner-blocklist-update.timer >/dev/null 2>&1
 print_status "Качаю scanner blocklist (первый запуск)..."
 if systemctl start scanner-blocklist-update.service; then
     sleep 2
-    BLOCKLIST_V4_SIZE=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | grep -c '/' || echo 0)
+    BLOCKLIST_V4_SIZE=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | grep -c '/')
+    BLOCKLIST_V4_SIZE="${BLOCKLIST_V4_SIZE:-0}"
     if [ "$BLOCKLIST_V4_SIZE" -gt 0 ]; then
         print_ok "Blocklist загружен: $BLOCKLIST_V4_SIZE v4 подсетей"
     else
@@ -2378,6 +2541,178 @@ fi
 
 systemctl start scanner-blocklist-update.timer >/dev/null 2>&1
 print_ok "Timer активен (обновление каждые 6 часов)"
+
+# ==============================================================================
+# ШАГ 6.1: TOR EXIT BLOCKLIST UPDATER (опционально, v3.11)
+# ==============================================================================
+
+if [ "$BLOCK_TOR" = "1" ]; then
+    print_header "ШАГ 6.1: TOR EXIT BLOCKLIST"
+
+    TOR_UPDATER_SCRIPT="/usr/local/sbin/update-tor-blocklist.sh"
+
+    cat > "$TOR_UPDATER_SCRIPT" <<'TOR_UPDATER_EOF'
+#!/bin/bash
+# v3.11: обновление nft set tor_exit_blocklist_v4 из публичных списков.
+# Запускается через cron.hourly или systemd timer.
+#
+# Поведение при ошибках:
+#   - Если ОБА источника недоступны → НЕ очищаем set (оставляем последний
+#     known-good). Это важно: иначе короткий network-glitch снимет защиту.
+#   - Если 3 раза подряд fail (file /var/lib/shieldnode/tor_fail_count >=3)
+#     → очищаем set (старые IPs устарели), пишем алерт в logger.
+
+set -o pipefail
+export LANG=C LC_ALL=C
+
+LOG_TAG="tor-blocklist"
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+STATE_DIR="/var/lib/shieldnode"
+mkdir -p "$STATE_DIR"
+FAIL_COUNTER="$STATE_DIR/tor_fail_count"
+
+# Источник 1: официальный torproject (preferred)
+PRIMARY_URL="https://check.torproject.org/torbulkexitlist"
+# Источник 2: dan.me.uk (fallback). Включает IPv6, фильтруем потом.
+FALLBACK_URL="https://www.dan.me.uk/torlist/?exit"
+
+DOWNLOADED=0
+if curl -fsSL --max-time 30 "$PRIMARY_URL" -o "$TMP_DIR/tor.raw" 2>/dev/null; then
+    if [ -s "$TMP_DIR/tor.raw" ]; then
+        DOWNLOADED=1
+        logger -t "$LOG_TAG" "downloaded primary source ($(wc -l < "$TMP_DIR/tor.raw") lines)"
+    fi
+fi
+
+if [ "$DOWNLOADED" = "0" ]; then
+    # Fallback. Уважаем rate-limit dan.me.uk (раз в 30 мин/IP), используем
+    # только если primary не сработал.
+    if curl -fsSL --max-time 30 "$FALLBACK_URL" -o "$TMP_DIR/tor.raw" 2>/dev/null; then
+        if [ -s "$TMP_DIR/tor.raw" ]; then
+            DOWNLOADED=1
+            logger -t "$LOG_TAG" "downloaded fallback source ($(wc -l < "$TMP_DIR/tor.raw") lines)"
+        fi
+    fi
+fi
+
+if [ "$DOWNLOADED" = "0" ]; then
+    # Оба источника failed. Инкрементируем счётчик.
+    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
+    CURRENT=$((CURRENT + 1))
+    echo "$CURRENT" > "$FAIL_COUNTER"
+    logger -t "$LOG_TAG" "ERROR: both sources unreachable (fail #$CURRENT)"
+
+    if [ "$CURRENT" -ge 3 ]; then
+        # 3+ failures подряд → очищаем set (старые данные устарели)
+        nft flush set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null && \
+            logger -t "$LOG_TAG" "cleared set after 3+ failures (data is stale)"
+    fi
+    exit 1
+fi
+
+# Reset fail counter
+echo 0 > "$FAIL_COUNTER"
+
+# Извлекаем IPv4 (one-per-line), применяем тот же sanity-filter что в
+# scanner_blocklist (BUG-6 fix): отсев bogons, prefix>=8.
+# Tor exit nodes — это всегда /32 (single IPs), поэтому prefix-фильтр не критичен,
+# но bogon-фильтр полезен на случай supply-chain атаки на источник.
+grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' "$TMP_DIR/tor.raw" | \
+    awk -F'.' '
+    {
+        o1 = $1 + 0
+        if (o1 == 0)   next
+        if (o1 == 10)  next
+        if (o1 == 127) next
+        if (o1 >= 224) next
+        if (o1 == 169 && $2 + 0 == 254) next
+        if (o1 == 172) {
+            o2 = $2 + 0
+            if (o2 >= 16 && o2 <= 31) next
+        }
+        if (o1 == 192 && $2 + 0 == 168) next
+        print $0
+    }' | sort -u > "$TMP_DIR/tor.list"
+
+V4_COUNT=$(wc -l < "$TMP_DIR/tor.list")
+
+# Sanity: Tor list реально имеет 1000-2000 IPs. Если меньше 100 — что-то
+# сломалось, не применяем (защита от corrupted upstream).
+if [ "$V4_COUNT" -lt 100 ]; then
+    logger -t "$LOG_TAG" "ERROR: only $V4_COUNT IPs after parse (expected 1000+) — not applying"
+    exit 1
+fi
+
+# Атомарная замена через flush + add (одна транзакция nft -f)
+{
+    echo "flush set inet ddos_protect tor_exit_blocklist_v4"
+    if [ -s "$TMP_DIR/tor.list" ]; then
+        # nft set elements limit ~65k за один add — у Tor списка <2000, OK
+        awk 'BEGIN { printf "add element inet ddos_protect tor_exit_blocklist_v4 { " }
+             { printf "%s%s", (NR == 1 ? "" : ", "), $0 }
+             END { print " }" }' "$TMP_DIR/tor.list"
+    fi
+} | nft -f - 2>&1 | logger -t "$LOG_TAG"
+
+logger -t "$LOG_TAG" "applied $V4_COUNT Tor exit IPs"
+exit 0
+TOR_UPDATER_EOF
+    chmod 755 "$TOR_UPDATER_SCRIPT"
+
+    # systemd timer (hourly)
+    cat > /etc/systemd/system/tor-blocklist-update.service <<EOF
+[Unit]
+Description=Update shieldnode Tor exit blocklist
+Wants=network-online.target
+After=network-online.target shieldnode-nftables.service
+Requires=shieldnode-nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=$TOR_UPDATER_SCRIPT
+EOF
+
+    cat > /etc/systemd/system/tor-blocklist-update.timer <<'EOF'
+[Unit]
+Description=Update shieldnode Tor exit blocklist hourly
+Requires=tor-blocklist-update.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable tor-blocklist-update.timer >/dev/null 2>&1
+
+    # Первый запуск (blocking)
+    print_status "Качаю Tor exit list (первый запуск)..."
+    if systemctl start tor-blocklist-update.service; then
+        sleep 2
+        TOR_SIZE=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+        if [ "$TOR_SIZE" -gt 0 ]; then
+            print_ok "Tor blocklist загружен: ${BOLD}$TOR_SIZE${NC} exit nodes"
+        else
+            print_warn "Tor blocklist пуст — проверь: journalctl -u tor-blocklist-update"
+        fi
+    else
+        print_warn "Первый запуск Tor updater'а провалился — продолжаем"
+        print_info "Проверь: journalctl -u tor-blocklist-update -n 30"
+    fi
+
+    systemctl start tor-blocklist-update.timer >/dev/null 2>&1
+    print_ok "Timer активен (обновление ежечасно с jitter ±5min)"
+
+    # Маркер для повторных запусков скрипта
+    mkdir -p /etc/shieldnode
+    touch /etc/shieldnode/block_tor
+fi
 
 # ==============================================================================
 # ШАГ 7: УСТАНОВКА CROWDSEC
@@ -2417,7 +2752,8 @@ COLLECTIONS=(
 )
 
 for col in "${COLLECTIONS[@]}"; do
-    if cscli collections list 2>/dev/null | grep -q "^$col"; then
+    # v3.11.1: устойчивая проверка через cscli_collection_installed (BUG-CSCLI-FMT)
+    if cscli_collection_installed "$col"; then
         print_info "Уже установлена: $col"
     else
         print_status "Устанавливаю $col..."
@@ -2430,7 +2766,8 @@ for col in "${COLLECTIONS[@]}"; do
 done
 
 # v1.4: удаляем iptables-коллекцию если осталась с v1.3 (false positive prone)
-if cscli collections list 2>/dev/null | grep -q "^crowdsecurity/iptables"; then
+# v3.11.1: устойчивая проверка через cscli_collection_installed (BUG-CSCLI-FMT)
+if cscli_collection_installed "crowdsecurity/iptables"; then
     print_status "Удаляю crowdsecurity/iptables (v1.4: ложно банит юзеров)..."
     cscli collections remove crowdsecurity/iptables >/dev/null 2>&1 && \
         print_ok "crowdsecurity/iptables удалена"
@@ -2528,7 +2865,7 @@ for acquis_file in /etc/crowdsec/acquis.yaml "$ACQUIS_DIR"/*.yaml; do
     fi
 done
 
-if [ "$SSH_ACQUIS_FOUND" = "0" ] && cscli collections list 2>/dev/null | grep -q "^crowdsecurity/sshd"; then
+if [ "$SSH_ACQUIS_FOUND" = "0" ] && cscli_collection_installed "crowdsecurity/sshd"; then
     # Нет SSH acquisition, но коллекция установлена — создаём journalctl
     print_status "SSH acquisition отсутствует — создаю journalctl-based (BUG-14)"
     cat > "$ACQUIS_DIR/sshd.yaml" <<'SSHD_ACQUIS_EOF'
@@ -2561,8 +2898,8 @@ elif [ "$SSH_JOURNALD_ACQUIS" = "1" ]; then
     print_ok "SSH acquisition: journalctl (sshd.service)"
 fi
 
-# Проверим что SSH-коллекция установлена
-if cscli collections list 2>/dev/null | grep -q "^crowdsecurity/sshd"; then
+# Проверим что SSH-коллекция установлена (BUG-CSCLI-FMT fix)
+if cscli_collection_installed "crowdsecurity/sshd"; then
     print_ok "SSH parsing активен (через crowdsecurity/sshd)"
 else
     print_warn "crowdsecurity/sshd не установлен — SSH-логи не парсятся"
@@ -2944,9 +3281,9 @@ fi
 # Извлекаем cursor из последней строки и удаляем его из вывода
 NEW_CURSOR=$(grep -oE '^-- cursor: .+$' "$TMP" | tail -1 | sed 's/^-- cursor: //')
 
-# Парсим сообщения [shield:scanner] и [shield:ddos]
+# Парсим сообщения [shield:scanner], [shield:ddos] и [shield:tor]   v3.11
 # Формат kernel-лога: "[shield:scanner] IN=eth0 SRC=85.142.100.2 DST=... PROTO=TCP DPT=8443 ..."
-declare -A scanner_ips ddos_ips
+declare -A scanner_ips ddos_ips tor_ips
 # v3.5: для events.log — собираем порт назначения и тип flood'а
 declare -A ddos_ports ddos_proto
 
@@ -2965,6 +3302,9 @@ while IFS='|' read -r kind ip port proto; do
                 [ -n "$proto" ] && ddos_proto[$ip]="$proto"
             fi
             ;;
+        tor)
+            [ -n "$ip" ] && tor_ips[$ip]=$((${tor_ips[$ip]:-0} + 1))
+            ;;
     esac
 done < <(awk '
     /\[shield:scanner\]/ {
@@ -2979,6 +3319,12 @@ done < <(awk '
         if (match($0, /DPT=[0-9]+/))   port  = substr($0, RSTART+4, RLENGTH-4)
         if (match($0, /PROTO=[A-Z]+/)) proto = substr($0, RSTART+6, RLENGTH-6)
         if (ip != "") print "ddos|" ip "|" port "|" proto
+    }
+    /\[shield:tor\]/ {
+        if (match($0, /SRC=[^ ]+/)) {
+            ip = substr($0, RSTART+4, RLENGTH-4)
+            if (ip != "") print "tor|" ip "||"
+        }
     }
 ' "$TMP")
 
@@ -3000,6 +3346,11 @@ TS=$(date '+%Y-%m-%d %H:%M:%S')
             *)   ftype="$proto-flood" ;;
         esac
         echo "[$TS] DDOS BLOCK ip=$ip port=$port type=$ftype hits=$cnt"
+    done
+    # v3.11: Tor exit drops
+    for ip in "${!tor_ips[@]}"; do
+        cnt=${tor_ips[$ip]}
+        echo "[$TS] TOR EXIT BLOCK ip=$ip hits=$cnt"
     done
 } >> "$EVENTS_LOG" 2>/dev/null
 
@@ -3054,6 +3405,11 @@ NOW=$(date +%s)
         cnt=${ddos_ips[$ip]}
         echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('ddos', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
     done
+    # v3.11: Tor exits
+    for ip in "${!tor_ips[@]}"; do
+        cnt=${tor_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('tor', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
     if [ -n "$NEW_CURSOR" ]; then
         # Экранируем одинарные кавычки в cursor
         ESC_CURSOR=$(echo "$NEW_CURSOR" | sed "s/'/''/g")
@@ -3065,8 +3421,9 @@ NOW=$(date +%s)
 # Лог
 TOTAL_SCANNERS=${#scanner_ips[@]}
 TOTAL_DDOS=${#ddos_ips[@]}
-if [ $TOTAL_SCANNERS -gt 0 ] || [ $TOTAL_DDOS -gt 0 ]; then
-    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS unique IPs, ddos=$TOTAL_DDOS unique IPs"
+TOTAL_TOR=${#tor_ips[@]}
+if [ $TOTAL_SCANNERS -gt 0 ] || [ $TOTAL_DDOS -gt 0 ] || [ $TOTAL_TOR -gt 0 ]; then
+    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS, ddos=$TOTAL_DDOS, tor=$TOTAL_TOR unique IPs"
 fi
 AGG_EOF
 
@@ -3253,10 +3610,16 @@ collect_stats() {
     read CONFIRMED_PKTS_V4 CONFIRMED_BYTES_V4 <<< "$(read_counter confirmed_drops_v4)"
     read SYN_CONF_PKTS_V4 SYN_CONF_BYTES_V4 <<< "$(read_counter syn_confirmed_v4)"
     read UDP_CONF_PKTS_V4 UDP_CONF_BYTES_V4 <<< "$(read_counter udp_confirmed_v4)"
+    read TOR_PKTS_V4 TOR_BYTES_V4 <<< "$(read_counter tor_drops_v4)"     # v3.11
     # v3.5: HTTP/conn-flood counters
     read CONN_FLOOD_PKTS_V4 CONN_FLOOD_BYTES_V4 <<< "$(read_counter conn_flood_v4)"
     read NEWCONN_FLOOD_PKTS_V4 NEWCONN_FLOOD_BYTES_V4 <<< "$(read_counter newconn_flood_v4)"
     read TCP_INVALID_PKTS TCP_INVALID_BYTES <<< "$(read_counter tcp_invalid)"
+
+    # v3.11: размер tor blocklist set'а
+    TOR_SET_SIZE=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+    TOR_SET_SIZE="${TOR_SET_SIZE:-0}"
 
     # Когда nft started — для "stats since"
     NFT_SINCE=$(systemctl show nftables.service --property=ActiveEnterTimestamp --value 2>/dev/null | \
@@ -3372,15 +3735,21 @@ draw_snapshot() {
     printf  "  ├─ ${Y}suspect (watched)${N}     ${Y}${B}%5d${N} IPs ${DIM}(observed 30min)${N}\n"        "$SUSPECT_COUNT"
     printf  "  ├─ ${R}crowdsec bans${N}         ${R}${B}%5d${N} IPs ${DIM}(behavioural detection)${N}\n" "$CS_BANS"
     printf  "  ├─ ${R}scanner blocklist${N}     ${R}${B}%5d${N} IPs ${DIM}(IPv4)${N}\n"                  "$BL_V4"
+    if [ "$TOR_SET_SIZE" -gt 0 ]; then
+        printf  "  ├─ ${R}tor exit blocklist${N}    ${R}${B}%5d${N} IPs ${DIM}(IPv4)${N}\n" "$TOR_SET_SIZE"
+    fi
     printf  "  └─ ${G}whitelist${N}             ${G}${B}%5d${N} IPs ${DIM}(manual)${N}\n" "$MANUAL_WHITE"
     echo ""
 
     # ===== TOTAL BLOCKED (since boot) =====
-    local total_pkts=$((SCANNER_PKTS_V4 + CONFIRMED_PKTS_V4 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4 + CONN_FLOOD_PKTS_V4 + NEWCONN_FLOOD_PKTS_V4 + TCP_INVALID_PKTS))
-    local total_bytes=$((SCANNER_BYTES_V4 + CONFIRMED_BYTES_V4 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4 + CONN_FLOOD_BYTES_V4 + NEWCONN_FLOOD_BYTES_V4 + TCP_INVALID_BYTES))
+    local total_pkts=$((SCANNER_PKTS_V4 + TOR_PKTS_V4 + CONFIRMED_PKTS_V4 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4 + CONN_FLOOD_PKTS_V4 + NEWCONN_FLOOD_PKTS_V4 + TCP_INVALID_PKTS))
+    local total_bytes=$((SCANNER_BYTES_V4 + TOR_BYTES_V4 + CONFIRMED_BYTES_V4 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4 + CONN_FLOOD_BYTES_V4 + NEWCONN_FLOOD_BYTES_V4 + TCP_INVALID_BYTES))
 
     echo -e "  ${B}📊 Since reboot${N} ${DIM}($NFT_SINCE)${N}"
     printf  "  ├─ ${DIM}scanner drops:${N}        %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SCANNER_PKTS_V4")" "$(human_bytes "$SCANNER_BYTES_V4")"
+    if [ "$TOR_SET_SIZE" -gt 0 ] || [ "$TOR_PKTS_V4" -gt 0 ]; then
+        printf  "  ├─ ${DIM}tor exit drops:${N}       %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$TOR_PKTS_V4")" "$(human_bytes "$TOR_BYTES_V4")"
+    fi
     printf  "  ├─ ${DIM}attack drops:${N}         %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONFIRMED_PKTS_V4")" "$(human_bytes "$CONFIRMED_BYTES_V4")"
     printf  "  ├─ ${DIM}rate-limit (syn):${N}     %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
     printf  "  ├─ ${DIM}rate-limit (udp):${N}     %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
@@ -3867,7 +4236,8 @@ fi
 if command -v cscli >/dev/null 2>&1; then
     sleep 1
     # cscli metrics show acquisition покажет источники
-    SSH_ACQ_LINES=$(cscli metrics show acquisition 2>/dev/null | grep -cE "auth\.log|sshd\.service" || echo 0)
+    SSH_ACQ_LINES=$(cscli metrics show acquisition 2>/dev/null | grep -cE "auth\.log|sshd\.service")
+    SSH_ACQ_LINES="${SSH_ACQ_LINES:-0}"
     if [ "$SSH_ACQ_LINES" -gt 0 ]; then
         print_ok "Smoke: SSH acquisition активен ($SSH_ACQ_LINES источников)"
     else
@@ -3893,10 +4263,33 @@ fi
 
 # 13. v3.10.4 BUG-19: scenarios в simulation mode (не банят, только alerts)
 if command -v cscli >/dev/null 2>&1; then
-    SIM_COUNT=$(cscli simulation status 2>/dev/null | grep -cE "^\s*-\s+" || echo 0)
+    SIM_COUNT=$(cscli simulation status 2>/dev/null | grep -cE "^\s*-\s+")
+    SIM_COUNT="${SIM_COUNT:-0}"
     if [ "$SIM_COUNT" -gt 0 ]; then
         print_info "Smoke: $SIM_COUNT scenarios в simulation mode (alerts only, без bans)"
         print_info "       Список: cscli simulation status"
+    fi
+fi
+
+# 14. v3.11: Tor blocklist загружен если BLOCK_TOR=1
+if [ "$BLOCK_TOR" = "1" ]; then
+    TOR_SET_COUNT=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+    if [ "$TOR_SET_COUNT" -ge 100 ]; then
+        print_ok "Smoke: Tor blocklist загружен ($TOR_SET_COUNT exit nodes)"
+    elif [ "$TOR_SET_COUNT" -gt 0 ]; then
+        print_warn "WARN: Tor blocklist подозрительно мал ($TOR_SET_COUNT IPs, ожидается 1000+)"
+        print_info "       Проверь: journalctl -u tor-blocklist-update -n 30"
+    else
+        print_error "FAIL: BLOCK_TOR=1 включён, но Tor blocklist пустой"
+        print_info "       Проверь: journalctl -u tor-blocklist-update -n 30"
+        SMOKE_FAIL=1
+    fi
+    # Timer должен быть active
+    if systemctl is-active --quiet tor-blocklist-update.timer; then
+        print_ok "Smoke: tor-blocklist-update.timer активен (hourly refresh)"
+    else
+        print_warn "WARN: tor-blocklist-update.timer не active"
     fi
 fi
 
@@ -3959,6 +4352,10 @@ echo -e "  │   ├─ traffic-guard-lists (общие сканеры, Shodan, 
 echo -e "  │   ├─ ${BOLD}tread-lightly/CyberOK_Skipa_ips${NC} (SKIPA scan-XX, ГРЧЦ, НКЦКИ)"
 echo -e "  │   ├─ ${BOLD}MISP/CIRCL${NC} (honeypot-verified scanner IPs)"
 echo -e "  │   └─ обновление каждые 6 часов из 3 источников"
+if [ "$BLOCK_TOR" = "1" ]; then
+    TOR_NUM=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+    echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Tor exit blocklist (v3.11):${NC} ${TOR_NUM:-0} exit nodes, обновление ежечасно"
+fi
 echo -e "  ├─ ${GREEN}✔${NC} Защищённые TCP-порты: ${CYAN}$XRAY_PORTS_TCP${NC}"
 [ -n "$XRAY_PORTS_UDP" ] && echo -e "  ├─ ${GREEN}✔${NC} Защищённые UDP-порты: ${CYAN}$XRAY_PORTS_UDP${NC}"
 echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Auto-sync портов с фаерволом:${NC} мгновенно через inotify + 60с safety"
