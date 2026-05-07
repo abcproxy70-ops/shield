@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.11.2 (Commercial Edition) — HOTFIX
+#  VPN NODE DDoS PROTECTION v3.11.3 (Commercial Edition) — HOTFIX
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables connection-flood + slowloris защита (PROPER per-IP ct count)
@@ -13,6 +13,32 @@
 #  - guard CLI — снимок состояния защиты + кнопка [8] Unban all
 #  - Человекочитаемые логи в /var/log/shieldnode/events.log
 #  - Мгновенное отслеживание изменений в фаерволе через inotify
+#
+#  v3.11.3 hotfix changelog:
+#
+#    [BUG-MULTILINE-SMOKE] Smoke-test ложно репортил "protected_ports_tcp пуст"
+#      хотя set был заполнен корректно.
+#
+#      Симптом на проде: каждая установка показывала FAIL даже когда
+#      `nft list set` показывал нормальные данные. Прошлые попытки
+#      "исправить" updater (v3.11.2 PER-SET-PROTECTION + RETRY-ON-EMPTY)
+#      решали несуществующую проблему — реально баг был в smoke-check
+#      парсере.
+#
+#      Корень: nft форматирует длинные `elements = { ... }` на несколько
+#      строк (после ~7 элементов):
+#        elements = { 80, 443-444, 6443, 7441, 7443,
+#                     8443, 9999 }
+#      Старый smoke-check: `grep -oE 'elements = \{[^}]*\}'` работает
+#      только в пределах одной строки. На multi-line блоке regex не
+#      матчит → SMOKE_TCP=0 → ложный FAIL.
+#
+#      FIX: добавлен `tr '\n' ' '` для flattening multi-line input
+#      (тот же подход что в updater'e CUR_TCP — но в smoke check был
+#      пропущен). Применено к smoke check #2 (TCP) и #3 (UDP).
+#
+#      Регресс-тест: nft set с 7+ элементами → smoke-check показывает
+#      правильное количество вместо 0.
 #
 #  v3.11.2 hotfix changelog:
 #
@@ -4261,9 +4287,13 @@ if ! nft list table inet ddos_protect >/dev/null 2>&1; then
 fi
 
 # 2. protected_ports_tcp непустой если в UFW есть TCP-правила
+# v3.11.3 BUG-MULTILINE FIX: nft форматирует длинные `elements = { ... }`
+# на несколько строк (после ~7 элементов). grep -oE на single-line не матчит
+# multi-line блок → SMOKE_TCP=0 → ложный FAIL даже когда set заполнен.
+# Fix: tr '\n' ' ' для flattening (тот же подход что в updater'e CUR_TCP).
 if [ -n "$PROTECTED_TCP" ]; then
     SMOKE_TCP=$(nft list set inet ddos_protect protected_ports_tcp 2>/dev/null | \
-        grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+(-[0-9]+)?' | wc -l)
+        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+(-[0-9]+)?' | wc -l)
     if [ "$SMOKE_TCP" -eq 0 ]; then
         print_error "FAIL: protected_ports_tcp пуст, ожидается: $PROTECTED_TCP"
         print_info "Это симптом BUG-1 (port-range в UFW) или BUG-8 (локализация)"
@@ -4275,10 +4305,10 @@ if [ -n "$PROTECTED_TCP" ]; then
     fi
 fi
 
-# 3. protected_ports_udp непустой если в UFW есть UDP-правила
+# 3. protected_ports_udp непустой если в UFW есть UDP-правила (same multi-line fix)
 if [ -n "$PROTECTED_UDP" ]; then
     SMOKE_UDP=$(nft list set inet ddos_protect protected_ports_udp 2>/dev/null | \
-        grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+(-[0-9]+)?' | wc -l)
+        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+(-[0-9]+)?' | wc -l)
     if [ "$SMOKE_UDP" -eq 0 ]; then
         print_error "FAIL: protected_ports_udp пуст, ожидается: $PROTECTED_UDP"
         SMOKE_FAIL=1
