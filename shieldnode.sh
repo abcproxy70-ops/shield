@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.10 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v3.10.1 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables connection-flood + slowloris защита (PROPER per-IP ct count)
@@ -17,23 +17,21 @@
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
 #  Совместимо с vpn-node-setup.sh v4.0 (XanMod + IPv6 disabled).
 #
-#  v3.10 changelog (CRITICAL FIX: UFW-парсер был сломан с самого начала):
-#    - CRITICAL FIX: detect_firewall_ports() для UFW не находил ни одного порта.
-#      Корень: awk-фильтр проверял "$3 == Anywhere", но в реальном выводе
-#      ufw status формат "22/tcp ALLOW IN Anywhere" — Anywhere это $4, не $3.
-#      $3 это "IN". Поэтому условие НИКОГДА не матчило.
-#      Симптом: protected_ports_tcp пуст, в логах "Updated: TCP={} UDP={}".
-#      Правила "tcp dport @protected_ports_tcp ..." никогда не срабатывали:
-#      ни SYN-flood защита, ни UDP-flood, ни connection-flood, ни new-conn rate.
-#      Реально работало только: scanner_blocklist, confirmed_attack drop,
-#      сломанный ct count (баг v3.9 уже починен).
-#      Fix: awk теперь проверяет $4 == "Anywhere".
-#      Применяется в ДВУХ местах: detect_firewall_ports() в установщике
-#      и detect_firewall_ports() в /usr/local/sbin/update-protected-ports.sh.
-#    - ADD: print_warn в установщике если detect вернул пустой список портов.
-#      Раньше silently продолжал с пустыми protected_ports — юзер не замечал.
-#    - FIX: в guard "suspect (watched) observed 5min" теперь "observed 30min"
-#      (соответствует таймауту suspect_v4 после v3.9).
+#  v3.10.1 changelog (REVERT v3.10 incorrect parser fix):
+#    - REVERT: v3.10 поменял awk-фильтр UFW парсера с $3 == "Anywhere" на
+#      $4 == "Anywhere". Это было НЕПРАВИЛЬНО.
+#      Корень моей ошибки: я анализировал вывод "ufw status verbose" (с
+#      колонкой IN), где Anywhere — это $4. Но скрипт вызывает обычный
+#      "ufw status" (без verbose), где Anywhere — это $3.
+#      После v3.10 парсер на ВСЕХ серверах перестал находить порты:
+#      "В фаерволе нет открытых TCP-портов кроме SSH" / TCP={}.
+#      v3.10.1 откатывает парсер обратно к $3 (как было в v3.9 и раньше).
+#    - NOTE: оригинальная проблема "Updated: TCP={}" наблюдавшаяся ДО v3.10
+#      имеет другой корень. Возможные причины:
+#        a) race condition: updater запускался во время изменения UFW-правил
+#        b) locale: LANG=ru_RU мог сломать парсинг "ALLOW"/"Anywhere"
+#        c) первые запуски сразу после установки UFW
+#      В v3.10.1 ошибочный фикс убран; парсер вернулся в рабочее состояние.
 #
 #  v3.9 changelog (CRITICAL FIX: ложные баны клиентов на CGNAT):
 #    - CRITICAL FIX: правило "ct count over 50" банило ВСЕХ клиентов VPN-ноды.
@@ -845,7 +843,7 @@ detect_firewall_ports() {
             ufw_out=$(ufw status 2>/dev/null)
             # Парсим строки с ALLOW для не-v6 (v6-правила дублируют v4 в UFW по умолчанию)
             tcp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $4 == "Anywhere" {
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
                     pp = $1
                     if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
                         n = split(pp, a, "/")
@@ -857,7 +855,7 @@ detect_firewall_ports() {
             ' | sort -un | tr '\n' ',' | sed 's/,$//')
 
             udp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $4 == "Anywhere" {
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
                     pp = $1
                     if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
                         n = split(pp, a, "/")
@@ -871,8 +869,8 @@ detect_firewall_ports() {
             # v2.2: management IPs из правил "ALLOW from <IP>" (только IPv4, v3.6)
             # Формат: "2222/tcp  ALLOW  213.165.55.166" (3й колонкой идёт IP вместо Anywhere)
             mgmt_ipv4=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $4 != "Anywhere" {
-                    if ($4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $4
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 != "Anywhere" {
+                    if ($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $3
                 }
             ' | sort -u | tr '\n' ',' | sed 's/,$//')
             ;;
@@ -1528,7 +1526,7 @@ detect_firewall_ports() {
             local ufw_out
             ufw_out=$(ufw status 2>/dev/null)
             tcp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $4 == "Anywhere" {
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
                     pp = $1
                     if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
                         n = split(pp, a, "/")
@@ -1539,7 +1537,7 @@ detect_firewall_ports() {
                 }
             ' | sort -un | tr '\n' ',' | sed 's/,$//')
             udp_list=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $4 == "Anywhere" {
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 == "Anywhere" {
                     pp = $1
                     if (match(pp, /^[0-9:]+(\/(tcp|udp))?$/)) {
                         n = split(pp, a, "/")
@@ -1551,8 +1549,8 @@ detect_firewall_ports() {
             ' | sort -un | tr '\n' ',' | sed 's/,$//')
             # v2.2: management IPs (только IPv4, v3.6)
             mgmt_ipv4=$(echo "$ufw_out" | awk '
-                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $4 != "Anywhere" {
-                    if ($4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $4
+                $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 != "Anywhere" {
+                    if ($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $3
                 }
             ' | sort -u | tr '\n' ',' | sed 's/,$//')
             ;;
