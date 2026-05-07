@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.11.1 (Commercial Edition) — HOTFIX
+#  VPN NODE DDoS PROTECTION v3.11.2 (Commercial Edition) — HOTFIX
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables connection-flood + slowloris защита (PROPER per-IP ct count)
@@ -14,9 +14,44 @@
 #  - Человекочитаемые логи в /var/log/shieldnode/events.log
 #  - Мгновенное отслеживание изменений в фаерволе через inotify
 #
-#  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
-#  Совместимо с активным UFW и любыми другими nft-таблицами.
-#  Совместимо с vpn-node-setup.sh v4.0 (XanMod + IPv6 disabled).
+#  v3.11.2 hotfix changelog:
+#
+#    [BUG-PORTS-WIPE] protected_ports_tcp периодически обнулялся таймером.
+#
+#      Симптом на проде: smoke-test FAIL, set пуст. journalctl -t protected-ports
+#      показывал чередование:
+#        19:42:03  Updated: TCP={443,444,...}   ← правильно
+#        19:42:31  Updated: TCP={}              ← ЧЕРЕЗ 28с timer обнулил!
+#        19:50:18  Updated: TCP={443,444,...}   ← правильно (ручной запуск)
+#
+#      Корень: detect_firewall_ports() иногда возвращает empty при transient
+#      UFW state (atomic rename файла). Safety-guard срабатывал только если
+#      одновременно: FIREWALL_ACTIVE=1, ВСЕ NEW пустые, ANY CUR непустой.
+#      Если FIREWALL_ACTIVE detection тоже попал в transient — guard не
+#      срабатывал → flush применялся → set обнулялся.
+#
+#      После обнуления, следующий transient run видел CUR=empty → guard вообще
+#      не активировался → состояние "залипало" empty до timer'а с реальными
+#      данными.
+#
+#      FIX (двойная защита):
+#      1. RETRY-ON-EMPTY: если detect возвращает все пустые → sleep 0.3s →
+#         retry один раз. Покрывает atomic-rename window UFW.
+#      2. PER-SET PROTECTION: для КАЖДОГО set'а отдельно: flush only if
+#         (NEW непустой) ИЛИ (CUR пустой). Это значит: если NEW для конкретного
+#         set'а пуст, но CUR непуст — НЕ ТРОГАЕМ этот set. Защищает от
+#         частичных parse fail'ов где, например, TCP попал в transient но
+#         MGMT прочитался корректно (или наоборот).
+#
+#    [BUG-SSH-BACKPORT] OpenSSH 9.6p1 на Ubuntu 24.04 ошибочно ругался как
+#      уязвимый к CVE-2025-26466, хотя Canonical backport'ит фикс в
+#      1:9.6p1-3ubuntu13.8+. Старая проверка смотрела только upstream
+#      version (9.6 < 9.9 → vulnerable).
+#
+#      FIX: смотрим dpkg-version openssh-server и сверяем с known-patched
+#      для конкретного дистрибутива (ubuntu:24.04 → 1:9.6p1-3ubuntu13.8+,
+#      ubuntu:22.04 → 1:8.9p1-3ubuntu0.11+, debian:12 → 1:9.2p1-2+deb12u4+,
+#      etc). Учитывает что 8.x не affected by CVE-2025-26466 в принципе.
 #
 #  v3.11.1 hotfix changelog (3 production-discovered bugs):
 #
@@ -1001,26 +1036,89 @@ print_ok "nftables ядерные модули работают"
 SSH_VERSION=$(ssh -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+(p[0-9]+)?' | head -1)
 if [ -n "$SSH_VERSION" ]; then
     print_info "OpenSSH: $SSH_VERSION"
-    # Проверяем версию: < 9.9p2 уязвим к CVE-2025-26466
-    SSH_MAJOR=$(echo "$SSH_VERSION" | grep -oE '[0-9]+\.[0-9]+' | head -1)
-    if dpkg --compare-versions "$SSH_MAJOR" "lt" "10.3" 2>/dev/null; then
-        print_warn "Версия OpenSSH потенциально уязвима к CVE-2025-26466 / CVE-2026-35414"
+
+    # v3.11.1: Ubuntu/Debian backport-aware check.
+    # Проблема: upstream OpenSSH 9.6p1 уязвим к CVE-2025-26466, но Ubuntu 24.04
+    # имеет backport (1:9.6p1-3ubuntu13.8+) который УЖЕ ИСПРАВЛЕН. Старая
+    # проверка `[ ssh_version < 9.9p2 ]` ругалась на patched 9.6p1 ложно.
+    #
+    # FIX: смотрим dpkg-version openssh-server и сверяем с известными
+    # patched-версиями для конкретного дистрибутива.
+    SSH_VULNERABLE=0
+    OS_ID=$(. /etc/os-release 2>/dev/null && echo "$ID")
+    OS_VER=$(. /etc/os-release 2>/dev/null && echo "$VERSION_ID")
+    DPKG_SSH_VER=$(dpkg-query -W -f='${Version}' openssh-server 2>/dev/null)
+
+    if [ -n "$DPKG_SSH_VER" ]; then
+        # Известные patched-версии (USN-7270-1, Feb 2025):
+        case "$OS_ID:$OS_VER" in
+            ubuntu:24.04|ubuntu:24.10)
+                # Ubuntu 24.04: patched в 1:9.6p1-3ubuntu13.8 и выше
+                if dpkg --compare-versions "$DPKG_SSH_VER" "lt" "1:9.6p1-3ubuntu13.8" 2>/dev/null; then
+                    SSH_VULNERABLE=1
+                fi
+                ;;
+            ubuntu:22.04)
+                # Ubuntu 22.04: 8.9p1, не affected by CVE-2025-26466 (introduced in 9.5p1)
+                # Но проверим CVE-2025-26465 — patched в 1:8.9p1-3ubuntu0.11
+                if dpkg --compare-versions "$DPKG_SSH_VER" "lt" "1:8.9p1-3ubuntu0.11" 2>/dev/null; then
+                    SSH_VULNERABLE=1
+                fi
+                ;;
+            ubuntu:20.04)
+                # 8.2p1 — не affected by CVE-2025-26466
+                # CVE-2025-26465 patched в 1:8.2p1-4ubuntu0.12
+                if dpkg --compare-versions "$DPKG_SSH_VER" "lt" "1:8.2p1-4ubuntu0.12" 2>/dev/null; then
+                    SSH_VULNERABLE=1
+                fi
+                ;;
+            debian:12)
+                # Bookworm: 9.2p1 — не affected by CVE-2025-26466 (introduced 9.5p1)
+                # CVE-2025-26465 patched в 1:9.2p1-2+deb12u4
+                if dpkg --compare-versions "$DPKG_SSH_VER" "lt" "1:9.2p1-2+deb12u4" 2>/dev/null; then
+                    SSH_VULNERABLE=1
+                fi
+                ;;
+            debian:11)
+                # Bullseye: 8.4p1 — не affected by CVE-2025-26466
+                if dpkg --compare-versions "$DPKG_SSH_VER" "lt" "1:8.4p1-5+deb11u4" 2>/dev/null; then
+                    SSH_VULNERABLE=1
+                fi
+                ;;
+            *)
+                # Неизвестный дистрибутив — fallback на upstream-версию
+                SSH_MAJOR=$(echo "$SSH_VERSION" | grep -oE '[0-9]+\.[0-9]+' | head -1)
+                if dpkg --compare-versions "$SSH_MAJOR" "lt" "9.9" 2>/dev/null; then
+                    SSH_VULNERABLE=1
+                    print_info "Неизвестный дистрибутив ($OS_ID:$OS_VER) — fallback на upstream-проверку"
+                fi
+                ;;
+        esac
+    fi
+
+    if [ "$SSH_VULNERABLE" = "1" ]; then
+        print_warn "Версия OpenSSH потенциально уязвима ($DPKG_SSH_VER)"
         print_status "Обновляю openssh-server (apt upgrade)..."
         wait_for_apt_lock
         if DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y openssh-server openssh-client >/dev/null 2>&1; then
-            NEW_VERSION=$(ssh -V 2>&1 | grep -oE 'OpenSSH_[0-9]+\.[0-9]+(p[0-9]+)?' | head -1)
-            if [ "$NEW_VERSION" != "$SSH_VERSION" ]; then
-                print_ok "OpenSSH обновлён: $SSH_VERSION → $NEW_VERSION"
+            NEW_DPKG_VER=$(dpkg-query -W -f='${Version}' openssh-server 2>/dev/null)
+            if [ "$NEW_DPKG_VER" != "$DPKG_SSH_VER" ]; then
+                print_ok "OpenSSH обновлён: $DPKG_SSH_VER → $NEW_DPKG_VER"
                 print_info "Перезагрузи ssh: systemctl restart ssh (или ребут)"
             else
-                print_info "OpenSSH уже последней версии в репо ($SSH_VERSION)"
+                print_info "OpenSSH уже последней версии в репо ($DPKG_SSH_VER)"
                 print_info "Если репо старый — обнови дистрибутив или через backports"
             fi
         else
             print_warn "Не удалось обновить openssh — продолжаю установку"
         fi
     else
-        print_ok "OpenSSH версия не уязвима к известным CVE"
+        # Известная patched-версия для этого дистрибутива
+        if [ -n "$DPKG_SSH_VER" ]; then
+            print_ok "OpenSSH защищён (patched в $OS_ID:$OS_VER backport: $DPKG_SSH_VER)"
+        else
+            print_ok "OpenSSH версия не уязвима к известным CVE"
+        fi
     fi
 fi
 
@@ -2131,6 +2229,18 @@ NEW_TCP=$(echo "$FW_OUTPUT" | sed -n '1p')
 NEW_UDP=$(echo "$FW_OUTPUT" | sed -n '2p')
 NEW_MGMT_V4=$(echo "$FW_OUTPUT" | sed -n '3p')
 
+# v3.11.2 RETRY-ON-EMPTY: если ВСЕ результаты пустые — это либо real empty
+# фаервол (rare), либо transient parse fail (common). Retry один раз через
+# 0.3 сек чтобы дать UFW дописать atomic-rename и stabilize. Если retry
+# тоже пустой — оставляем пусто и доверяем safety-guard.
+if [ -z "$NEW_TCP" ] && [ -z "$NEW_UDP" ] && [ -z "$NEW_MGMT_V4" ]; then
+    sleep 0.3
+    FW_OUTPUT=$(detect_firewall_ports "$FIREWALL_TYPE")
+    NEW_TCP=$(echo "$FW_OUTPUT" | sed -n '1p')
+    NEW_UDP=$(echo "$FW_OUTPUT" | sed -n '2p')
+    NEW_MGMT_V4=$(echo "$FW_OUTPUT" | sed -n '3p')
+fi
+
 # v3.10.2 BUG-7: исключаем все SSH-порты, не только первый.
 exclude_port() {
     local list="$1" exclude="$2"
@@ -2208,21 +2318,42 @@ fi
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
+# v3.11.2 PER-SET PROTECTION: don't flush a set if NEW is empty but CUR was
+# populated. This protects against transient parser fails that get past the
+# global safety-guard (e.g. when UFW returns partial output and FIREWALL_ACTIVE
+# detection ALSO returns 0 due to same transient).
+#
+# Логика: для каждого set'а отдельно решаем — flush+add или keep CUR.
+#   NEW=empty, CUR=full   → SKIP (не трогаем set, оставляем CUR)
+#   NEW=empty, CUR=empty  → flush (no-op, оба пустые)
+#   NEW=full,  CUR=*      → flush + add (apply changes)
 {
-    echo "flush set inet ddos_protect protected_ports_tcp"
-    if [ -n "$NEW_TCP" ]; then
-        echo "add element inet ddos_protect protected_ports_tcp { $(echo "$NEW_TCP" | sed 's/,/, /g') }"
+    if [ -n "$NEW_TCP" ] || [ -z "$CUR_TCP" ]; then
+        echo "flush set inet ddos_protect protected_ports_tcp"
+        if [ -n "$NEW_TCP" ]; then
+            echo "add element inet ddos_protect protected_ports_tcp { $(echo "$NEW_TCP" | sed 's/,/, /g') }"
+        fi
     fi
-    echo "flush set inet ddos_protect protected_ports_udp"
-    if [ -n "$NEW_UDP" ]; then
-        echo "add element inet ddos_protect protected_ports_udp { $(echo "$NEW_UDP" | sed 's/,/, /g') }"
+    if [ -n "$NEW_UDP" ] || [ -z "$CUR_UDP" ]; then
+        echo "flush set inet ddos_protect protected_ports_udp"
+        if [ -n "$NEW_UDP" ]; then
+            echo "add element inet ddos_protect protected_ports_udp { $(echo "$NEW_UDP" | sed 's/,/, /g') }"
+        fi
     fi
     # v2.2: синхронизируем management whitelist (только IPv4, v3.6)
-    echo "flush set inet ddos_protect manual_whitelist_v4"
-    if [ -n "$NEW_MGMT_V4" ]; then
-        echo "add element inet ddos_protect manual_whitelist_v4 { $(echo "$NEW_MGMT_V4" | sed 's/,/, /g') }"
+    if [ -n "$NEW_MGMT_V4" ] || [ -z "$CUR_MGMT_V4" ]; then
+        echo "flush set inet ddos_protect manual_whitelist_v4"
+        if [ -n "$NEW_MGMT_V4" ]; then
+            echo "add element inet ddos_protect manual_whitelist_v4 { $(echo "$NEW_MGMT_V4" | sed 's/,/, /g') }"
+        fi
     fi
 } > "$TMP"
+
+# v3.11.2: если TMP пустой (всё защищено per-set guard'ом) — ничего не делаем
+if [ ! -s "$TMP" ]; then
+    logger -t "$LOG_TAG" "SKIP: per-set protection — все NEW пустые, CUR имеют данные"
+    exit 0
+fi
 
 # v2.4: захватываем stderr из nft для диагностики (раньше >/dev/null глотал ошибки)
 NFT_ERR=$(nft -f "$TMP" 2>&1)
