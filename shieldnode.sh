@@ -2817,9 +2817,19 @@ show_full_log() {
     echo -e "${B}Full events log${N} ${DIM}($log, $lines lines)${N}"
     echo -e "${DIM}─────────────────────────────────${N}"
     if command -v less >/dev/null 2>&1; then
-        less -R "$log"
+        # v3.8.1: подсказка + надёжные флаги less.
+        # -F = exit если влезает на экран
+        # -X = не очищать экран при выходе (чтобы юзер видел что вернулся в guard)
+        # -R = raw control chars (для ANSI-цветов в логе)
+        # -K = exit по Ctrl-C
+        # -E = quit при достижении конца файла
+        echo -e "${DIM}Навигация: ↑↓ стрелки, PgUp/PgDn, ${B}q${N}${DIM} — выход${N}"
+        echo -e "${DIM}Если застрял в команде less (видишь \":\") — нажми ${B}ESC${N}${DIM} затем ${B}q${N}"
+        sleep 1
+        LESS="" less -FRXKE "$log"
     else
-        # fallback — последние 200 строк
+        echo -e "${DIM}less не установлен, показываю последние 200 строк${N}"
+        echo ""
         tail -200 "$log"
     fi
     echo ""
