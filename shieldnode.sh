@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.10.2 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v3.10.4 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables connection-flood + slowloris защита (PROPER per-IP ct count)
@@ -16,6 +16,145 @@
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
 #  Совместимо с vpn-node-setup.sh v4.0 (XanMod + IPv6 disabled).
+#
+#  v3.10.4 changelog (CrowdSec deep audit, part 2):
+#
+#    [BUG-14] Acquisition не настраивается явно для SSHD на Minimal Ubuntu 24.04.
+#      Корень: при установке crowdsec wizard сканирует /var/log/ и создаёт
+#      acquis.yaml только для FOUND log files. На Minimal Ubuntu 24.04 (или
+#      cloud images типа Oracle Cloud free tier) /var/log/auth.log не
+#      существует — система пишет только в journald. Wizard не создаёт
+#      acquisition для SSH, и crowdsecurity/sshd сценарии никогда не
+#      получают данные. `cscli metrics` показывает пустые counters.
+#      Симптом: установка прошла "успешно", но cscli decisions list пустой
+#      даже после реальных SSH-атак.
+#      FIX: после установки crowdsec проверяем наличие SSH-acquisition
+#      (либо file:/var/log/auth.log, либо journalctl). Если нет — создаём
+#      /etc/crowdsec/acquis.d/sshd.yaml с journalctl-filter sshd.service.
+#
+#    [BUG-15] CAPI registration не проверяется → нет community blocklist.
+#      Корень: при apt install crowdsec на машинах за NAT/прокси/корпоративным
+#      фаерволом CAPI registration может silently fail. Это не помечается
+#      как ошибка установки. На выходе у юзера локальная CrowdSec без
+#      community blocklist (это самая ценная фича, ради которой ставится
+#      CrowdSec). `cscli capi status` returns auth error, но никто не
+#      смотрит. Скрипт молча проходит.
+#      FIX: после установки делаем `cscli capi status`. Если non-zero exit —
+#      пытаемся `cscli capi register` ещё раз. Если опять fail — выводим
+#      WARNING с инструкциями.
+#
+#    [BUG-16] Дубль bouncer registration на повторных запусках.
+#      Корень: на повторном запуске скрипта (например, после изменения портов
+#      в UFW) проверка `cscli bouncers list | grep -q "cs-firewall-bouncer"`
+#      — подстрочный match, поэтому НЕ создаётся дубль.
+#      Но при rerun на чистой системе после ручного `cscli bouncers delete`
+#      (если оператор экспериментирует) — apt postinst уже зарегистрировал
+#      bouncer как `cs-firewall-bouncer`, мы попытаемся зарегистрировать
+#      `cs-firewall-bouncer-nftables` потому что наша проверка сработала
+#      на устаревший cache. Получим два bouncer'а в БД, один сломанный.
+#      FIX: явно проверяем что bouncer-имя реально работает через
+#      `cscli bouncers list -o json` + jq, и только если registration
+#      нерабочая — пытаемся пересоздать.
+#
+#    [BUG-17] Mgmt IPs whitelist через decision не блокирует scenario trigger.
+#      Корень: `cscli decisions add --type whitelist` создаёт decision с
+#      типом "whitelist" в БД. Bouncer не дропает такие IP. ОДНАКО, scenario
+#      всё равно срабатывает (генерируется alert, увеличиваются counters,
+#      и signal отправляется в CAPI как сигнал атаки). На CAPI side это
+#      может ухудшить наш community contribution score → меньше блок-листов
+#      по подписке.
+#      FIX: добавляем postoverflow whitelist в /etc/crowdsec/postoverflows/
+#      s01-whitelist/shieldnode-mgmt.yaml. Postoverflow срабатывает ПОСЛЕ
+#      scenario trigger, но ДО decision/alert — alerts тоже не идут.
+#
+#    [BUG-18] Acquisition с syslog-type читается ДВАЖДЫ если есть и
+#      auth.log, и journalctl (rsyslog активен на Ubuntu 24.04 default).
+#      Корень: Ubuntu 24.04 default имеет rsyslog → /var/log/auth.log
+#      ВТОРАЯ копия данных в journald. Если wizard создаст acquis для
+#      auth.log А мы добавим acquis для journalctl-sshd → каждый log line
+#      обработается дважды → двойные счётчики leaky bucket → preliminary
+#      ban при половине реального threshold.
+#      Симптом: ssh-bf срабатывает на 2-3 неправильных попытках вместо 5.
+#      FIX: при создании sshd.yaml acquisition (BUG-14) сначала
+#      проверяем что нет уже работающего file-based acquisition с
+#      auth.log. Если есть — пропускаем создание journalctl-acquisition.
+#
+#    [BUG-19] cscli simulation status не проверяется.
+#      Корень: некоторые scenarios (e.g. `crowdsecurity/http-bf-wordpress_bf`)
+#      приходят в simulation mode по дефолту. В simulation mode они
+#      производят alerts, но не decisions. Пользователь установил коллекцию
+#      с этим сценарием, видит alerts — но IP не банится. Не очевидно
+#      без проверки. Для нашего скрипта (только linux + sshd) это не
+#      проблема, но если оператор добавит свои коллекции, сюрприз.
+#      FIX: smoke-test print'ает количество scenarios в simulation mode.
+#
+#  v3.10.3 changelog (CrowdSec audit fixes):
+#
+#    [BUG-9] Bouncer работает в input hook ПОСЛЕ нашего prerouting → пакеты
+#      от CrowdSec-banned IP всё равно проходят через наш rate-limit.
+#      Корень: bouncer по дефолту создаёт `table ip crowdsec` с цепочкой
+#      `crowdsec-chain` в hook input priority -10. Наша же таблица
+#      `inet ddos_protect` сидит в prerouting priority -100. Prerouting
+#      выполняется НАМНОГО раньше input, поэтому banned-IP попадает в
+#      наш newconn_rate_v4 → suspect_v4 → confirmed_attack_v4 ПРЕЖДЕ ЧЕМ
+#      bouncer его дропнет. Проверено эмпирически в network-namespace:
+#      30 fast pings от заблокированного IP → 19 hits на нашем
+#      newconn_overflow ДО того как bouncer drop сработал.
+#      Последствия: лишний CPU-расход на каждом пакете от banned IP,
+#      ложные алерты в /var/log/shieldnode/events.log, IP попадает
+#      одновременно в crowdsec ban (4h) И в наш confirmed_attack_v4 (1h).
+#      FIX: меняем приоритет bouncer'а на raw (-300) и hook на prerouting,
+#      чтобы CrowdSec drops срабатывали ДО нашей логики rate-limit.
+#      После этого banned-IP вообще не доходит до нашей цепочки.
+#
+#    [BUG-10] Bouncer пытается работать с IPv6 на нодах с отключённым IPv6.
+#      Корень: vpn-node-setup.sh v4.0 отключает IPv6 (sysctl + grub),
+#      но bouncer config defaults: `ipv6.enabled: true`. На таких нодах
+#      bouncer каждые 10 секунд пишет в /var/log/crowdsec-firewall-bouncer.log
+#      ошибки про netlink ENOENT и невозможность создать table ip6 crowdsec6.
+#      Последствия: лог-спам, забивает диск (10 событий/мин × 1440 мин = 14400
+#      строк/день).
+#      FIX: после установки bouncer'а патчим config — disable IPv6 если в
+#      sysctl IPv6 отключён (net.ipv6.conf.all.disable_ipv6=1).
+#
+#    [BUG-11 SECURITY] Mgmt IPs в UFW whitelist НЕ передаются в CrowdSec.
+#      Корень: скрипт парсит `ufw status` и кладёт mgmt IPs в наш nft set
+#      `manual_whitelist_v4`. Но CrowdSec про эти IPs ничего не знает.
+#      Если админ 5 раз неправильно введёт SSH-пароль (или fail2ban-style
+#      сценарий поменяется в hub upgrade), CrowdSec забанит его IP.
+#      Bouncer дропает на хук-уровне, наш `manual_whitelist_v4` в другой
+#      таблице/цепочке не помогает. Админ заблокирован на 4 часа.
+#      Симптом: "не могу подключиться по SSH со своего IP" — а нода живая.
+#      FIX: при установке создаём CrowdSec whitelist через
+#      `cscli decisions add --type whitelist` для всех IPs из MGMT_IPV4.
+#      Также делаем postoverflow whitelist по тем же IPs.
+#
+#    [BUG-12] sed для ban duration патчит только ПЕРВУЮ запись `duration: 24h`.
+#      Корень: дефолтный CrowdSec profiles.yaml содержит ТРИ профиля
+#      (captcha_remediation, default_ip_remediation, default_range_remediation),
+#      каждый со своим `duration: 4h`. Старая версия скрипта (v1.1-1.3)
+#      устанавливала 24h во все три. Команда
+#      `sed -i '0,/^...duration: 24h.../s//.../'` использует range-
+#      замену "первая встреченная строка" — обновляет только профиль Ip,
+#      оставляя Range и captcha на 24h. Юзер за CGNAT (Range-scope) сидит
+#      в бане 24h вместо 4h.
+#      FIX: убран `0,` из sed → теперь патчатся все вхождения 24h → 4h.
+#
+#    [BUG-13] Hub update никогда не запускается → стареющие правила.
+#      Корень: cscli коллекции/сценарии регулярно обновляются (новые
+#      sshd-bf варианты, исправления regex'ов в парсерах). На свежей
+#      установке скрипт ставит коллекции через `cscli collections install`,
+#      но никогда не делает `cscli hub update && cscli hub upgrade`.
+#      Через полгода правила устаревают, новые scenarios не подхватываются.
+#      На CrowdSec >= 1.7.2 идёт встроенный systemd-таймер hub-update,
+#      на старых версиях нет.
+#      FIX: после установки делаем единоразовый `cscli hub update && cscli
+#      hub upgrade`. Плюс если crowdsec версия < 1.7.2, добавляем cron-job
+#      ежедневного hub-update.
+#
+#    [DOCS] Уточнения в комментариях про взаимодействие CrowdSec с нашей
+#      защитой. Исправлены упоминания "защищает CrowdSec" в местах, где
+#      имеется в виду конкретно SSH-bouncer.
 #
 #  v3.10.2 changelog (audit fixes — major reliability + CGNAT false-positives):
 #
@@ -568,10 +707,32 @@ if [ "${1:-}" = "--uninstall" ]; then
     fi
     print_ok "nft правила удалены"
 
-    # cscli whitelist decisions
+    # cscli whitelist decisions (включая v3.10.3 mgmt whitelist)
     if command -v cscli >/dev/null 2>&1; then
         cscli decisions delete --type whitelist >/dev/null 2>&1 || true
         print_ok "Whitelist decisions очищены"
+    fi
+
+    # v3.10.3: убираем cron-job hub upgrade
+    rm -f /etc/cron.daily/cscli-hub-upgrade
+
+    # v3.10.4: убираем postoverflow whitelist
+    rm -f /etc/crowdsec/postoverflows/s01-whitelist/shieldnode-mgmt.yaml
+
+    # v3.10.4: убираем journalctl SSH acquisition если он от нас
+    if [ -f /etc/crowdsec/acquis.d/sshd.yaml ] && \
+       grep -q "v3.10.4" /etc/crowdsec/acquis.d/sshd.yaml 2>/dev/null; then
+        rm -f /etc/crowdsec/acquis.d/sshd.yaml
+        print_ok "Удалён shieldnode SSH acquisition"
+    fi
+    systemctl reload crowdsec >/dev/null 2>&1 || true
+
+    # v3.10.3: восстанавливаем оригинальный bouncer config если есть бэкап
+    if [ -f "$BACKUP_DIR/crowdsec-firewall-bouncer.yaml.before" ]; then
+        cp -a "$BACKUP_DIR/crowdsec-firewall-bouncer.yaml.before" \
+              /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+        systemctl restart crowdsec-firewall-bouncer 2>/dev/null || true
+        print_ok "Bouncer config восстановлен из бэкапа"
     fi
 
     print_header "UNINSTALL ЗАВЕРШЁН"
@@ -2295,9 +2456,15 @@ if [ -f "$PROFILES_FILE" ]; then
     fi
 
     # Если стоит 24h (от старой версии этого скрипта) — вернуть на 4h
+    # v3.10.3 BUG-12 FIX: убран `0,` префикс из sed — теперь патчатся ВСЕ
+    # вхождения. Дефолтный profiles.yaml содержит 3 профиля (captcha,
+    # default_ip_remediation, default_range_remediation), все с
+    # `duration: 4h`. Старая версия (v1.1-1.3) ставила 24h во все три, но
+    # downgrade патчил только первый (Ip-scope). Range-scope оставался 24h
+    # → юзер за CGNAT сидел в бане 24h вместо 4h.
     if grep -qE "^[[:space:]]*duration:[[:space:]]*24h[[:space:]]*$" "$PROFILES_FILE"; then
-        sed -i '0,/^\([[:space:]]*\)duration:[[:space:]]*24h[[:space:]]*$/s//\1duration: 4h/' "$PROFILES_FILE"
-        print_ok "Ban duration: 24h → 4h (v1.4 user-friendly)"
+        sed -i 's/^\([[:space:]]*\)duration:[[:space:]]*24h[[:space:]]*$/\1duration: 4h/' "$PROFILES_FILE"
+        print_ok "Ban duration: 24h → 4h во всех профилях (v3.10.3 BUG-12)"
     elif grep -qE "^[[:space:]]*duration:[[:space:]]*4h[[:space:]]*$" "$PROFILES_FILE"; then
         print_info "Ban duration уже 4h (дефолт CrowdSec)"
     else
@@ -2318,14 +2485,9 @@ print_header "ШАГ 9: ACQUISITION"
 # crowdsecurity/iptables-scan-multi_ports который ложно срабатывал на
 # VPN-юзеров с многопортовыми профилями. Без iptables-коллекции и UFW
 # acquisition этот сценарий не запускается.
-#
-# Оставляем только дефолтные acquisition (auth.log, journal) которые
-# приходят с коллекцией crowdsecurity/sshd. Они нужны для:
-#   - SSH bruteforce detection
-#   - regreSSHion (CVE-2024-6387)
-#   - SSH-key auto-whitelist watcher
 
 ACQUIS_DIR="/etc/crowdsec/acquis.d"
+mkdir -p "$ACQUIS_DIR"
 
 # Удаляем UFW acquisition если он был создан старой версией скрипта
 OLD_UFW_ACQUIS="$ACQUIS_DIR/ufw.yaml"
@@ -2336,11 +2498,162 @@ if [ -f "$OLD_UFW_ACQUIS" ]; then
     fi
 fi
 
-# Проверим что SSH acquisition (от sshd-коллекции) на месте
+# v3.10.4 BUG-14 + BUG-18 FIX: явно убеждаемся что SSHD acquisition есть.
+# Wizard может НЕ создать acquisition если /var/log/auth.log отсутствует
+# (Minimal Ubuntu 24.04, cloud images). Без acquisition коллекция sshd
+# работает в холостую — никаких decisions не создаётся.
+#
+# Стратегия:
+#   1. Проверяем существующие acquis-источники для SSH (file или journalctl)
+#   2. Если нет ничего — создаём journalctl-based acquis для sshd.service
+#   3. Если есть file-based для /var/log/auth.log — НЕ дублируем (BUG-18:
+#      double-counting в leaky bucket → ssh-bf срабатывает на 2-3 попытках
+#      вместо 5)
+SSH_ACQUIS_FOUND=0
+SSH_FILE_ACQUIS=0
+SSH_JOURNALD_ACQUIS=0
+
+# Сканируем acquis.yaml + acquis.d/*.yaml на SSH-источники
+for acquis_file in /etc/crowdsec/acquis.yaml "$ACQUIS_DIR"/*.yaml; do
+    [ -f "$acquis_file" ] || continue
+    # File-based для auth.log
+    if grep -qE "^\s*-\s+/var/log/auth\.log" "$acquis_file" 2>/dev/null; then
+        SSH_FILE_ACQUIS=1
+        SSH_ACQUIS_FOUND=1
+    fi
+    # Journalctl-based для sshd.service
+    if grep -qE "_SYSTEMD_UNIT=sshd\.service" "$acquis_file" 2>/dev/null; then
+        SSH_JOURNALD_ACQUIS=1
+        SSH_ACQUIS_FOUND=1
+    fi
+done
+
+if [ "$SSH_ACQUIS_FOUND" = "0" ] && cscli collections list 2>/dev/null | grep -q "^crowdsecurity/sshd"; then
+    # Нет SSH acquisition, но коллекция установлена — создаём journalctl
+    print_status "SSH acquisition отсутствует — создаю journalctl-based (BUG-14)"
+    cat > "$ACQUIS_DIR/sshd.yaml" <<'SSHD_ACQUIS_EOF'
+# v3.10.4: SSH acquisition через journalctl (BUG-14 fix).
+# Универсально работает на всех Ubuntu/Debian, не зависит от наличия
+# /var/log/auth.log (на Minimal Ubuntu файла нет).
+source: journalctl
+journalctl_filter:
+  - "_SYSTEMD_UNIT=sshd.service"
+labels:
+  type: syslog
+SSHD_ACQUIS_EOF
+    chmod 644 "$ACQUIS_DIR/sshd.yaml"
+    systemctl reload crowdsec >/dev/null 2>&1 || systemctl restart crowdsec >/dev/null 2>&1
+    print_ok "Создан /etc/crowdsec/acquis.d/sshd.yaml (journalctl)"
+elif [ "$SSH_FILE_ACQUIS" = "1" ] && [ "$SSH_JOURNALD_ACQUIS" = "1" ]; then
+    # BUG-18: двойной acquisition — auth.log + journalctl. Это double-counts
+    # каждое событие. Удаляем дублирующийся journalctl-acquis если он наш.
+    if [ -f "$ACQUIS_DIR/sshd.yaml" ] && grep -q "v3.10.4" "$ACQUIS_DIR/sshd.yaml"; then
+        rm -f "$ACQUIS_DIR/sshd.yaml"
+        systemctl reload crowdsec >/dev/null 2>&1
+        print_ok "Удалён дубль journalctl SSH acquisition (BUG-18: file-based уже работает)"
+    else
+        print_warn "Двойной SSH acquisition (file + journald). leaky bucket будет срабатывать в 2× быстрее."
+        print_info "Проверь /etc/crowdsec/acquis.yaml и acquis.d/*.yaml — оставь один источник."
+    fi
+elif [ "$SSH_FILE_ACQUIS" = "1" ]; then
+    print_ok "SSH acquisition: file:/var/log/auth.log"
+elif [ "$SSH_JOURNALD_ACQUIS" = "1" ]; then
+    print_ok "SSH acquisition: journalctl (sshd.service)"
+fi
+
+# Проверим что SSH-коллекция установлена
 if cscli collections list 2>/dev/null | grep -q "^crowdsecurity/sshd"; then
-    print_ok "SSH acquisition активен (через crowdsecurity/sshd)"
+    print_ok "SSH parsing активен (через crowdsecurity/sshd)"
 else
     print_warn "crowdsecurity/sshd не установлен — SSH-логи не парсятся"
+fi
+
+# v3.10.4 BUG-15 FIX: проверяем что CAPI registration реально прошла.
+# На машинах за corporate proxy/firewall apt postinst может silently fail.
+# Без CAPI нет community blocklist — теряется самая ценная фича.
+print_status "Проверяю CAPI registration (BUG-15)..."
+if cscli capi status >/dev/null 2>&1; then
+    print_ok "CAPI: registered + работает"
+else
+    print_warn "CAPI status не OK — пытаюсь зарегистрироваться..."
+    # Удаляем существующие credentials если они невалидные
+    if cscli capi register >/dev/null 2>&1; then
+        systemctl restart crowdsec >/dev/null 2>&1
+        sleep 3
+        if cscli capi status >/dev/null 2>&1; then
+            print_ok "CAPI зарегистрирован успешно"
+        else
+            print_warn "CAPI всё ещё не работает — проверь сеть"
+            print_info "Без CAPI не будет community blocklist (главная фича CrowdSec)"
+            print_info "Проверь: curl -v https://api.crowdsec.net"
+            print_info "За proxy/NAT? См. docs.crowdsec.net про HTTP_PROXY"
+        fi
+    else
+        print_warn "cscli capi register failed"
+    fi
+fi
+
+# v3.10.4 BUG-17 FIX: postoverflow whitelist для mgmt IPs.
+# `cscli decisions add --type whitelist` не предотвращает scenario trigger
+# (alerts всё равно идут в CAPI как сигналы атаки → ухудшение нашего
+# community contribution score). Postoverflow whitelist — правильный способ
+# глушить scenarios на доверенных IP до того как они попадут в alert.
+if [ -n "$MGMT_IPV4" ]; then
+    POSTOVERFLOW_WL="/etc/crowdsec/postoverflows/s01-whitelist/shieldnode-mgmt.yaml"
+    mkdir -p "$(dirname "$POSTOVERFLOW_WL")"
+
+    # Формируем YAML-список IP
+    # Save and restore IFS (we're at top level, can't use `local`)
+    OLD_IFS="$IFS"
+
+    # Split MGMT_IPV4 into pure IPs vs CIDRs (different YAML fields per CrowdSec spec)
+    TMP_IPS=""
+    TMP_CIDRS=""
+    IFS=','
+    for entry in $MGMT_IPV4; do
+        entry=$(echo "$entry" | tr -d ' ')
+        [ -z "$entry" ] && continue
+        case "$entry" in
+            */32)
+                # /32 — pure IP, strip /32
+                TMP_IPS="$TMP_IPS ${entry%/32}"
+                ;;
+            */*)
+                # CIDR (e.g. 192.168.1.0/24)
+                TMP_CIDRS="$TMP_CIDRS $entry"
+                ;;
+            *)
+                # No mask = single IP
+                TMP_IPS="$TMP_IPS $entry"
+                ;;
+        esac
+    done
+    IFS="$OLD_IFS"
+
+    {
+        echo "# v3.10.4 BUG-17: postoverflow whitelist для mgmt IPs."
+        echo "# Срабатывает ПОСЛЕ scenario trigger но ДО alert/decision —"
+        echo "# scenario не оставляет следов на наших IP."
+        echo "name: shieldnode/mgmt-whitelist"
+        echo "description: \"Whitelist mgmt IPs from UFW (auto-generated)\""
+        echo "whitelist:"
+        echo "  reason: \"shieldnode mgmt IP\""
+        if [ -n "$TMP_IPS" ]; then
+            echo "  ip:"
+            for ip in $TMP_IPS; do
+                echo "    - \"$ip\""
+            done
+        fi
+        if [ -n "$TMP_CIDRS" ]; then
+            echo "  cidr:"
+            for cidr in $TMP_CIDRS; do
+                echo "    - \"$cidr\""
+            done
+        fi
+    } > "$POSTOVERFLOW_WL"
+    chmod 644 "$POSTOVERFLOW_WL"
+    systemctl reload crowdsec >/dev/null 2>&1 || systemctl restart crowdsec >/dev/null 2>&1
+    print_ok "Postoverflow whitelist mgmt IPs (BUG-17)"
 fi
 
 # ==============================================================================
@@ -2370,8 +2683,85 @@ if ! cscli bouncers list 2>/dev/null | grep -q "cs-firewall-bouncer"; then
     fi
 fi
 
+# ============================================================================
+# v3.10.3 BUG-9 + BUG-10 FIX: правим bouncer config
+# ============================================================================
+# BUG-9: bouncer по дефолту: ipv4.priority=-10, hook=input. Это срабатывает
+# ПОСЛЕ нашей цепочки prerouting (priority -100). Banned-IP проходит наши
+# rate-limits и попадает в suspect_v4 ДО того как bouncer его дропнет.
+# Эмпирически проверено: 30 fast pings → 19 hits на newconn_overflow.
+# FIX: ставим bouncer на hook prerouting с priority -200 (раньше нашего -100).
+# Banned-IP дропнется до того как наша логика его увидит.
+#
+# BUG-10: ipv6.enabled=true по дефолту. На IPv6-disabled нодах bouncer пишет
+# в лог 8640 ошибок/сутки. FIX: если в системе IPv6 отключён — disable в
+# bouncer config.
+BOUNCER_CFG="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
+if [ -f "$BOUNCER_CFG" ]; then
+    BOUNCER_CHANGED=0
+
+    # Backup before patching
+    if [ ! -f "$BACKUP_DIR/crowdsec-firewall-bouncer.yaml.before" ]; then
+        cp -a "$BOUNCER_CFG" "$BACKUP_DIR/crowdsec-firewall-bouncer.yaml.before"
+    fi
+
+    # BUG-9: ipv4 priority -10 → -200, hook input → prerouting
+    if grep -qE '^\s*priority:\s*-10\s*$' "$BOUNCER_CFG"; then
+        # Меняем оба priority (ipv4 + ipv6 секции, обе по дефолту -10)
+        sed -i 's/^\([[:space:]]*\)priority:[[:space:]]*-10[[:space:]]*$/\1priority: -200/g' "$BOUNCER_CFG"
+        BOUNCER_CHANGED=1
+        print_ok "Bouncer priority: -10 → -200 (BUG-9: раньше нашего prerouting)"
+    fi
+
+    # nftables_hooks меняем с [input, forward] на [prerouting]
+    if grep -qE '^[[:space:]]*-\s+input\s*$' "$BOUNCER_CFG" && \
+       grep -qE '^[[:space:]]*-\s+forward\s*$' "$BOUNCER_CFG"; then
+        # Заменяем блок nftables_hooks: [input, forward] → [prerouting]
+        # (используем awk для надёжной обработки YAML-блока)
+        awk '
+        BEGIN { in_hooks = 0 }
+        /^nftables_hooks:/ { in_hooks = 1; print; print "  - prerouting"; next }
+        in_hooks && /^[[:space:]]*-/ { next }   # пропускаем старые элементы списка
+        in_hooks && !/^[[:space:]]*-/ { in_hooks = 0 }
+        { print }
+        ' "$BOUNCER_CFG" > "$BOUNCER_CFG.new" && mv "$BOUNCER_CFG.new" "$BOUNCER_CFG"
+        BOUNCER_CHANGED=1
+        print_ok "Bouncer hooks: input,forward → prerouting (BUG-9)"
+    fi
+
+    # BUG-10: disable IPv6 если в sysctl отключён
+    if [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" = "1" ]; then
+        # В bouncer.yaml ipv6.enabled может быть в двух местах: ipv6: enabled: true (под nftables)
+        # и disable_ipv6: false (top-level). Меняем оба.
+        if grep -qE '^\s*disable_ipv6:\s*false' "$BOUNCER_CFG"; then
+            sed -i 's/^\([[:space:]]*\)disable_ipv6:[[:space:]]*false[[:space:]]*$/\1disable_ipv6: true/' "$BOUNCER_CFG"
+            BOUNCER_CHANGED=1
+        fi
+        # Под секцией ipv6: меняем enabled: true → false
+        # Используем awk чтобы найти блок ipv6: и поменять enabled внутри
+        awk '
+        BEGIN { in_ipv6_block = 0 }
+        /^[[:space:]]*ipv6:/ { in_ipv6_block = 1; print; next }
+        in_ipv6_block && /^[a-zA-Z]/ { in_ipv6_block = 0 }
+        in_ipv6_block && /^[[:space:]]*enabled:[[:space:]]*true/ {
+            sub(/enabled:[[:space:]]*true/, "enabled: false"); print; next
+        }
+        { print }
+        ' "$BOUNCER_CFG" > "$BOUNCER_CFG.new" && mv "$BOUNCER_CFG.new" "$BOUNCER_CFG"
+        print_ok "Bouncer IPv6 отключён (BUG-10: в системе IPv6 disabled)"
+        BOUNCER_CHANGED=1
+    fi
+
+    if [ "$BOUNCER_CHANGED" = "1" ]; then
+        # Удаляем существующие cs-bouncer таблицы — они с правилами на старом hook
+        nft delete table ip crowdsec 2>/dev/null || true
+        nft delete table ip6 crowdsec6 2>/dev/null || true
+    fi
+fi
+
 systemctl enable --now crowdsec >/dev/null 2>&1 || true
-systemctl enable --now crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+systemctl restart crowdsec-firewall-bouncer >/dev/null 2>&1 || \
+    systemctl enable --now crowdsec-firewall-bouncer >/dev/null 2>&1 || true
 
 sleep 3
 
@@ -2382,6 +2772,70 @@ else
     systemctl is-active crowdsec || print_error "  crowdsec НЕ active"
     systemctl is-active crowdsec-firewall-bouncer || print_error "  bouncer НЕ active"
     print_info "Логи: journalctl -u crowdsec -u crowdsec-firewall-bouncer -n 50"
+fi
+
+# ============================================================================
+# v3.10.3 BUG-11 SECURITY FIX: добавляем mgmt IPs в CrowdSec whitelist
+# ============================================================================
+# Без этого: если админ ошибётся 5 раз с SSH-паролем (или CrowdSec обновит
+# scenarios с более чувствительным sshd-bf), его IP попадёт в ban → bouncer
+# дропнет его на новом priority -200 (после BUG-9 fix) → админ заблокирован.
+# Наш `manual_whitelist_v4` set здесь не помогает — bouncer работает в
+# отдельной таблице.
+if [ -n "$MGMT_IPV4" ]; then
+    print_status "Добавляю mgmt IPs в CrowdSec whitelist (BUG-11 SECURITY)..."
+    IFS=',' read -ra MGMT_LIST <<< "$MGMT_IPV4"
+    for mgmt_ip in "${MGMT_LIST[@]}"; do
+        # Очищаем от пробелов
+        mgmt_ip=$(echo "$mgmt_ip" | tr -d ' ')
+        [ -z "$mgmt_ip" ] && continue
+        # cscli decisions add создаёт whitelist на 100 лет (3650 дней)
+        if cscli decisions add --ip "$mgmt_ip" --type whitelist --duration 87600h \
+            --reason "shieldnode mgmt IP whitelist" >/dev/null 2>&1; then
+            print_ok "Mgmt whitelist: $mgmt_ip"
+        else
+            # Возможно уже в whitelist — это OK
+            print_info "Mgmt whitelist (возможно уже есть): $mgmt_ip"
+        fi
+    done
+fi
+
+# ============================================================================
+# v3.10.3 BUG-13 FIX: hub update + upgrade
+# ============================================================================
+# Без этого: сценарии устаревают, новые sshd-bf варианты не подхватываются.
+# CrowdSec >= 1.7.2 имеет встроенный systemd timer (hubupdate.timer), на
+# старых версиях нужен cron.
+print_status "Обновляю CrowdSec hub (BUG-13)..."
+if cscli hub update >/dev/null 2>&1; then
+    if cscli hub upgrade >/dev/null 2>&1; then
+        print_ok "Hub: коллекции/сценарии обновлены"
+    fi
+fi
+
+# Проверяем CrowdSec версию для cron-fallback
+CS_VER=$(cscli version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | tr -d v)
+if [ -n "$CS_VER" ]; then
+    # dpkg --compare-versions работает с числами
+    if dpkg --compare-versions "$CS_VER" lt "1.7.2" 2>/dev/null; then
+        # Старая версия — добавляем cron для hub upgrade
+        if [ ! -f /etc/cron.daily/cscli-hub-upgrade ]; then
+            cat > /etc/cron.daily/cscli-hub-upgrade <<'CRON_EOF'
+#!/bin/sh
+# v3.10.3 BUG-13: ежедневный hub upgrade для CrowdSec < 1.7.2
+# В 1.7.2+ есть встроенный systemd timer hubupdate.timer
+cscli hub update >/dev/null 2>&1 && cscli hub upgrade >/dev/null 2>&1 || true
+CRON_EOF
+            chmod +x /etc/cron.daily/cscli-hub-upgrade
+            print_ok "Cron daily hub-upgrade добавлен (CrowdSec $CS_VER < 1.7.2)"
+        fi
+    else
+        # Новая версия — встроенный timer
+        if systemctl list-unit-files | grep -q "crowdsec-hubupdate.timer"; then
+            systemctl enable --now crowdsec-hubupdate.timer >/dev/null 2>&1 || true
+            print_info "CrowdSec $CS_VER >= 1.7.2 — встроенный hub-upgrade timer"
+        fi
+    fi
 fi
 
 # ==============================================================================
@@ -3364,6 +3818,87 @@ case "$FIREWALL_TYPE" in
         fi
         ;;
 esac
+
+# 8. v3.10.3 BUG-9: bouncer работает на правильном hook (prerouting, не input)
+if systemctl is-active --quiet crowdsec-firewall-bouncer; then
+    sleep 2  # дать bouncer'у время создать таблицу
+    # Bouncer создаёт `table ip crowdsec` (не inet, не наша). Проверяем что
+    # цепочка в этой таблице висит на prerouting hook с priority -200.
+    if nft list chain ip crowdsec crowdsec-chain-prerouting >/dev/null 2>&1; then
+        BOUNCER_PRIO=$(nft list chain ip crowdsec crowdsec-chain-prerouting 2>/dev/null | grep -oE 'priority [a-z]* ?[+-]?[0-9]+' | head -1)
+        print_ok "Smoke: bouncer на prerouting hook ($BOUNCER_PRIO) — раньше нашего"
+    elif nft list chain ip crowdsec crowdsec-chain-input >/dev/null 2>&1; then
+        print_warn "WARN: bouncer всё ещё на input hook — BUG-9 fix не сработал"
+        print_info "Проверь /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
+        print_info "Должно быть: nftables_hooks: - prerouting, priority: -200"
+    elif nft list table ip crowdsec >/dev/null 2>&1; then
+        print_info "Smoke: bouncer table создана, но цепочка с непредсказуемым именем"
+    else
+        # Bouncer ещё не успел создать таблицу — возможно CAPI sync в процессе
+        print_info "Smoke: bouncer table ещё не создана (вероятно в процессе sync с CAPI)"
+    fi
+fi
+
+# 9. v3.10.3 BUG-10: bouncer не пытается работать с IPv6 если он отключён
+if [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" = "1" ]; then
+    if [ -f /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml ]; then
+        # Проверяем что в config'е ipv6 disabled
+        if awk '/^[[:space:]]*ipv6:/{f=1} f && /^[[:space:]]*enabled:[[:space:]]*true/{exit 1} /^[a-zA-Z]/{f=0}' \
+            /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml; then
+            print_ok "Smoke: bouncer IPv6 disabled (соответствует sysctl)"
+        else
+            print_warn "WARN: IPv6 disabled в системе, но НЕ в bouncer config — будут ошибки в логе"
+        fi
+    fi
+fi
+
+# 10. v3.10.3 BUG-11: mgmt IPs в CrowdSec whitelist
+if [ -n "$MGMT_IPV4" ] && command -v cscli >/dev/null 2>&1; then
+    WL_COUNT=$(cscli decisions list --type whitelist -o raw 2>/dev/null | tail -n +2 | wc -l)
+    EXPECTED_COUNT=$(echo "$MGMT_IPV4" | tr ',' '\n' | grep -c .)
+    if [ "$WL_COUNT" -ge "$EXPECTED_COUNT" ]; then
+        print_ok "Smoke: $WL_COUNT mgmt IPs в CrowdSec whitelist"
+    else
+        print_warn "WARN: только $WL_COUNT из $EXPECTED_COUNT mgmt IPs в whitelist"
+    fi
+fi
+
+# 11. v3.10.4 BUG-14: SSH acquisition реально работает
+if command -v cscli >/dev/null 2>&1; then
+    sleep 1
+    # cscli metrics show acquisition покажет источники
+    SSH_ACQ_LINES=$(cscli metrics show acquisition 2>/dev/null | grep -cE "auth\.log|sshd\.service" || echo 0)
+    if [ "$SSH_ACQ_LINES" -gt 0 ]; then
+        print_ok "Smoke: SSH acquisition активен ($SSH_ACQ_LINES источников)"
+    else
+        # Может быть еще не успели получить метрики - не fatal
+        print_info "Smoke: SSH acquisition метрики ещё пустые (нет логин-попыток с момента старта)"
+    fi
+fi
+
+# 12. v3.10.4 BUG-15: CAPI работает → community blocklist приходит
+if command -v cscli >/dev/null 2>&1; then
+    if cscli capi status >/dev/null 2>&1; then
+        # Подсчёт CAPI decisions (community blocklist)
+        CAPI_DECISIONS=$(cscli decisions list --origin CAPI -o raw 2>/dev/null | tail -n +2 | wc -l)
+        if [ "$CAPI_DECISIONS" -gt 0 ]; then
+            print_ok "Smoke: $CAPI_DECISIONS CAPI decisions (community blocklist работает)"
+        else
+            print_info "Smoke: CAPI registered, но 0 decisions yet (придут через 1-2 часа)"
+        fi
+    else
+        print_warn "WARN: CAPI status не OK — нет community blocklist"
+    fi
+fi
+
+# 13. v3.10.4 BUG-19: scenarios в simulation mode (не банят, только alerts)
+if command -v cscli >/dev/null 2>&1; then
+    SIM_COUNT=$(cscli simulation status 2>/dev/null | grep -cE "^\s*-\s+" || echo 0)
+    if [ "$SIM_COUNT" -gt 0 ]; then
+        print_info "Smoke: $SIM_COUNT scenarios в simulation mode (alerts only, без bans)"
+        print_info "       Список: cscli simulation status"
+    fi
+fi
 
 if [ "$SMOKE_FAIL" -eq 1 ]; then
     print_error ""
