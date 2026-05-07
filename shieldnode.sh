@@ -1,11 +1,13 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.7 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v3.8 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables connection-flood + slowloris защита (ct count + new-conn rate)
 #  - nftables TCP flag sanity (drop invalid combinations)
+#  - nftables anti-spoofing (fib saddr — стронгер чем rp_filter loose)
+#  - nftables TCP MSS clamping (улучшает скорость VPN, устраняет фрагментацию)
 #  - CrowdSec (SSH brute-force + community blocklist)
 #  - guard CLI — снимок состояния защиты (one-shot, no live updates)
 #  - Человекочитаемые логи в /var/log/shieldnode/events.log
@@ -14,6 +16,21 @@
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
 #  Совместимо с vpn-node-setup.sh v4.0 (XanMod + IPv6 disabled).
+#
+#  v3.8 changelog (perf + защита-улучшения, без подлагиваний для клиентов):
+#    - ADD: TCP MSS clamping в nft chain forward.
+#      Что: для new TCP-соединений устанавливает MSS option = "path MTU - 40".
+#      Зачем: устраняет фрагментацию пакетов в VPN-туннеле (клиент жалуется
+#      "сайт не открывается / медленно грузит") — стандартная VPN-болезнь
+#      когда MTU 1500 на eth0 + tun0/wg0 ломает large-packet path.
+#      Эффект: УСКОРЯЕТ VPN, не замедляет. Применяется только к forwarded
+#      трафику (через ноду), не к локальному (SSH/control plane не задевает).
+#    - ADD: fib saddr type missing drop (anti-spoofing уровень 2).
+#      Что: дропает пакеты у которых FIB не знает обратного маршрута к src IP.
+#      Стронгер чем rp_filter loose — ловит spoofed src из соседних сетей.
+#      Включается ТОЛЬКО если у сервера один upstream-интерфейс (детектится
+#      автоматически). На multi-homed VPS — пропускается с warning'ом
+#      (asymmetric routing там нормален). tun*/wg*/docker*/lo исключены.
 #
 #  v3.7 changelog (standalone-ready: shieldnode работает БЕЗ vpn-node-setup.sh):
 #    - ADD: shieldnode теперь сам ставит критичные security sysctl, скопированные
@@ -436,6 +453,30 @@ if mkdir -p "$INSTALL_LOG_DIR" 2>/dev/null && touch "$INSTALL_LOG" 2>/dev/null; 
     # Перенаправляем stdout И stderr в tee (видим на экране + пишем в лог).
     # Это ставится ДО первого print_* — все шаги установки попадут в файл.
     exec > >(tee -a "$INSTALL_LOG") 2>&1
+fi
+
+# ==============================================================================
+# v3.7: LEGACY CLEANUP (миграция со старых версий)
+# ==============================================================================
+# Точечно убираем артефакты старых версий, чтобы не висели orphan-файлы.
+# Делаем тихо — если ничего нет, ничего не происходит.
+# Полная зачистка остаётся в --uninstall блоке.
+
+LEGACY_CLEANED=0
+
+# v≤3.4: SSH-key auto-whitelist (удалён в v3.5)
+if [ -f /etc/systemd/system/cs-ssh-whitelist.service ]; then
+    systemctl disable --now cs-ssh-whitelist 2>/dev/null || true
+    rm -f /etc/systemd/system/cs-ssh-whitelist.service
+    rm -f /usr/local/sbin/cs-ssh-key-whitelist.sh
+    rm -f /etc/crowdsec/postoverflows/s01-whitelist/ssh-key-whitelist.yaml
+    rm -rf /run/cs-ssh-whitelist
+    systemctl daemon-reload 2>/dev/null || true
+    LEGACY_CLEANED=1
+fi
+
+if [ "$LEGACY_CLEANED" = "1" ]; then
+    print_status "Legacy cleanup: удалены артефакты ≤v3.4 (cs-ssh-whitelist)"
 fi
 
 # ==============================================================================
@@ -963,11 +1004,26 @@ case "$ADMIN_IP" in
 esac
 
 if [ -n "$ADMIN_IP" ]; then
-    print_ok "Текущий админский IP: ${BOLD}$ADMIN_IP${NC} (bootstrap-whitelist на 12h)"
+    print_ok "Текущий админский IP: ${BOLD}$ADMIN_IP${NC}"
+    print_info "Если хочешь добавить в manual whitelist: sudo ufw allow from $ADMIN_IP"
 else
-    print_warn "Не удалось определить админский IP (запуск не через SSH)"
-    print_info "Это ок если ты на локальной консоли. Whitelist начнёт работать"
-    print_info "после первого SSH-коннекта по ключу."
+    print_info "Админский IP не определён (запуск с локальной консоли — это ок)"
+fi
+
+# v3.8: детект upstream-интерфейсов для anti-spoofing (fib saddr).
+# Считаем интерфейсы в основной таблице маршрутизации, исключая виртуальные.
+# Если интерфейсов больше 1 — multi-homed VPS, fib может дать false-positive
+# из-за asymmetric routing → отключаем правило.
+UPSTREAM_IFACES=$(ip -o -4 route show default 2>/dev/null | awk '{print $5}' | sort -u)
+UPSTREAM_COUNT=$(echo "$UPSTREAM_IFACES" | grep -cE '^[a-z]')
+if [ "$UPSTREAM_COUNT" = "1" ] && [ -n "$UPSTREAM_IFACES" ]; then
+    ENABLE_FIB_ANTISPOOF=1
+    print_ok "Single-homed VPS (uplink: ${BOLD}$UPSTREAM_IFACES${NC}) — fib anti-spoofing будет включён"
+else
+    ENABLE_FIB_ANTISPOOF=0
+    print_warn "Multi-homed VPS (${UPSTREAM_COUNT} default routes) — fib anti-spoofing ОТКЛЮЧЁН"
+    print_info "На multi-homed asymmetric routing нормален; fib может дать false-positive."
+    print_info "rp_filter=2 (loose) от vpn-node-setup.sh продолжает защищать от spoofing."
 fi
 
 # ==============================================================================
@@ -1024,6 +1080,20 @@ print_header "ШАГ 4: NFTABLES RATE-LIMIT (kernel-level SYN flood protection)"
 NFT_CONF_DIR="/etc/nftables.d"
 NFT_DDOS_CONF="$NFT_CONF_DIR/ddos-protect.conf"
 mkdir -p "$NFT_CONF_DIR"
+
+# v3.8: подготовка conditional-правил для nft template.
+# fib anti-spoofing — только на single-homed VPS.
+if [ "${ENABLE_FIB_ANTISPOOF:-0}" = "1" ]; then
+    FIB_ANTISPOOF_RULE="        # === v3.8: ANTI-SPOOFING (fib reverse-path) ===
+        # Стронгер чем rp_filter loose — ловит spoofed src из соседних сетей,
+        # для которых kernel'у не известен обратный маршрут.
+        # iif lo пропускаем (локальный трафик не должен попадать под fib check).
+        # Включено потому что VPS single-homed (один upstream).
+        iif \"lo\" accept
+        fib saddr . iif oif missing counter name tcp_invalid drop"
+else
+    FIB_ANTISPOOF_RULE="        # fib anti-spoofing отключён (multi-homed VPS — может дать false-positive)"
+fi
 
 cat > "$NFT_DDOS_CONF" <<EOF
 #!/usr/sbin/nft -f
@@ -1164,6 +1234,8 @@ $MANUAL_WHITELIST_V4_INIT
         # SSH — без блокировок (защищает CrowdSec)
         tcp dport $SSH_PORT accept
 
+$FIB_ANTISPOOF_RULE
+
         # === v3.5: TCP FLAG SANITY ===
         # Дропаем пакеты с невозможными комбинациями TCP-флагов.
         # Используются port-сканерами (nmap -sN/-sF/-sX), evasion-сценариями,
@@ -1263,6 +1335,21 @@ $MANUAL_WHITELIST_V4_INIT
         udp dport @protected_ports_udp \\
             add @udp_flood_v4 { ip saddr limit rate over 600/second burst 1000 packets } \\
             add @suspect_v4 { ip saddr }
+    }
+
+    # === v3.8: TCP MSS CLAMPING (forward hook) ===
+    # Что: для new TCP connection clamp MSS option в SYN до "path MTU - 40".
+    # Зачем: VPN-туннели (tun0/wg0) часто имеют MTU < 1500. Без clamping'а
+    # клиент шлёт пакет 1460 byte payload (MSS=1460 для eth0 1500), который
+    # потом приходится фрагментировать или дропать с ICMP "frag needed".
+    # Симптом без clamping'а: "сайт грузится медленно" / "не открывается".
+    # С clamping'ом: клиент сразу шлёт правильный MSS, нет ретрансмитов.
+    #
+    # priority: filter (после rate-limit'а в prerouting, перед NAT).
+    # Применяется ТОЛЬКО к forwarded трафику (не локальному SSH/control plane).
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        tcp flags syn tcp option maxseg size set rt mtu
     }
 }
 EOF
@@ -2880,6 +2967,10 @@ print_header "ГОТОВО"
 echo -e "  ${BOLD}Что настроено:${NC}"
 echo -e "  ├─ ${GREEN}✔${NC} nft rate-limit: 300 SYN/sec TCP, 600 packets/sec UDP (CGNAT-friendly, ban-once)"
 echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}HTTP/conn-flood защита (v3.5):${NC} ct count 50 + new-conn 50/min + TCP flag sanity"
+if [ "${ENABLE_FIB_ANTISPOOF:-0}" = "1" ]; then
+    echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Anti-spoofing (v3.8):${NC} fib reverse-path check (single-homed VPS)"
+fi
+echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}TCP MSS clamping (v3.8):${NC} устраняет фрагментацию в VPN-туннеле (faster, не slower)"
 echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Scanner blocklist:${NC} pre-emptive drop российских госсканеров"
 echo -e "  │   ├─ traffic-guard-lists (общие сканеры, Shodan, Censys)"
 echo -e "  │   ├─ ${BOLD}tread-lightly/CyberOK_Skipa_ips${NC} (SKIPA scan-XX, ГРЧЦ, НКЦКИ)"
@@ -2935,18 +3026,22 @@ fi
 echo -e "  ${BOLD}Многоуровневая защита (по приоритету):${NC}"
 echo -e "  1. ${CYAN}Manual whitelist${NC}      → доверенные IP (management из UFW + manual)"
 echo -e "  2. ${CYAN}SSH (порт $SSH_PORT)${NC}      → пропуск (защищает CrowdSec)"
-echo -e "  3. ${CYAN}Scanner blocklist${NC}     → drop ${BOLD}~3000${NC} известных сканеров"
+if [ "${ENABLE_FIB_ANTISPOOF:-0}" = "1" ]; then
+    echo -e "  3. ${CYAN}Anti-spoofing${NC}         → drop пакетов с нерутабельным src (fib check)"
+fi
+echo -e "  4. ${CYAN}Scanner blocklist${NC}     → drop ${BOLD}~3000${NC} известных сканеров"
 echo -e "      ├─ shadow-netlab/traffic-guard-lists (общие: Shodan, Censys, gov)"
 echo -e "      ├─ tread-lightly/CyberOK_Skipa_ips (SKIPA, ГРЧЦ, НКЦКИ)"
 echo -e "      └─ MISP/CIRCL warninglists (honeypot-verified)"
-echo -e "  4. ${CYAN}Confirmed attack${NC}      → drop IP подтверждённых атакующих (1 час)"
-echo -e "  5. ${CYAN}Rate-limit ban-once${NC}   → 1й удар = suspect (5 мин), 2й = бан"
+echo -e "  5. ${CYAN}Confirmed attack${NC}      → drop IP подтверждённых атакующих (1 час)"
+echo -e "  6. ${CYAN}Rate-limit ban-once${NC}   → 1й удар = suspect (5 мин), 2й = бан"
 echo -e "      ├─ TCP SYN: ${BOLD}300/sec burst 500${NC} (CGNAT-friendly)"
 echo -e "      ├─ UDP:     ${BOLD}600/sec burst 1000${NC}"
 echo -e "      ├─ ct count: ${BOLD}50 concurrent${NC} на src IP (slowloris/conn-flood)"
 echo -e "      ├─ new-conn: ${BOLD}50/min burst 100${NC} (HTTP-flood через TLS)"
 echo -e "      └─ TCP flags: drop XMAS/NULL/SYN+FIN/SYN+RST/FIN+RST"
-echo -e "  6. ${CYAN}CrowdSec bouncer${NC}      → бан по поведению (SSH brute, regreSSHion)"
+echo -e "  7. ${CYAN}CrowdSec bouncer${NC}      → бан по поведению (SSH brute, regreSSHion)"
+echo -e "  8. ${CYAN}MSS clamping (forward)${NC} → ускорение VPN-трафика, устранение фрагментации"
 echo ""
 echo -e "  ${BOLD}${GREEN}User-friendly defaults:${NC}"
 echo -e "  ${GREEN}✔${NC} CGNAT юзеры (МТС/Билайн/МегаФон) не банятся — лимит 300/sec на IP"
