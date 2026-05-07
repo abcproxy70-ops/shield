@@ -1,21 +1,50 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.8 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v3.9 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
-#  - nftables connection-flood + slowloris защита (ct count + new-conn rate)
+#  - nftables connection-flood + slowloris защита (PROPER per-IP ct count)
 #  - nftables TCP flag sanity (drop invalid combinations)
 #  - nftables anti-spoofing (fib saddr — стронгер чем rp_filter loose)
 #  - nftables TCP MSS clamping (улучшает скорость VPN, устраняет фрагментацию)
 #  - CrowdSec (SSH brute-force + community blocklist)
-#  - guard CLI — снимок состояния защиты (one-shot, no live updates)
+#  - guard CLI — снимок состояния защиты + кнопка [8] Unban all
 #  - Человекочитаемые логи в /var/log/shieldnode/events.log
 #  - Мгновенное отслеживание изменений в фаерволе через inotify
 #
 #  Запускать ПОСЛЕ настройки фаервола (UFW/iptables/firewalld).
 #  Совместимо с активным UFW и любыми другими nft-таблицами.
 #  Совместимо с vpn-node-setup.sh v4.0 (XanMod + IPv6 disabled).
+#
+#  v3.9 changelog (CRITICAL FIX: ложные баны клиентов на CGNAT):
+#    - CRITICAL FIX: правило "ct count over 50" банило ВСЕХ клиентов VPN-ноды.
+#      Корень проблемы: синтаксис "ct count over N" БЕЗ "ip saddr" — это
+#      ГЛОБАЛЬНЫЙ счётчик conntrack по всей системе, а не per-IP.
+#      Когда у ноды >50 conntrack-записей (норма для VPN), КАЖДЫЙ новый TCP
+#      на VPN-порту матчил это правило → попадал в suspect → второй матч →
+#      confirmed_attack (бан 1ч). Проявление на проде: 42 ложных бана
+#      российских CGNAT-клиентов за 6 секунд.
+#      Подтверждение: counter conn_flood_v4=189 packets, syn_confirmed_v4=0,
+#      newconn_flood_v4=0 → бан шёл ИСКЛЮЧИТЕЛЬНО через сломанный ct count.
+#      Правильный синтаксис per-IP (Red Hat RHEL 8 docs):
+#        add @set { ip saddr ct count over N }
+#      Где N — concurrent connections от конкретного src IP, set хранит
+#      элементы автоматически с per-element счётчиком.
+#    - CHANGE: лимиты подняты под реальные CGNAT-нагрузки в РФ:
+#      • ct count: 50 → 100 (CGNAT с 50 юзерами легко даёт 80-150 concurrent)
+#      • new-conn rate: 50/min → 150/min, burst 100 → 300
+#      • SYN rate: 300/sec → оставлен (для CGNAT уже OK)
+#      • UDP rate: 600/sec → оставлен
+#    - CHANGE: suspect_v4 timeout 5min → 30min.
+#      Зачем: 5min слишком коротко — клиент с retry (Reality, mux) может
+#      залезть в suspect, через 6 минут попробовать снова, и счётчик
+#      сбросится — ban-once архитектура не работает. 30min даёт окно
+#      определить настоящего атакующего.
+#    - ADD: [8] Unban all в guard interactive menu.
+#      Что: одной кнопкой очистить confirmed_attack_v4 + suspect_v4.
+#      Зачем: при ложных срабатываниях (как этот баг) или ручной коррекции
+#      нужна простая команда вместо `nft flush set ...` руками.
 #
 #  v3.8 changelog (perf + защита-улучшения, без подлагиваний для клиентов):
 #    - ADD: TCP MSS clamping в nft chain forward.
@@ -1154,10 +1183,25 @@ $XRAY_PORTS_UDP_INIT
     # IP попадает сюда при первом превышении лимита.
     # Трафик НЕ дропается. Если за 5 минут IP опять превышает — переводим в confirmed.
     # Если не превышает — таймер истекает, забываем про IP (false positive).
+    # v3.9: timeout поднят с 5m до 30m. Причина: 5m слишком коротко для
+    # реальной защиты — клиент с retry (Reality mux, mobile reconnect) мог
+    # залезть в suspect, через 6 мин попробовать снова, и таймер сбрасывался.
+    # Ban-once не работал по сути. 30m даёт окно определить atакующего vs CGNAT.
     set suspect_v4 {
         type ipv4_addr
         flags dynamic, timeout
-        timeout 5m
+        timeout 30m
+        size 65536
+    }
+
+    # v3.9: connlimit_v4 — отслеживает concurrent connections per source IP
+    # для ct count. ВАЖНО: НЕ должен иметь timeout (по docs nftables wiki:
+    # "ct count statement can only be used with add set statement, if you
+    # define timeout, you will hit Operation is not supported error").
+    # Conntrack table timers сами cleanup элементы при истечении соединений.
+    set connlimit_v4 {
+        type ipv4_addr
+        flags dynamic
         size 65536
     }
 
@@ -1269,44 +1313,44 @@ $FIB_ANTISPOOF_RULE
             counter name confirmed_drops_v4 drop
         ip saddr @confirmed_attack_v4 counter name confirmed_drops_v4 drop
 
-        # === v3.5: CONNECTION-FLOOD / SLOWLORIS ЗАЩИТА ===
+        # === v3.5+v3.9: CONNECTION-FLOOD / SLOWLORIS ЗАЩИТА ===
         # Защищает от: тысяч одновременных TCP-соединений с одного IP,
         # медленного TLS handshake (slowloris), HTTP-flood через established TCP.
         # Применяется только к защищаемым TCP-портам (Xray/Reality/sing-box).
         # manual_whitelist уже пропущен выше.
         #
-        # Лимиты подобраны для VPN-трафика:
-        #   ct count    > 50  — concurrent connections per src IP (mux=5-20 норма,
-        #                       CGNAT с 50 юзерами = до 1000, но это редкость
-        #                       одновременно — большинство idle)
-        #   new conn    > 50/min — скорость открытия новых соединений
+        # v3.9 CRITICAL FIX: правильный синтаксис per-source-IP.
+        # Старый синтаксис "ct count over N" БЕЗ "ip saddr" в add-statement
+        # был ГЛОБАЛЬНЫМ счётчиком conntrack. На VPN-нодах с >100 conntrack
+        # это банило ВСЕХ клиентов. Правильный синтаксис (Red Hat docs +
+        # nftables wiki Meters):
+        #   add @set { ip saddr ct count over N }
+        # Set ОБЯЗАТЕЛЬНО без timeout (иначе "Operation is not supported").
+        # Conntrack timers сами cleanup элементы.
         #
-        # Поведение: первое нарушение → suspect (5 мин watch, no drop),
-        # второе → confirmed_attack (1h drop). Та же ban-once что у SYN-flood.
-
-        # Этап 2: IP уже в suspect и снова превышает ct count → confirmed + drop.
-        tcp dport @protected_ports_tcp ct state new ip saddr @suspect_v4 \\
-            ct count over 50 \\
-            add @confirmed_attack_v4 { ip saddr } counter name conn_flood_v4 drop
-
-        # Этап 1: первое превышение ct count → suspect (no drop).
+        # Логика проще чем у SYN-flood: ct count работает в реальном времени,
+        # ban-once stage не нужен — если IP реально держит >100 concurrent
+        # connections, это однозначно flood/slowloris/scanner. Прямой drop.
+        # Лимит 100 (CGNAT с 50 юзерами обычно даёт 30-80 concurrent).
         tcp dport @protected_ports_tcp ct state new \\
-            ct count over 50 \\
-            add @suspect_v4 { ip saddr } counter name conn_flood_v4
+            add @connlimit_v4 { ip saddr ct count over 100 } \\
+            counter name conn_flood_v4 drop
 
         # === v3.5: NEW CONNECTION RATE-LIMIT ===
         # Отдельно от SYN — считает уникальные new-conn по conntrack
         # (SYN-rate ловит retry/duplicate, а это — реальную скорость подключений).
-        # Лимит: 50 new-conn/минуту на src IP.
+        # v3.9: 50/min → 150/min, burst 100 → 300 (CGNAT-friendly).
+        # Это правило ИСПОЛЬЗУЕТ ban-once (suspect→confirmed) — потому что
+        # rate-burst может быть legitimate (массовый reconnect клиентов).
 
         # Этап 2: suspect + снова превышает → confirmed.
         tcp dport @protected_ports_tcp ct state new ip saddr @suspect_v4 \\
-            add @newconn_rate_v4 { ip saddr limit rate over 50/minute burst 100 packets } \\
+            add @newconn_rate_v4 { ip saddr limit rate over 150/minute burst 300 packets } \\
             add @confirmed_attack_v4 { ip saddr } counter name newconn_flood_v4 drop
 
         # Этап 1: первое превышение → suspect.
         tcp dport @protected_ports_tcp ct state new \\
-            add @newconn_rate_v4 { ip saddr limit rate over 50/minute burst 100 packets } \\
+            add @newconn_rate_v4 { ip saddr limit rate over 150/minute burst 300 packets } \\
             add @suspect_v4 { ip saddr } counter name newconn_flood_v4
 
         # === TCP SYN rate-limit на защищаемых портах ===
@@ -2800,6 +2844,37 @@ show_top_attackers() {
     echo ""
 }
 
+# v3.9: разбан всех IP в suspect_v4 и confirmed_attack_v4 одной командой.
+# Используется при ложных срабатываниях или при ручной коррекции.
+unban_all() {
+    echo ""
+    local susp conf
+    susp=$(nft list set inet ddos_protect suspect_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+    conf=$(nft list set inet ddos_protect confirmed_attack_v4 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+    echo -e "${B}Unban all confirmed attack + suspect${N}"
+    echo -e "${DIM}─────────────────────────────────${N}"
+    echo -e "  Сейчас в suspect:          ${Y}${susp}${N} IP"
+    echo -e "  Сейчас в confirmed_attack: ${R}${conf}${N} IP"
+    echo ""
+    echo -ne "  ${B}Очистить оба set'а? [y/N]:${N} "
+    read -r confirm
+    case "$confirm" in
+        y|Y|yes|YES)
+            nft flush set inet ddos_protect suspect_v4 2>/dev/null
+            nft flush set inet ddos_protect confirmed_attack_v4 2>/dev/null
+            echo -e "  ${G}✓${N} Очищено: $susp suspect + $conf confirmed = $((susp + conf)) IP разбанены"
+            echo -e "  ${DIM}Учти: connlimit_v4 не очищается (там conntrack timers cleanup автоматом)${N}"
+            ;;
+        *)
+            echo -e "  ${DIM}Отменено${N}"
+            ;;
+    esac
+    echo ""
+}
+
+
 # v3.5: показать /var/log/shieldnode/events.log через less
 show_full_log() {
     echo ""
@@ -2900,7 +2975,7 @@ while true; do
     echo -e "${C}│${N}  [${B}1${N}] Active attacks         [${B}2${N}] CrowdSec bans                   ${C}│${N}"
     echo -e "${C}│${N}  [${B}3${N}] Whitelist IPs          [${B}4${N}] Scanner blocklist               ${C}│${N}"
     echo -e "${C}│${N}  [${B}6${N}] Recent history         [${B}7${N}] Top attackers                   ${C}│${N}"
-    echo -e "${C}│${N}  [${B}9${N}] View full events.log                                       ${C}│${N}"
+    echo -e "${C}│${N}  [${B}8${N}] Unban all (suspect+confirmed)  [${B}9${N}] View full events.log    ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
     echo -e "${C}│${N}  [${B}r${N}] Refresh                [${B}0${N}] Exit                            ${C}│${N}"
     echo -e "${C}└─────────────────────────────────────────────────────────────────┘${N}"
@@ -2914,6 +2989,7 @@ while true; do
         4) show_scanner_samples  ;;
         6) show_history          ;;
         7) show_top_attackers    ;;
+        8) unban_all             ;;
         9) show_full_log         ;;
         r|R|"") continue ;;
         0|q|quit|exit) clear 2>/dev/null; exit 0 ;;
