@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.14.0 (Commercial Edition)
+#  VPN NODE DDoS PROTECTION v3.14.1 (Commercial Edition) — HOTFIX
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables threat-blocklist (Spamhaus DROP + FireHOL Level 1, v3.12.0)
@@ -19,6 +19,35 @@
 #  - Человекочитаемые логи в /var/log/shieldnode/events.log
 #  - Опциональный конфиг /etc/shieldnode/shieldnode.conf (v3.12.0)
 #  - File-based blocklists в /etc/shieldnode/lists/*.txt (v3.12.0)
+#
+#  v3.14.1 hotfix changelog:
+#
+#    [PRESERVE-USER-SETTINGS] При reinstall (apply новой версии через
+#      'sudo guard upgrade' или bash <(curl ...)) настройки оператора в
+#      /etc/shieldnode/shieldnode.conf РАНЬШЕ ИГНОРИРОВАЛИСЬ установщиком.
+#
+#      Сценарий-баг: оператор отключил GitHub sync через guard settings →
+#      ENABLE_GITHUB_SYNC="0" записан в shieldnode.conf. После reinstall
+#      главный установщик использовал env-default ENABLE_GITHUB_SYNC=1 →
+#      timer включался снова. Оператор терял свой выбор.
+#
+#      FIX: при старте главный установщик ЧИТАЕТ /etc/shieldnode/shieldnode.conf
+#      ДО объявления дефолтов. Все ENABLE_* из конфига получают приоритет
+#      над встроенными дефолтами. Конкретно влияет на:
+#         - ENABLE_GITHUB_SYNC
+#         - ENABLE_VERSION_CHECK
+#         - ENABLE_RU_MOBILE_WHITELIST
+#         - MAXMIND_LICENSE_KEY (был ОК — читался updater'ом, а не установщиком,
+#           но теперь и установщик его видит для финальной summary)
+#         - BLOCK_TOR (был ОК — читался через файл-маркер, дополнительно
+#           теперь приоритет conf > env > default)
+#
+#      Файлы которые УЖЕ сохранялись (как было):
+#         - /etc/shieldnode/lists/custom.txt        (через [ -s "$target" ])
+#         - /etc/shieldnode/lists/custom-local.txt  (через [ ! -e "$LOCAL_CUSTOM" ])
+#         - /etc/shieldnode/shieldnode.conf         (через [ ! -f "$SHIELD_CONF_FILE" ])
+#         - /var/lib/shieldnode/events.db           (только uninstall удаляет)
+#         - /var/log/shieldnode/events.log          (logrotate'ится)
 #
 #  v3.14.0 changelog:
 #
@@ -966,21 +995,32 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.14.0: версия для self-check
-SHIELDNODE_VERSION="3.14.0"
+SHIELDNODE_VERSION="3.14.1"
 
-# v3.14.0: настройки auto-sync (можно переопределить в shieldnode.conf)
-ENABLE_GITHUB_SYNC="${ENABLE_GITHUB_SYNC:-1}"
-ENABLE_VERSION_CHECK="${ENABLE_VERSION_CHECK:-1}"
-DEFAULT_GITHUB_SYNC_INTERVAL="6h"
-DEFAULT_VERSION_CHECK_INTERVAL="1d"
-
-# Каталоги
+# Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
 SHIELD_LISTS_DIR="$SHIELD_ETC_DIR/lists"
 SHIELD_CONF_FILE="$SHIELD_ETC_DIR/shieldnode.conf"
 SHIELD_DEFAULTS_FILE="/usr/local/sbin/shieldnode-defaults.sh"
 SHIELD_UPDATER_SCRIPT="/usr/local/sbin/shieldnode-update-blocklist.sh"
 SHIELD_STATE_DIR="/var/lib/shieldnode"
+
+# v3.14.1: ПРИОРИТЕТНАЯ ПОДГРУЗКА USER CONFIG.
+# Если оператор настроил что-либо через guard CLI settings menu — это записалось
+# в /etc/shieldnode/shieldnode.conf. При reinstall (apply новой версии) мы должны
+# уважать его выбор, а не сбрасывать на дефолты. Подгружаем СЕЙЧАС, до объявления
+# дефолтов: env var или conf-значение получает приоритет над встроенным дефолтом.
+if [ -f "$SHIELD_CONF_FILE" ]; then
+    # shellcheck source=/dev/null
+    . "$SHIELD_CONF_FILE" 2>/dev/null || true
+fi
+
+# v3.14.0: настройки auto-sync (можно переопределить в shieldnode.conf или env).
+# Приоритет: env var → shieldnode.conf → дефолт здесь.
+ENABLE_GITHUB_SYNC="${ENABLE_GITHUB_SYNC:-1}"
+ENABLE_VERSION_CHECK="${ENABLE_VERSION_CHECK:-1}"
+DEFAULT_GITHUB_SYNC_INTERVAL="6h"
+DEFAULT_VERSION_CHECK_INTERVAL="1d"
 
 # v3.12.0: detect pipe-mode (curl | bash) vs git-clone-mode (./shieldnode.sh)
 # Pipe-mode → BASH_SOURCE[0] = /dev/fd/* или похожее → нет ./lists рядом со скриптом
@@ -1046,6 +1086,8 @@ shield_nft_set_name() {
 }
 
 # v3.13.0: mobile-RU whitelist defaults
+# v3.14.1: эти переменные тоже подхватятся из shieldnode.conf если оператор
+# изменил их через guard CLI settings menu (загружен выше до этого блока).
 ENABLE_RU_MOBILE_WHITELIST="${ENABLE_RU_MOBILE_WHITELIST:-1}"
 MAXMIND_LICENSE_KEY="${MAXMIND_LICENSE_KEY:-}"
 
@@ -2976,7 +3018,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.14.0 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.14.1 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3234,7 +3276,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_MOBILE_RU_UPDATER="/usr/local/sbin/shieldnode-update-mobile-ru.sh"
 cat > "$SHIELD_MOBILE_RU_UPDATER" <<'MOBILE_RU_UPDATER_EOF'
 #!/bin/bash
-# shieldnode v3.14.0 — mobile-RU AS whitelist updater.
+# shieldnode v3.14.1 — mobile-RU AS whitelist updater.
 # Скачивает MaxMind GeoLite2-ASN-CSV, фильтрует по списку AS,
 # заполняет nft set mobile_ru_whitelist_v4.
 #
@@ -3411,7 +3453,7 @@ print_ok "Mobile-RU updater: $SHIELD_MOBILE_RU_UPDATER"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.14.0 — github sync для lists/custom.txt
+# shieldnode v3.14.1 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3471,7 +3513,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.14.0 — version check
+# shieldnode v3.14.1 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -4964,7 +5006,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.14.0${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.14.1${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -5847,7 +5889,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.14.0 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.14.1 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
