@@ -1,7 +1,10 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.16.1 (Commercial Edition) — PATH-WATCHER HOTFIX
+#  VPN NODE DDoS PROTECTION v3.16.2 (Commercial Edition) — CRITICAL HOTFIX
+#  v3.16.2: aggregator падал с syntax error на /\[UFW (LIMIT )?BLOCK\]/ —
+#           bash heredoc интерпретировал () как subshell. Заменено на 2
+#           отдельные регулярки без capture groups.
 #
 #  v3.15.3 changelog:
 #    [OBSERVABILITY] Добавлены оставшиеся log prefix'ы для полного покрытия:
@@ -1029,8 +1032,8 @@ cscli_collection_installed() {
 # Можно переопределить через env (для тестинга на форке).
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
-# v3.16.1: версия для self-check
-SHIELDNODE_VERSION="3.16.1"
+# v3.16.2: версия для self-check
+SHIELDNODE_VERSION="3.16.2"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -4454,8 +4457,17 @@ done < <(awk '
     }
     # v3.16.0: UFW BLOCK дропы (когда оператор включил ufw logging on)
     # Формат: "[UFW BLOCK] IN=ens3 OUT= MAC=... SRC=1.2.3.4 DST=... DPT=22 ..."
-    # Включает [UFW BLOCK] и [UFW LIMIT BLOCK]. AUDIT мы НЕ парсим (это accept'ы).
-    /\[UFW (LIMIT )?BLOCK\]/ {
+    # v3.16.2 FIX: bash heredoc with single quotes still expanded (LIMIT) as
+    # subshell — критическая ошибка которая ломала весь aggregator.
+    # Решение: матчим оба варианта без use of capturing groups через индекс
+    # символов (UFW + что-то + BLOCK]). Дублирование ради безопасности.
+    /\[UFW BLOCK\]/ {
+        ip=""; port=""
+        if (match($0, /SRC=[^ ]+/))  ip   = substr($0, RSTART+4, RLENGTH-4)
+        if (match($0, /DPT=[0-9]+/)) port = substr($0, RSTART+4, RLENGTH-4)
+        if (ip != "") print "ufw_block|" ip "|" port "|"
+    }
+    /\[UFW LIMIT BLOCK\]/ {
         ip=""; port=""
         if (match($0, /SRC=[^ ]+/))  ip   = substr($0, RSTART+4, RLENGTH-4)
         if (match($0, /DPT=[0-9]+/)) port = substr($0, RSTART+4, RLENGTH-4)
