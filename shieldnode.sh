@@ -1,7 +1,35 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.16.3 (Commercial Edition) — BOUNCER RACE FIX
+#  VPN NODE DDoS PROTECTION v3.18.0 (Commercial Edition) — PRE-INSTALL CONFIG
+#  v3.18.0: интерактивный pre-install опросник для критичных настроек:
+#           - BRIDGE_IPS: IP моста/upstream-ноды (auto-whitelist'ятся)
+#           - PANEL_TYPE: detection Remnawave/Marzban/3x-ui (auto-detect via docker)
+#           Настройки сохраняются в /etc/shieldnode/shieldnode.conf — при
+#           reinstall переиспользуются без повторного опроса.
+#           Skip: SHIELDNODE_NONINTERACTIVE=1 sudo bash shieldnode.sh
+#
+#  v3.17.2: shieldnode forward priority filter (=0) → -50. Remnawave plugin
+#           тоже сидит на forward priority=0 для banlist'а — race condition.
+#           -50 = между shieldnode prerouting (-150) и Remnawave forward (0).
+#
+#  v3.17.1: shieldnode prerouting priority -100 → -150. Remnawave plugin
+#           использует `priority dstnat` (=-100) для DSTNAT маршрутизации
+#           VLESS клиентов на bridge-ноду. Конфликт priority вызывал race
+#           condition — клиенты могли потерять интернет после реконфига xray.
+#           -150 ставит shieldnode МЕЖДУ crowdsec (-200) и Remnawave (-100).
+#
+#  v3.17.0: добавлен whitelist-local.txt — symmetric к custom-local.txt
+#           (который для бана). IPs из файла попадают в manual_whitelist_v4
+#           через path-watcher за 1-2 сек. При добавлении автоматически
+#           удаляются из confirmed_attack_v4, suspect_v4 и всех blocklist'ов.
+#
+#  v3.16.4: добавлен UDP conntrack timeout = 180 сек (default 30 сек слишком
+#           короткий для VPN keepalive). Решает проблему: мост-сервер шлёт
+#           keepalive раз в 60+ сек → conntrack теряет state → UFW дропает
+#           ответ как "новый пакет на закрытый порт".
+#           TCP timeout'ы НЕ трогаем — это зона vpn-node-setup.sh.
+#
 #  v3.16.3: bouncer pre-inst hook на Ubuntu 24.04 с custom kernel flush'ил
 #           nftables → наша table исчезала после установки. Добавлен
 #           re-load nft template после bouncer setup + retry в smoke-test.
@@ -1036,8 +1064,8 @@ cscli_collection_installed() {
 # Можно переопределить через env (для тестинга на форке).
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
-# v3.16.3: версия для self-check
-SHIELDNODE_VERSION="3.16.3"
+# v3.18.0: версия для self-check
+SHIELDNODE_VERSION="3.18.0"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1186,7 +1214,8 @@ if [ "${1:-}" = "--uninstall" ]; then
                 shieldnode-update@custom.path \
                 shieldnode-update@mobile_ru.timer shieldnode-update@mobile_ru.service \
                 shieldnode-github-sync.timer shieldnode-github-sync.service \
-                shieldnode-version-check.timer shieldnode-version-check.service; do
+                shieldnode-version-check.timer shieldnode-version-check.service \
+                shieldnode-whitelist.path shieldnode-whitelist.service; do
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
     done
@@ -1209,6 +1238,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /usr/local/sbin/shieldnode-update-mobile-ru.sh
     rm -f /usr/local/sbin/shieldnode-github-sync.sh
     rm -f /usr/local/sbin/shieldnode-version-check.sh
+    rm -f /usr/local/sbin/shieldnode-whitelist-updater.sh
     rm -f /usr/local/sbin/shieldnode-defaults.sh
     rm -f /usr/local/bin/guard
     print_ok "Скрипты удалены (включая команду guard)"
@@ -1341,6 +1371,162 @@ fi
 
 if [ "$LEGACY_CLEANED" = "1" ]; then
     print_status "Legacy cleanup: удалены артефакты ≤v3.4 (cs-ssh-whitelist)"
+fi
+
+# ==============================================================================
+# v3.18.0: PRE-INSTALL CONFIGURATION
+# ==============================================================================
+# Спрашиваем у оператора критичные настройки ДО начала установки чтобы избежать
+# случайного бана bridge-нод и legacy-партнёров. Ответы сохраняются в conf-файл
+# и при reinstall переиспользуются автоматически (без повторного опроса).
+#
+# Можно пропустить опрос: SHIELDNODE_NONINTERACTIVE=1 sudo bash shieldnode.sh
+
+PREINSTALL_CONF="/etc/shieldnode/shieldnode.conf"
+mkdir -p /etc/shieldnode 2>/dev/null
+
+# Загружаем существующие настройки (если есть)
+if [ -r "$PREINSTALL_CONF" ]; then
+    # shellcheck source=/dev/null
+    . "$PREINSTALL_CONF" 2>/dev/null || true
+fi
+
+# Не интерактивный режим — пропускаем опрос
+if [ "${SHIELDNODE_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
+    PREINSTALL_SKIP=1
+    print_info "Non-interactive mode — pre-install опрос пропущен"
+fi
+
+# Если все настройки уже есть в conf — пропускаем опрос
+if [ -n "${BRIDGE_IPS:-}" ] && [ -n "${PANEL_TYPE:-}" ]; then
+    PREINSTALL_SKIP=1
+    print_status "Используем существующие настройки из $PREINSTALL_CONF:"
+    print_info "  Bridge IPs: ${BRIDGE_IPS:-(нет)}"
+    print_info "  Panel type: ${PANEL_TYPE:-none}"
+fi
+
+if [ -z "${PREINSTALL_SKIP:-}" ]; then
+    print_header "PRE-INSTALL CONFIGURATION"
+
+    echo ""
+    echo "  Эти настройки помогут shieldnode'у работать корректно в твоей"
+    echo "  конкретной архитектуре. Все настройки сохраняются в:"
+    echo "    $PREINSTALL_CONF"
+    echo "  и при reinstall переиспользуются автоматически."
+    echo ""
+
+    # === Вопрос 1: Bridge/Upstream ноды ===
+    echo "─── Bridge/Upstream nodes ───"
+    echo ""
+    echo "  Если эта нода — front-сервер для bridge'а к upstream-ноде"
+    echo "  (например RU-front → FI bridge), то IP моста нужно whitelist'ить"
+    echo "  ДО включения защиты. Иначе shieldnode может его заблокировать"
+    echo "  и клиенты потеряют интернет."
+    echo ""
+    echo -n "  IP-адрес bridge-ноды (или несколько через запятую, Enter если нет): "
+    read -r BRIDGE_INPUT
+    BRIDGE_IPS=$(echo "$BRIDGE_INPUT" | tr -d ' ')
+
+    if [ -n "$BRIDGE_IPS" ]; then
+        # Валидация
+        VALID_IPS=""
+        IFS=',' read -ra IP_ARR <<< "$BRIDGE_IPS"
+        for ip in "${IP_ARR[@]}"; do
+            if echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
+                VALID_IPS="${VALID_IPS:+$VALID_IPS,}$ip"
+            else
+                print_warn "Пропускаю невалидный IP: $ip"
+            fi
+        done
+        BRIDGE_IPS="$VALID_IPS"
+        if [ -n "$BRIDGE_IPS" ]; then
+            print_ok "Bridge IPs будут добавлены в whitelist: $BRIDGE_IPS"
+        fi
+    else
+        print_info "Bridge IPs не заданы (стандартная single-node установка)"
+    fi
+    echo ""
+
+    # === Вопрос 2: Panel detection ===
+    echo "─── VPN Panel ───"
+    echo ""
+    echo "  Если на ноде установлена VPN-панель (Remnawave, Marzban, 3x-ui),"
+    echo "  shieldnode переключится в compatible-режим:"
+    echo "    - prerouting priority -150 (не конфликтует с panel DSTNAT)"
+    echo "    - forward priority -50 (не конфликтует с panel banlist'ами)"
+    echo ""
+
+    # Auto-detect
+    AUTO_PANEL=""
+    if docker ps 2>/dev/null | grep -qi "remnanode\|remnawave"; then
+        AUTO_PANEL="remnawave"
+    elif docker ps 2>/dev/null | grep -qi "marzban"; then
+        AUTO_PANEL="marzban"
+    elif docker ps 2>/dev/null | grep -qi "3x-ui\|x-ui"; then
+        AUTO_PANEL="3x-ui"
+    fi
+
+    if [ -n "$AUTO_PANEL" ]; then
+        print_info "Auto-detected: $AUTO_PANEL"
+        echo -n "  Использовать compatible-режим? (Y/n) [Y]: "
+    else
+        echo -n "  Установлена ли VPN-панель? (none/remnawave/marzban/3x-ui) [none]: "
+    fi
+    read -r PANEL_INPUT
+    PANEL_INPUT=$(echo "$PANEL_INPUT" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+
+    if [ -n "$AUTO_PANEL" ] && [ -z "$PANEL_INPUT" -o "$PANEL_INPUT" = "y" -o "$PANEL_INPUT" = "yes" ]; then
+        PANEL_TYPE="$AUTO_PANEL"
+    elif [ "$PANEL_INPUT" = "n" ] || [ "$PANEL_INPUT" = "no" ] || [ "$PANEL_INPUT" = "none" ] || [ -z "$PANEL_INPUT" ]; then
+        PANEL_TYPE="none"
+    else
+        case "$PANEL_INPUT" in
+            remnawave|marzban|3x-ui|x-ui)
+                PANEL_TYPE="$PANEL_INPUT"
+                ;;
+            *)
+                print_warn "Неизвестный тип '$PANEL_INPUT', выбран 'none'"
+                PANEL_TYPE="none"
+                ;;
+        esac
+    fi
+
+    if [ "$PANEL_TYPE" = "none" ]; then
+        print_info "Panel: none (стандартные nft priorities)"
+    else
+        print_ok "Panel: $PANEL_TYPE (compatible nft priorities активированы)"
+    fi
+    echo ""
+
+    # Сохраняем настройки
+    cat > "$PREINSTALL_CONF" <<CONF_EOF
+# shieldnode pre-install configuration
+# Сгенерирован: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+# При reinstall эти значения переиспользуются автоматически.
+
+BRIDGE_IPS="$BRIDGE_IPS"
+PANEL_TYPE="$PANEL_TYPE"
+CONF_EOF
+    chmod 0644 "$PREINSTALL_CONF"
+    print_ok "Сохранено: $PREINSTALL_CONF"
+    echo ""
+fi
+
+# Если bridge IPs заданы — добавляем их в whitelist-local.txt сразу
+# (до того как shieldnode-nftables.service загрузит правила)
+if [ -n "${BRIDGE_IPS:-}" ]; then
+    WL_LOCAL="/etc/shieldnode/lists/whitelist-local.txt"
+    mkdir -p /etc/shieldnode/lists
+    if [ ! -e "$WL_LOCAL" ]; then
+        echo "# shieldnode whitelist (auto-populated from BRIDGE_IPS)" > "$WL_LOCAL"
+    fi
+    IFS=',' read -ra BR_ARR <<< "$BRIDGE_IPS"
+    for ip in "${BR_ARR[@]}"; do
+        if ! grep -qxF "$ip" "$WL_LOCAL" 2>/dev/null; then
+            echo "$ip" >> "$WL_LOCAL"
+            print_ok "Добавлен в whitelist: $ip"
+        fi
+    done
 fi
 
 # ==============================================================================
@@ -1586,6 +1772,22 @@ net.ipv4.tcp_rfc1337 = 1
 # === Logging ===
 # Логировать martian packets (странные source IP — ранний сигнал атаки)
 net.ipv4.conf.all.log_martians = 1
+
+# === v3.16.4: UDP conntrack timeout для VPN keepalive ===
+# Default UDP timeout 30 сек слишком короткий для VPN-протоколов с
+# keepalive каждые 60-120 сек (WireGuard, мост-связки, Hysteria/Tuic).
+# Без этого — UFW дропает каждый второй keepalive ответ как "новый пакет
+# на закрытый порт", т.к. conntrack теряет state между keepalive'ами.
+#
+# 180 сек охватывает все VPN-сценарии. По алфавиту 90-shieldnode.conf
+# применяется ДО 99-xray-tuning.conf от vpn-node-setup.sh, поэтому если
+# у оператора уже стоят свои значения — они переопределят наши.
+#
+# TCP timeout'ы НАМЕРЕННО не трогаем — это зона ответственности
+# vpn-node-setup.sh (default 432000 для established он или не он, но
+# мы туда не лезем чтобы не сломать существующие конфиги).
+net.netfilter.nf_conntrack_udp_timeout = 180
+net.netfilter.nf_conntrack_udp_timeout_stream = 300
 SYSCTL_EOF
 
 # Применяем
@@ -2359,7 +2561,14 @@ $MANUAL_WHITELIST_V4_INIT
     counter tcp_invalid { }       # invalid TCP flag combos
 
     chain prerouting {
-        type filter hook prerouting priority -100; policy accept;
+        # v3.17.1: priority -150 (было -100). Remnawave plugin использует
+        # `priority dstnat` (=-100) в своей table `ip remnanode` для DSTNAT
+        # маршрутизации клиентов VLESS → upstream мост. Когда shieldnode
+        # сидел на том же -100, kernel выполнял chains в неопределённом
+        # порядке (по порядку регистрации) — пакеты могли попасть в shieldnode
+        # ДО DSTNAT или ПОСЛЕ. -150 ставит нас МЕЖДУ crowdsec bouncer (-200)
+        # и Remnawave dstnat (-100), без конфликта priority.
+        type filter hook prerouting priority -150; policy accept;
 
         # Established/related — пропускаем без проверок.
         ct state established,related accept
@@ -2598,7 +2807,12 @@ $FIB_ANTISPOOF_RULE
     # priority: filter (после rate-limit'а в prerouting, перед NAT).
     # Применяется ТОЛЬКО к forwarded трафику (не локальному SSH/control plane).
     chain forward {
-        type filter hook forward priority filter; policy accept;
+        # v3.17.2: priority -50 (было filter=0). Remnawave plugin
+        # ingress-filter-ip + torrent-blocker сидят в их forward на
+        # priority filter (=0). Чтобы избежать race condition и
+        # гарантированно делать MSS clamping ДО их banlist'а — ставим
+        # на -50 (между shieldnode prerouting -150 и Remnawave forward 0).
+        type filter hook forward priority -50; policy accept;
         tcp flags syn tcp option maxseg size set rt mtu
     }
 }
@@ -3106,7 +3320,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.16.3 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.18.0 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3365,7 +3579,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.16.3 — github sync для lists/custom.txt
+# shieldnode v3.18.0 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3425,7 +3639,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.16.3 — version check
+# shieldnode v3.18.0 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -3735,6 +3949,125 @@ systemctl reset-failed shieldnode-update@custom.path 2>/dev/null
 systemctl reset-failed 'shieldnode-update@*.service' 2>/dev/null
 systemctl daemon-reload
 systemctl enable --now shieldnode-update@custom.path >/dev/null 2>&1
+
+# ============================================================================
+# v3.17.0: WHITELIST-LOCAL.TXT — symmetric к custom-local.txt но для accept
+# ============================================================================
+# Файл /etc/shieldnode/lists/whitelist-local.txt → nft manual_whitelist_v4
+# IPs из этого файла:
+#   - попадают в manual_whitelist_v4 → обходят ВСЕ shieldnode проверки
+#   - удаляются из confirmed_attack_v4, suspect_v4, custom_blocklist_v4 и др.
+# Path-watcher подхватывает изменения за 1-2 сек.
+
+WHITELIST_LOCAL="$SHIELD_LISTS_DIR/whitelist-local.txt"
+WHITELIST_UPDATER="/usr/local/sbin/shieldnode-whitelist-updater.sh"
+
+# 1. Создаём whitelist-local.txt только если его нет (сохраняем существующие записи при reinstall)
+if [ ! -e "$WHITELIST_LOCAL" ]; then
+    cat > "$WHITELIST_LOCAL" <<'WHITELIST_DEFAULT'
+# shieldnode local whitelist (этот узел)
+#
+# IPs/CIDRs тут добавляются в nft manual_whitelist_v4 — обходят ВСЕ проверки:
+# rate-limit, conn-flood, scanner blocklist, threat blocklist, mobile-RU drop.
+# Также автоматически удаляются из confirmed_attack_v4, suspect_v4 и blocklist'ов.
+#
+# Изменения подхватываются path-watcher'ом за 1-2 секунды.
+#
+# Формат: один IP или CIDR на строку, # = комментарий.
+# Примеры:
+#   echo '1.2.3.4' | sudo tee -a /etc/shieldnode/lists/whitelist-local.txt
+#   echo '10.0.0.0/24' | sudo tee -a /etc/shieldnode/lists/whitelist-local.txt
+#
+# Удалить: отредактировать файл (удалить строку), изменения применятся за 2 сек.
+WHITELIST_DEFAULT
+    chmod 0644 "$WHITELIST_LOCAL"
+fi
+
+# 2. Updater script
+cat > "$WHITELIST_UPDATER" <<'WHITELIST_UPDATER_EOF'
+#!/bin/bash
+# shieldnode-whitelist-updater — синхронизирует whitelist-local.txt → nft manual_whitelist_v4
+set -u
+WHITELIST_FILE="/etc/shieldnode/lists/whitelist-local.txt"
+NFT_TABLE="inet ddos_protect"
+NFT_SET="manual_whitelist_v4"
+LOG_TAG="shieldnode-whitelist"
+
+[ -r "$WHITELIST_FILE" ] || { logger -t "$LOG_TAG" "File missing: $WHITELIST_FILE"; exit 1; }
+
+# Парсим IPs (без комментариев, пустых строк, валидируем формат)
+IPS=$(grep -vE '^[[:space:]]*(#|$)' "$WHITELIST_FILE" | \
+      grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | \
+      sort -u)
+
+if [ -n "$IPS" ]; then
+    {
+        echo "flush set $NFT_TABLE $NFT_SET"
+        while IFS= read -r ip; do
+            echo "add element $NFT_TABLE $NFT_SET { $ip }"
+        done <<< "$IPS"
+    } | nft -f - 2>&1
+
+    # Удаляем whitelisted IPs из drop sets — нельзя одновременно whitelist'ить и банить
+    while IFS= read -r ip; do
+        nft delete element $NFT_TABLE confirmed_attack_v4 "{ $ip }" 2>/dev/null || true
+        nft delete element $NFT_TABLE suspect_v4          "{ $ip }" 2>/dev/null || true
+        nft delete element $NFT_TABLE custom_blocklist_v4 "{ $ip }" 2>/dev/null || true
+        nft delete element $NFT_TABLE scanner_blocklist_v4 "{ $ip }" 2>/dev/null || true
+        nft delete element $NFT_TABLE threat_blocklist_v4  "{ $ip }" 2>/dev/null || true
+        nft delete element $NFT_TABLE tor_exit_blocklist_v4 "{ $ip }" 2>/dev/null || true
+    done <<< "$IPS"
+
+    COUNT=$(echo "$IPS" | wc -l)
+    logger -t "$LOG_TAG" "Updated $NFT_SET: $COUNT IPs (cleaned from blocklists/attack sets)"
+else
+    nft flush set $NFT_TABLE $NFT_SET 2>/dev/null
+    logger -t "$LOG_TAG" "Whitelist empty — flushed $NFT_SET"
+fi
+
+exit 0
+WHITELIST_UPDATER_EOF
+chmod 0750 "$WHITELIST_UPDATER"
+
+# 3. Systemd service
+cat > /etc/systemd/system/shieldnode-whitelist.service <<EOF
+[Unit]
+Description=Update shieldnode whitelist (manual_whitelist_v4) from local file
+After=shieldnode-nftables.service
+Requires=shieldnode-nftables.service
+StartLimitBurst=30
+StartLimitIntervalSec=60
+
+[Service]
+Type=oneshot
+ExecStart=$WHITELIST_UPDATER
+EOF
+
+# 4. Path-watcher
+cat > /etc/systemd/system/shieldnode-whitelist.path <<EOF
+[Unit]
+Description=Watch shieldnode whitelist-local.txt for changes
+StartLimitBurst=30
+StartLimitIntervalSec=60
+
+[Path]
+PathChanged=$WHITELIST_LOCAL
+PathExists=$WHITELIST_LOCAL
+Unit=shieldnode-whitelist.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 5. Запуск + первая инициализация (с reset-failed для idempotency)
+systemctl daemon-reload
+systemctl reset-failed shieldnode-whitelist.path 2>/dev/null
+systemctl reset-failed shieldnode-whitelist.service 2>/dev/null
+systemctl enable --now shieldnode-whitelist.path >/dev/null 2>&1
+systemctl start shieldnode-whitelist.service >/dev/null 2>&1
+
+WHITELIST_COUNT=$(grep -vE '^[[:space:]]*(#|$)' "$WHITELIST_LOCAL" 2>/dev/null | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')
+print_ok "Whitelist file-based: $WHITELIST_LOCAL ($WHITELIST_COUNT IPs, path-watcher активен)"
 
 print_ok "Blocklists активны: $(
     for n in "${ENABLED_LISTS[@]}"; do
@@ -5108,7 +5441,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.16.3${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.18.0${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -5282,19 +5615,147 @@ show_crowdsec_bans() {
 }
 
 show_whitelist_ips() {
-    echo ""
-    echo -e "${B}Auto whitelist (SSH-key)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-    if command -v cscli >/dev/null 2>&1; then
-        cscli decisions list --type whitelist 2>/dev/null | head -50
-    fi
-    echo ""
-    echo -e "${B}Manual whitelist (nftables)${N}"
-    echo -e "${DIM}─────────────────────────────────${N}"
-    nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
-        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | \
-        sed 's/^/  /'
-    echo ""
+    local WL_FILE="/etc/shieldnode/lists/whitelist-local.txt"
+
+    while true; do
+        clear 2>/dev/null
+        echo ""
+        echo -e "${B}═══ Whitelist Management ═══${N}"
+        echo ""
+        echo -e "${DIM}Whitelist file: $WL_FILE${N}"
+        echo -e "${DIM}IPs пропускаются МИМО всех проверок (rate-limit, blocklists, conn-flood).${N}"
+        echo -e "${DIM}Изменения применяются за 1-2 секунды через path-watcher.${N}"
+        echo ""
+
+        # Auto whitelist (SSH-keys из CrowdSec)
+        echo -e "${B}Auto whitelist (CrowdSec SSH-key)${N}"
+        echo -e "${DIM}─────────────────────────────────${N}"
+        if command -v cscli >/dev/null 2>&1; then
+            local cs_count
+            cs_count=$(cscli decisions list --type whitelist 2>/dev/null | grep -cE '^\| [0-9]')
+            if [ "$cs_count" -gt 0 ]; then
+                cscli decisions list --type whitelist 2>/dev/null | head -10
+            else
+                echo -e "  ${DIM}(пусто)${N}"
+            fi
+        fi
+        echo ""
+
+        # Manual whitelist (nftables active)
+        echo -e "${B}Active whitelist (nft manual_whitelist_v4)${N}"
+        echo -e "${DIM}─────────────────────────────────${N}"
+        local active_ips
+        active_ips=$(nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
+            tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | \
+            grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u)
+        if [ -n "$active_ips" ]; then
+            echo "$active_ips" | sed 's/^/  /'
+            echo ""
+            echo -e "  ${DIM}Total: $(echo "$active_ips" | wc -l) IPs${N}"
+        else
+            echo -e "  ${DIM}(пусто)${N}"
+        fi
+        echo ""
+
+        # Действия
+        echo -e "${C}┌─────────────────────────────────────────────────────────────────┐${N}"
+        echo -e "${C}│${N}  ${B}Whitelist actions${N}                                              ${C}│${N}"
+        echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
+        echo -e "${C}│${N}  [${B}a${N}] Add IP to whitelist                                        ${C}│${N}"
+        echo -e "${C}│${N}  [${B}d${N}] Delete IP from whitelist                                   ${C}│${N}"
+        echo -e "${C}│${N}  [${B}l${N}] List file content                                          ${C}│${N}"
+        echo -e "${C}│${N}  [${B}f${N}] Force re-sync (apply file → nft)                           ${C}│${N}"
+        echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
+        echo -e "${C}│${N}  [${B}b${N}] Back to main menu                                          ${C}│${N}"
+        echo -e "${C}└─────────────────────────────────────────────────────────────────┘${N}"
+        echo -ne "  ${B}>${N} "
+        read -r WL_ACTION
+
+        case "$WL_ACTION" in
+            a|A)
+                echo ""
+                echo -ne "  Enter IP or CIDR to whitelist (e.g. 1.2.3.4 or 10.0.0.0/24): "
+                read -r NEW_IP
+                # Валидация
+                if ! echo "$NEW_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
+                    echo -e "  ${Y}Invalid format. Expected: 1.2.3.4 or 10.0.0.0/24${N}"
+                else
+                    # Проверяем дубликат
+                    if grep -qxF "$NEW_IP" "$WL_FILE" 2>/dev/null; then
+                        echo -e "  ${Y}$NEW_IP уже в whitelist${N}"
+                    else
+                        echo "$NEW_IP" >> "$WL_FILE"
+                        echo -e "  ${G}✓${N} $NEW_IP добавлен. Применяется..."
+                        sleep 2
+                        if nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
+                            tr ',' '\n' | grep -qE "(^|[ {])$(echo "$NEW_IP" | sed 's/\./\\./g')([ },]|$)"; then
+                            echo -e "  ${G}✓${N} $NEW_IP активен в nft"
+                        else
+                            echo -e "  ${Y}!${N} Path-watcher ещё не сработал — попробуй [f] Force re-sync"
+                        fi
+                    fi
+                fi
+                echo -ne "  ${DIM}Press Enter...${N}"
+                read -r _
+                ;;
+            d|D)
+                echo ""
+                echo -ne "  Enter IP or CIDR to remove from whitelist: "
+                read -r DEL_IP
+                if [ -z "$DEL_IP" ]; then
+                    echo -e "  ${Y}Empty input${N}"
+                elif ! grep -qxF "$DEL_IP" "$WL_FILE" 2>/dev/null; then
+                    echo -e "  ${Y}$DEL_IP не найден в whitelist file${N}"
+                else
+                    # Escape для sed (точки, слэши)
+                    local DEL_ESC
+                    DEL_ESC=$(echo "$DEL_IP" | sed 's/[.\/]/\\&/g')
+                    sed -i "/^${DEL_ESC}$/d" "$WL_FILE"
+                    echo -e "  ${G}✓${N} $DEL_IP удалён из файла. Применяется..."
+                    sleep 2
+                    if ! nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
+                        tr ',' '\n' | grep -qE "(^|[ {])$(echo "$DEL_IP" | sed 's/\./\\./g')([ },]|$)"; then
+                        echo -e "  ${G}✓${N} $DEL_IP убран из nft"
+                    else
+                        echo -e "  ${Y}!${N} Path-watcher ещё не сработал — попробуй [f] Force re-sync"
+                    fi
+                fi
+                echo -ne "  ${DIM}Press Enter...${N}"
+                read -r _
+                ;;
+            l|L)
+                echo ""
+                echo -e "${B}File: $WL_FILE${N}"
+                echo -e "${DIM}─────────────────────────────────${N}"
+                if [ -r "$WL_FILE" ]; then
+                    cat "$WL_FILE" | sed 's/^/  /'
+                else
+                    echo -e "  ${Y}File not found${N}"
+                fi
+                echo ""
+                echo -ne "  ${DIM}Press Enter...${N}"
+                read -r _
+                ;;
+            f|F)
+                echo ""
+                echo -e "  Force re-sync..."
+                systemctl start shieldnode-whitelist.service 2>&1
+                sleep 1
+                echo -e "  ${G}✓${N} Re-sync done"
+                journalctl -t shieldnode-whitelist -n 1 --no-pager 2>/dev/null | sed 's/^/  /'
+                echo ""
+                echo -ne "  ${DIM}Press Enter...${N}"
+                read -r _
+                ;;
+            b|B|"")
+                return
+                ;;
+            *)
+                echo -e "  ${Y}Unknown: $WL_ACTION${N}"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 show_scanner_samples() {
@@ -5679,7 +6140,7 @@ while true; do
     echo -e "${C}│${N}  ${B}Actions${N}                                                        ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
     echo -e "${C}│${N}  [${B}1${N}] Active attacks         [${B}2${N}] CrowdSec bans                   ${C}│${N}"
-    echo -e "${C}│${N}  [${B}3${N}] Whitelist IPs          [${B}4${N}] Scanner blocklist               ${C}│${N}"
+    echo -e "${C}│${N}  [${B}3${N}] Whitelist manage       [${B}4${N}] Scanner blocklist               ${C}│${N}"
     echo -e "${C}│${N}  [${B}6${N}] Recent history         [${B}7${N}] Top attackers                   ${C}│${N}"
     echo -e "${C}│${N}  [${B}8${N}] Unban all              [${B}9${N}] View full events.log            ${C}│${N}"
     echo -e "${C}│${N}  [${B}s${N}] Settings                                                   ${C}│${N}"
@@ -5979,7 +6440,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.16.3 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.0 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
