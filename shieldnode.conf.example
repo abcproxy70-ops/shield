@@ -1,4 +1,4 @@
-# shieldnode v3.13.0 — пример конфигурации
+# shieldnode v3.14.0 — пример конфигурации
 #
 # Этот файл ОПЦИОНАЛЕН. Если его НЕТ в /etc/shieldnode/shieldnode.conf
 # — используются hardcoded дефолты в скрипте (те что закомментированы ниже).
@@ -8,8 +8,24 @@
 #   sudo nano /etc/shieldnode/shieldnode.conf
 #   sudo systemctl restart 'shieldnode-update@*.service'
 #
+# Альтернативно — все toggle'ы можно изменить через ${CYAN}sudo guard${NC} →
+# меню [s] settings (auto-sync, version check, mobile-RU, tor, MaxMind key).
+#
 # Синтаксис: bash array. Чтобы для одного set'а было НЕСКОЛЬКО URL'ов —
 # объединяй через запятую без пробелов.
+
+# ==============================================================================
+# v3.14.0: AUTO-SYNC FROM GITHUB
+# ==============================================================================
+# Каждые 6ч нода скачивает lists/custom.txt с github и заменяет локальный.
+# Локальные дополнения оператора (эта нода) — в /etc/shieldnode/lists/custom-local.txt
+# (НЕ трогается github sync'ом, объединяется с custom.txt в nft set).
+#ENABLE_GITHUB_SYNC=1
+
+# Раз в день нода проверяет github на новую версию shieldnode.sh.
+# Если есть новая — guard CLI покажет [upgrade] баннер. Никаких авто-апгрейдов.
+# Команды: 'sudo guard upgrade' (re-run installer), 'sudo guard check' (force).
+#ENABLE_VERSION_CHECK=1
 
 # ==============================================================================
 # v3.13.0: MOBILE-RU AS WHITELIST (CGNAT-friendly relaxed limits)
