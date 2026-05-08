@@ -16,7 +16,7 @@ Bash-скрипт DDoS-защиты для VPN-нод (Reality / Xray / sing-box
   - `threat` — Spamhaus DROP + FireHOL Level 1 (high-confidence криминал)
   - `tor` — Tor exit nodes (опционально, `BLOCK_TOR=1`)
   - `custom` — личный список оператора (file-based + URL union)
-- **Mobile-RU AS whitelist** (v3.13.1): relaxed limits (ct=1000, newconn=2000/min)
+- **Mobile-RU AS whitelist** (v3.13.2): relaxed limits (ct=1000, newconn=2000/min)
   для МТС / T2 / МегаФон / Билайн через MaxMind GeoLite2-ASN
 - **CrowdSec** + nftables bouncer (SSH brute-force + community blocklist)
 - **guard CLI** — дашборд защиты с ASN/owner column для top attackers
@@ -89,6 +89,7 @@ sudo guard --json   # JSON-вывод для интеграций (Zabbix, Prome
 
 ## Версии
 
+- **v3.13.2** — hotfix: миграция legacy-артефактов от ≤v3.12.x при reinstall (старые update-scanner-blocklist.sh, scanner-blocklist-update.timer и т.п. чистятся автоматически)
 - **v3.13.1** — hotfix: mobile-RU whitelist выше blocklist drops, удалён мёртвый counter, observability `[shield:mobile_ru_drop]`
 - **v3.13.0** — mobile-RU AS whitelist (МТС, T2, МегаФон, Билайн через MaxMind)
 - **v3.12.0** — blocklists архитектура (universal updater, file+URL union, ASN guard column), CGNAT-fix (ct=400, 500/min, 15min)
