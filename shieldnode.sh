@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.14.1 (Commercial Edition) — HOTFIX
+#  VPN NODE DDoS PROTECTION v3.15.0 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables threat-blocklist (Spamhaus DROP + FireHOL Level 1, v3.12.0)
 #  - nftables custom-blocklist (operator personal IPs, v3.12.0)
-#  - nftables mobile-RU AS whitelist (CGNAT-friendly, v3.13.0+)
+#  - nftables mobile-RU AS whitelist (CGNAT-friendly, v3.13.0+, v3.15.0 без MaxMind)
 #  - nftables connection-flood + slowloris защита (PROPER per-IP ct count)
 #  - nftables TCP flag sanity (drop invalid combinations)
 #  - nftables anti-spoofing (fib saddr — стронгер чем rp_filter loose)
@@ -19,6 +19,34 @@
 #  - Человекочитаемые логи в /var/log/shieldnode/events.log
 #  - Опциональный конфиг /etc/shieldnode/shieldnode.conf (v3.12.0)
 #  - File-based blocklists в /etc/shieldnode/lists/*.txt (v3.12.0)
+#
+#  v3.15.0 changelog:
+#
+#    [REMOVE-MAXMIND] Mobile-RU whitelist больше НЕ требует MaxMind license key.
+#      Раньше каждая нода качала GeoLite2-ASN-CSV.zip (~5MB) с MaxMind через
+#      персональный ключ оператора. Это создавало проблемы:
+#        - Public репо → не положить ключ → каждая нода требовала ручной настройки
+#        - Лимит 2000 запросов/день на бесплатный аккаунт
+#        - Ключ можно revoke'нуть → все ноды разом теряют whitelist
+#
+#      РЕШЕНИЕ: предсгенерированный файл lists/mobile-ru.txt в нашем github репо.
+#      Файл генерится автоматически раз в неделю через GitHub Actions с
+#      помощью публичного API RIPEstat (без аутентификации). Все ноды качают
+#      готовый файл через тот же universal updater что использует scanner/threat.
+#
+#      Архитектура:
+#        - .github/workflows/update-mobile-ru.yml — еженедельный cron
+#        - .github/scripts/generate-mobile-ru.sh — bash-генератор через RIPEstat
+#        - lists/mobile-ru.txt — авто-обновляемый файл с CIDR'ами 13 mobile-RU AS
+#        - На ноде: mobile_ru — обычный entry в LOCAL_BLOCKLISTS / REMOTE_BLOCKLISTS,
+#          использует тот же shieldnode-update-blocklist.sh что и scanner/threat
+#
+#      Migration: при reinstall с v3.14.x → v3.15.0:
+#        - shieldnode-update-mobile-ru.sh (отдельный updater) удаляется
+#        - shieldnode-update@mobile_ru.timer/.service переустанавливается под
+#          unified updater
+#        - MAXMIND_LICENSE_KEY в shieldnode.conf — игнорируется, остаётся как
+#          dead-config (не удаляем чтобы не ломать оператора)
 #
 #  v3.14.1 hotfix changelog:
 #
@@ -994,8 +1022,8 @@ cscli_collection_installed() {
 # Можно переопределить через env (для тестинга на форке).
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
-# v3.14.0: версия для self-check
-SHIELDNODE_VERSION="3.14.1"
+# v3.15.0: версия для self-check
+SHIELDNODE_VERSION="3.15.0"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1049,6 +1077,7 @@ DEFAULT_LOCAL_BLOCKLISTS=(
     "threat=$SHIELD_LISTS_DIR/threat.txt"
     "tor=$SHIELD_LISTS_DIR/tor.txt"
     "custom=$SHIELD_LISTS_DIR/custom.txt,$SHIELD_LISTS_DIR/custom-local.txt"
+    "mobile_ru=$SHIELD_LISTS_DIR/mobile-ru.txt"
 )
 
 # Объединение URL'ов через запятую → один set
@@ -1058,7 +1087,12 @@ DEFAULT_REMOTE_BLOCKLISTS=(
     "tor=https://check.torproject.org/torbulkexitlist"
     # custom: только локальный файл, без URL
     "custom="
+    # v3.15.0: mobile-RU из нашего github (генерится GitHub Actions через RIPEstat)
+    "mobile_ru=$SHIELD_REPO_URL/lists/mobile-ru.txt"
 )
+
+DEFAULT_MOBILE_RU_UPDATE_INTERVAL="1d"   # v3.15.0: github cron раз в неделю,
+                                          # клиент чекает раз в день для синка
 
 DEFAULT_SCANNER_UPDATE_INTERVAL="6h"
 DEFAULT_THREAT_UPDATE_INTERVAL="1d"
@@ -1089,30 +1123,12 @@ shield_nft_set_name() {
 # v3.14.1: эти переменные тоже подхватятся из shieldnode.conf если оператор
 # изменил их через guard CLI settings menu (загружен выше до этого блока).
 ENABLE_RU_MOBILE_WHITELIST="${ENABLE_RU_MOBILE_WHITELIST:-1}"
+# v3.15.0: MAXMIND_LICENSE_KEY больше не используется (mobile-RU теперь обычный
+# blocklist через github). Переменная остаётся в conf для backward-compat,
+# никаких функций не выполняет — тихо игнорируется.
 MAXMIND_LICENSE_KEY="${MAXMIND_LICENSE_KEY:-}"
 
-# Список AS — российские мобильные операторы (CGNAT pool'ы).
-# Проверены через RIPEstat: stat.ripe.net/data/as-overview/data.json?resource=ASxxxx
-# Включены: явные mobile/Vimpelcom AS. Исключены: МГТС fixed-line (AS25513),
-# Mod MVNO (AS39855), gov-only AS.
-DEFAULT_MOBILE_RU_AS_LIST=(
-    8359   # МТС PJSC
-    28884  # МТС Siberia
-    12958  # T2 Mobile (Tele2)
-    15378  # T2 Mobile (бывший Yota)
-    41330  # T2 Mobile Novosibirsk
-    42437  # T2 Mobile Rostov
-    48190  # T2 Mobile Ekaterinburg
-    31133  # MegaFon
-    31163  # MegaFon Kavkaz
-    12714  # MegaFon-AS (бэкбон)
-    3216   # Vimpelcom (Beeline)
-    8402   # Corbina (Vimpelcom)
-    16345  # Beeline-AS
-)
-
-DEFAULT_MOBILE_RU_UPDATE_INTERVAL="1w"   # MaxMind обновляется 2 раза в неделю
-DEFAULT_MIN_ENTRIES_MOBILE_RU=100        # ниже — что-то сломалось
+DEFAULT_MIN_ENTRIES_MOBILE_RU=100   # ниже — что-то сломалось у RIPEstat в github actions
 
 # ==============================================================================
 # UNINSTALL MODE
@@ -1720,9 +1736,16 @@ if [ -f /etc/sysctl.d/99-shieldnode.conf ]; then
     rm -f /etc/sysctl.d/99-shieldnode.conf
 fi
 
+# 6) v3.15.0: удаляем старый MaxMind-based mobile-RU updater (заменён унифицированным).
+#    timer/service оставляем — они переустановятся под новый updater автоматом.
+if [ -f /usr/local/sbin/shieldnode-update-mobile-ru.sh ]; then
+    LEGACY_FOUND=1
+    rm -f /usr/local/sbin/shieldnode-update-mobile-ru.sh
+fi
+
 if [ "$LEGACY_FOUND" = "1" ]; then
     systemctl daemon-reload
-    print_ok "Legacy-артефакты от ≤v3.12.x удалены"
+    print_ok "Legacy-артефакты удалены"
 else
     print_info "Legacy-артефактов не обнаружено (свежая установка)"
 fi
@@ -3018,7 +3041,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.14.1 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.15.0 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3043,11 +3066,6 @@ DEFAULT_MIN_ENTRIES_CUSTOM=$DEFAULT_MIN_ENTRIES_CUSTOM
 DEFAULT_MIN_ENTRIES_MOBILE_RU=$DEFAULT_MIN_ENTRIES_MOBILE_RU
 
 DEFAULT_FAIL_THRESHOLD=$DEFAULT_FAIL_THRESHOLD
-
-# v3.13.0: список AS для mobile-RU whitelist
-DEFAULT_MOBILE_RU_AS_LIST=(
-$(for asn in "${DEFAULT_MOBILE_RU_AS_LIST[@]}"; do printf "    %s\n" "$asn"; done)
-)
 DEFAULTS_EOF
 chmod 0644 "$SHIELD_DEFAULTS_FILE"
 print_ok "Defaults: $SHIELD_DEFAULTS_FILE"
@@ -3063,11 +3081,7 @@ export LANG=C LC_ALL=C
 
 NAME="${1:-}"
 case "$NAME" in
-    scanner|threat|tor|custom) ;;
-    mobile_ru)
-        # v3.13.0: mobile_ru использует отдельный updater (MaxMind CSV).
-        exec /usr/local/sbin/shieldnode-update-mobile-ru.sh "$@"
-        ;;
+    scanner|threat|tor|custom|mobile_ru) ;;
     *) echo "Usage: $0 <scanner|threat|tor|custom|mobile_ru>" >&2; exit 1 ;;
 esac
 
@@ -3078,10 +3092,11 @@ FAIL_COUNTER="$STATE_DIR/${NAME}_fail_count"
 
 # nft set name (legacy compat для tor → tor_exit_blocklist_v4)
 case "$NAME" in
-    scanner) NFT_SET="scanner_blocklist_v4" ;;
-    threat)  NFT_SET="threat_blocklist_v4"  ;;
-    tor)     NFT_SET="tor_exit_blocklist_v4" ;;
-    custom)  NFT_SET="custom_blocklist_v4"  ;;
+    scanner)   NFT_SET="scanner_blocklist_v4" ;;
+    threat)    NFT_SET="threat_blocklist_v4"  ;;
+    tor)       NFT_SET="tor_exit_blocklist_v4" ;;
+    custom)    NFT_SET="custom_blocklist_v4"  ;;
+    mobile_ru) NFT_SET="mobile_ru_whitelist_v4" ;;
 esac
 
 # Загружаем дефолты + опциональный override
@@ -3090,6 +3105,13 @@ esac
 if [ -f /etc/shieldnode/shieldnode.conf ]; then
     # shellcheck source=/dev/null
     . /etc/shieldnode/shieldnode.conf
+fi
+
+# v3.15.0: уважаем ENABLE_RU_MOBILE_WHITELIST=0 — flush set и exit
+if [ "$NAME" = "mobile_ru" ] && [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" != "1" ]; then
+    nft flush set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null
+    logger -t "$LOG_TAG" "ENABLE_RU_MOBILE_WHITELIST=${ENABLE_RU_MOBILE_WHITELIST}, set очищен"
+    exit 0
 fi
 
 # Резолвим финальные значения: оператор может задать LOCAL_BLOCKLISTS /
@@ -3113,10 +3135,11 @@ done
 
 # MIN_ENTRIES + FAIL_THRESHOLD: per-name override → DEFAULT_*
 case "$NAME" in
-    scanner) MIN_ENTRIES="${MIN_ENTRIES_SCANNER:-$DEFAULT_MIN_ENTRIES_SCANNER}" ;;
-    threat)  MIN_ENTRIES="${MIN_ENTRIES_THREAT:-$DEFAULT_MIN_ENTRIES_THREAT}"   ;;
-    tor)     MIN_ENTRIES="${MIN_ENTRIES_TOR:-$DEFAULT_MIN_ENTRIES_TOR}"         ;;
-    custom)  MIN_ENTRIES="${MIN_ENTRIES_CUSTOM:-$DEFAULT_MIN_ENTRIES_CUSTOM}"   ;;
+    scanner)   MIN_ENTRIES="${MIN_ENTRIES_SCANNER:-$DEFAULT_MIN_ENTRIES_SCANNER}"     ;;
+    threat)    MIN_ENTRIES="${MIN_ENTRIES_THREAT:-$DEFAULT_MIN_ENTRIES_THREAT}"       ;;
+    tor)       MIN_ENTRIES="${MIN_ENTRIES_TOR:-$DEFAULT_MIN_ENTRIES_TOR}"             ;;
+    custom)    MIN_ENTRIES="${MIN_ENTRIES_CUSTOM:-$DEFAULT_MIN_ENTRIES_CUSTOM}"       ;;
+    mobile_ru) MIN_ENTRIES="${MIN_ENTRIES_MOBILE_RU:-$DEFAULT_MIN_ENTRIES_MOBILE_RU}" ;;
 esac
 FAIL_THRESHOLD_VAL="${FAIL_THRESHOLD:-$DEFAULT_FAIL_THRESHOLD}"
 
@@ -3272,188 +3295,12 @@ UPDATER_EOF
 chmod 0755 "$SHIELD_UPDATER_SCRIPT"
 print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 
-# 2.5) v3.13.0: dedicated mobile-RU updater (использует MaxMind GeoLite2-ASN-CSV)
-SHIELD_MOBILE_RU_UPDATER="/usr/local/sbin/shieldnode-update-mobile-ru.sh"
-cat > "$SHIELD_MOBILE_RU_UPDATER" <<'MOBILE_RU_UPDATER_EOF'
-#!/bin/bash
-# shieldnode v3.14.1 — mobile-RU AS whitelist updater.
-# Скачивает MaxMind GeoLite2-ASN-CSV, фильтрует по списку AS,
-# заполняет nft set mobile_ru_whitelist_v4.
-#
-# Требует MAXMIND_LICENSE_KEY в /etc/shieldnode/shieldnode.conf или env.
-# Без key — выходит с WARN, set остаётся пустым (поведение v3.12.0).
-
-set -o pipefail
-export LANG=C LC_ALL=C
-
-LOG_TAG="shieldnode-update-mobile_ru"
-STATE_DIR="/var/lib/shieldnode"
-mkdir -p "$STATE_DIR"
-FAIL_COUNTER="$STATE_DIR/mobile_ru_fail_count"
-NFT_SET="mobile_ru_whitelist_v4"
-
-# Загружаем дефолты + опциональный override
-# shellcheck source=/dev/null
-. /usr/local/sbin/shieldnode-defaults.sh
-if [ -f /etc/shieldnode/shieldnode.conf ]; then
-    # shellcheck source=/dev/null
-    . /etc/shieldnode/shieldnode.conf
-fi
-
-# AS-список: из конфига MOBILE_RU_AS_LIST или DEFAULT_MOBILE_RU_AS_LIST
-[ "${#MOBILE_RU_AS_LIST[@]}" -gt 0 ] || MOBILE_RU_AS_LIST=("${DEFAULT_MOBILE_RU_AS_LIST[@]}")
-
-MIN_ENTRIES="${MIN_ENTRIES_MOBILE_RU:-$DEFAULT_MIN_ENTRIES_MOBILE_RU}"
-FAIL_THRESHOLD_VAL="${FAIL_THRESHOLD:-$DEFAULT_FAIL_THRESHOLD}"
-ENABLED="${ENABLE_RU_MOBILE_WHITELIST:-1}"
-
-# Если фича выключена в конфиге — flush и exit
-if [ "$ENABLED" != "1" ]; then
-    nft flush set inet ddos_protect "$NFT_SET" 2>/dev/null
-    logger -t "$LOG_TAG" "ENABLE_RU_MOBILE_WHITELIST=$ENABLED, set очищен"
-    exit 0
-fi
-
-# Если license key нет — graceful WARN
-if [ -z "$MAXMIND_LICENSE_KEY" ]; then
-    logger -t "$LOG_TAG" "MAXMIND_LICENSE_KEY не задан, set остаётся пустым (поведение v3.12.0). Получи бесплатный ключ на https://www.maxmind.com/en/geolite2/signup и добавь в /etc/shieldnode/shieldnode.conf"
-    exit 0
-fi
-
-# Если nft-таблицы нет — выходим
-if ! nft list table inet ddos_protect >/dev/null 2>&1; then
-    logger -t "$LOG_TAG" "table inet ddos_protect не существует — пропускаю"
-    exit 0
-fi
-
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-
-# 1) Скачиваем GeoLite2-ASN-CSV.zip (v3.13.0: ~5 MB архив)
-URL="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN-CSV&license_key=${MAXMIND_LICENSE_KEY}&suffix=zip"
-if ! curl -fsSL --max-time 60 --retry 2 "$URL" -o "$TMP/asn.zip" 2>"$TMP/curl.err"; then
-    logger -t "$LOG_TAG" "ERROR: не смог скачать MaxMind ($(cat "$TMP/curl.err"))"
-    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
-    CURRENT="${CURRENT:-0}"
-    echo $((CURRENT + 1)) > "$FAIL_COUNTER"
-    exit 1
-fi
-
-# 2) Извлекаем CSV (внутри архива GeoLite2-ASN-Blocks-IPv4.csv)
-if ! command -v unzip >/dev/null 2>&1; then
-    logger -t "$LOG_TAG" "ERROR: unzip не установлен (apt install unzip)"
-    exit 1
-fi
-
-if ! unzip -j -o -q "$TMP/asn.zip" "*/GeoLite2-ASN-Blocks-IPv4.csv" -d "$TMP/" 2>/dev/null; then
-    logger -t "$LOG_TAG" "ERROR: не смог распаковать MaxMind ZIP (формат изменился?)"
-    exit 1
-fi
-
-CSV="$TMP/GeoLite2-ASN-Blocks-IPv4.csv"
-if [ ! -s "$CSV" ]; then
-    logger -t "$LOG_TAG" "ERROR: CSV пустой или не найден после unzip"
-    exit 1
-fi
-
-# 3) Парсим CSV. Формат: network,autonomous_system_number,autonomous_system_organization
-# Пример: 1.0.0.0/24,13335,"CLOUDFLARENET"
-# Берём только наши AS, выводим CIDR.
-AS_FILTER=$(IFS='|'; echo "${MOBILE_RU_AS_LIST[*]}")
-awk -F, -v asns="$AS_FILTER" '
-BEGIN {
-    n = split(asns, arr, "|")
-    for (i = 1; i <= n; i++) want[arr[i]] = 1
-}
-NR == 1 { next }   # skip header
-{
-    # CSV формат: "1.2.3.0/24",12345,"OrgName"
-    cidr = $1
-    asn = $2
-    gsub(/"/, "", cidr)
-    gsub(/"/, "", asn)
-    if (asn in want) print cidr
-}' "$CSV" > "$TMP/mobile_ru.list"
-
-# Sanity-фильтр (тот же что в обычном updater'е): отсеиваем bogons и слишком широкие.
-awk -F'[./]' '
-{
-    prefix = (NF >= 5) ? $5 : 32
-    if (prefix < 8 || prefix > 32) next
-    o1 = $1 + 0
-    if (o1 == 0)   next
-    if (o1 == 10)  next
-    if (o1 == 127) next
-    if (o1 >= 224) next
-    if (o1 == 169 && $2 + 0 == 254) next
-    if (o1 == 172) {
-        o2 = $2 + 0
-        if (o2 >= 16 && o2 <= 31) next
-    }
-    if (o1 == 192 && $2 + 0 == 168) next
-    print $0
-}' "$TMP/mobile_ru.list" | sort -u > "$TMP/mobile_ru.parsed"
-
-V4_COUNT=$(wc -l < "$TMP/mobile_ru.parsed")
-V4_COUNT="${V4_COUNT:-0}"
-
-if [ "$V4_COUNT" -lt "$MIN_ENTRIES" ]; then
-    logger -t "$LOG_TAG" "ERROR: только $V4_COUNT CIDR'ов (ожидали >=$MIN_ENTRIES) — не применяю. Возможно AS-список пустой или MaxMind вернул мало данных."
-    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
-    CURRENT="${CURRENT:-0}"
-    echo $((CURRENT + 1)) > "$FAIL_COUNTER"
-    if [ "$CURRENT" -ge "$FAIL_THRESHOLD_VAL" ]; then
-        nft flush set inet ddos_protect "$NFT_SET" 2>/dev/null && \
-            logger -t "$LOG_TAG" "flushed $NFT_SET после $CURRENT провалов"
-    fi
-    exit 1
-fi
-
-# 4) Атомарный flush + add
-{
-    echo "flush set inet ddos_protect $NFT_SET"
-    if [ -s "$TMP/mobile_ru.parsed" ]; then
-        awk -v setname="$NFT_SET" '
-            NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet ddos_protect %s { ", setname }
-            { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
-            END { print " }" }' "$TMP/mobile_ru.parsed"
-    fi
-} > "$TMP/nft-batch"
-
-if nft -f "$TMP/nft-batch" 2>"$TMP/nft.err"; then
-    echo 0 > "$FAIL_COUNTER"
-    logger -t "$LOG_TAG" "Updated $NFT_SET: $V4_COUNT CIDR'ов из ${#MOBILE_RU_AS_LIST[@]} AS"
-
-    # 5) Observability: проверяем overlap с scanner_blocklist (informational only)
-    SCANNER_OVERLAP=0
-    if SCANNER_DUMP=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null); then
-        # Извлекаем CIDR'ы из scanner_blocklist
-        echo "$SCANNER_DUMP" | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u > "$TMP/scanner.cidrs"
-        # Сравниваем (наивная string-проверка, не subnet-overlap, но даёт сигнал)
-        SCANNER_OVERLAP=$(comm -12 "$TMP/mobile_ru.parsed" "$TMP/scanner.cidrs" | wc -l)
-        SCANNER_OVERLAP="${SCANNER_OVERLAP:-0}"
-        if [ "$SCANNER_OVERLAP" -gt 0 ]; then
-            logger -t "$LOG_TAG" "INFO: overlap mobile-RU ↔ scanner_blocklist: $SCANNER_OVERLAP CIDR'ов. Whitelist выигрывает (правило стоит раньше в prerouting)."
-        fi
-    fi
-    exit 0
-else
-    logger -t "$LOG_TAG" "ERROR: nft -f failed: $(cat "$TMP/nft.err")"
-    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
-    CURRENT="${CURRENT:-0}"
-    echo $((CURRENT + 1)) > "$FAIL_COUNTER"
-    exit 1
-fi
-MOBILE_RU_UPDATER_EOF
-chmod 0755 "$SHIELD_MOBILE_RU_UPDATER"
-print_ok "Mobile-RU updater: $SHIELD_MOBILE_RU_UPDATER"
-
 # 2.6) v3.14.0: GitHub sync updater — качает lists/custom.txt с github,
 #      обновляет /etc/shieldnode/lists/custom.txt (custom-local.txt не трогает).
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.14.1 — github sync для lists/custom.txt
+# shieldnode v3.15.0 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3513,7 +3360,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.14.1 — version check
+# shieldnode v3.15.0 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -5006,7 +4853,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.14.1${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.15.0${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -5036,7 +4883,7 @@ draw_snapshot() {
         printf  "  └─ ${G}mobile-RU whitelist${N} %s CIDRs ${DIM}(relaxed: ct=1000, newconn=2000/min, %s passes)${N}\n" \
             "$(human_num "$MOBILE_RU_SET_SIZE")" "$(human_num "$MOBILE_RU_PASS_PKTS")"
     else
-        printf  "  └─ ${DIM}mobile-RU whitelist${N} ${DIM}disabled or empty (set MAXMIND_LICENSE_KEY in shieldnode.conf to enable)${N}\n"
+        printf  "  └─ ${DIM}mobile-RU whitelist${N} ${DIM}disabled or empty (will populate from github on first sync)${N}\n"
     fi
     echo ""
 
@@ -5387,12 +5234,11 @@ show_settings_menu() {
 
     while true; do
         clear 2>/dev/null
-        local sync_state vc_state mobile_state tor_state mm_key
+        local sync_state vc_state mobile_state tor_state
         sync_state=$(_read_setting "ENABLE_GITHUB_SYNC" "1")
         vc_state=$(_read_setting "ENABLE_VERSION_CHECK" "1")
         mobile_state=$(_read_setting "ENABLE_RU_MOBILE_WHITELIST" "1")
         tor_state=$(_read_setting "BLOCK_TOR" "0")
-        mm_key=$(_read_setting "MAXMIND_LICENSE_KEY" "")
 
         # ON/OFF строки (зелёный для ON, серый для OFF)
         local s1 s2 s3 s4
@@ -5401,12 +5247,16 @@ show_settings_menu() {
         [ "$mobile_state" = "1" ] && s3="${G}ON ${N}" || s3="${DIM}OFF${N}"
         [ "$tor_state"    = "1" ] && s4="${G}ON ${N}" || s4="${DIM}OFF${N}"
 
-        # Mobile-RU dependency hint: если ON но ключа нет — показываем WARN
+        # v3.15.0: mobile-RU больше не требует MAXMIND_LICENSE_KEY
+        # Источник: lists/mobile-ru.txt из github (auto-generated через RIPEstat).
         local mobile_extra=""
-        if [ "$mobile_state" = "1" ] && [ -z "$mm_key" ]; then
-            mobile_extra=" ${Y}(no key — set empty)${N}"
-        elif [ -n "$mm_key" ]; then
-            mobile_extra=" ${DIM}(key: ${mm_key:0:8}…)${N}"
+        local mobile_size
+        mobile_size=$(nft list set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+        mobile_size="${mobile_size:-0}"
+        if [ "$mobile_state" = "1" ] && [ "$mobile_size" -gt 0 ]; then
+            mobile_extra=" ${DIM}($mobile_size CIDRs loaded)${N}"
+        elif [ "$mobile_state" = "1" ]; then
+            mobile_extra=" ${Y}(set empty — first sync pending)${N}"
         fi
 
         echo ""
@@ -5419,8 +5269,8 @@ show_settings_menu() {
         echo -e "  [${B}3${N}] Mobile-RU whitelist           $s3 $mobile_extra"
         echo -e "  [${B}4${N}] Tor exit blocklist            $s4"
         echo ""
-        echo -e "  [${B}k${N}] Edit MAXMIND_LICENSE_KEY"
         echo -e "  [${B}f${N}] Force github sync now"
+        echo -e "  [${B}m${N}] Force mobile-RU update now"
         echo -e "  [${B}v${N}] Force version check now"
         echo ""
         echo -e "  [${B}q${N}] Back to main menu"
@@ -5458,19 +5308,14 @@ show_settings_menu() {
             3)
                 if [ "$mobile_state" = "1" ]; then
                     _write_setting "ENABLE_RU_MOBILE_WHITELIST" "0"
+                    systemctl disable --now shieldnode-update@mobile_ru.timer >/dev/null 2>&1
                     nft flush set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null
                     echo -e "  ${G}✓${N} Mobile-RU whitelist ${R}disabled${N}"
                 else
                     _write_setting "ENABLE_RU_MOBILE_WHITELIST" "1"
-                    if [ -z "$mm_key" ]; then
-                        echo -e "  ${Y}⚠${N} Включено, но MAXMIND_LICENSE_KEY не задан — set будет пустой"
-                        echo -e "    ${DIM}Получи бесплатный ключ: https://www.maxmind.com/en/geolite2/signup${N}"
-                        echo -e "    ${DIM}Затем в Settings → [k] Edit MAXMIND_LICENSE_KEY${N}"
-                    else
-                        # Триггерим updater сразу
-                        systemctl start shieldnode-update@mobile_ru.service >/dev/null 2>&1 &
-                        echo -e "  ${G}✓${N} Mobile-RU whitelist ${G}enabled${N} (обновление запущено)"
-                    fi
+                    systemctl enable --now shieldnode-update@mobile_ru.timer >/dev/null 2>&1
+                    systemctl start shieldnode-update@mobile_ru.service >/dev/null 2>&1 &
+                    echo -e "  ${G}✓${N} Mobile-RU whitelist ${G}enabled${N} (загрузка запущена)"
                 fi
                 sleep 1
                 ;;
@@ -5490,30 +5335,20 @@ show_settings_menu() {
                 fi
                 sleep 1
                 ;;
-            k|K)
-                echo ""
-                echo -e "  ${B}MAXMIND_LICENSE_KEY${N}"
-                echo -e "  ${DIM}Текущий: ${mm_key:-(не задан)}${N}"
-                echo -e "  ${DIM}Получить бесплатный ключ: https://www.maxmind.com/en/geolite2/signup${N}"
-                echo -ne "  Новый key (Enter — пропустить): "
-                read -r NEW_KEY
-                if [ -n "$NEW_KEY" ]; then
-                    _write_setting "MAXMIND_LICENSE_KEY" "$NEW_KEY"
-                    chmod 0600 "$CONF"
-                    echo -e "  ${G}✓${N} MAXMIND_LICENSE_KEY обновлён"
-                    if [ "$mobile_state" = "1" ]; then
-                        echo -e "  ${DIM}Триггерю обновление mobile-RU whitelist...${N}"
-                        systemctl start shieldnode-update@mobile_ru.service >/dev/null 2>&1 &
-                    fi
-                    sleep 1
-                fi
-                ;;
             f|F)
                 echo ""
                 echo -e "  ${DIM}Запускаю github sync...${N}"
                 systemctl start shieldnode-github-sync.service
                 sleep 2
                 journalctl -t shieldnode-github-sync -n 3 --no-pager 2>/dev/null | sed 's/^/  /'
+                sleep 1
+                ;;
+            m|M)
+                echo ""
+                echo -e "  ${DIM}Запускаю mobile-RU update...${N}"
+                systemctl start shieldnode-update@mobile_ru.service
+                sleep 2
+                journalctl -t shieldnode-update-mobile_ru -n 3 --no-pager 2>/dev/null | sed 's/^/  /'
                 sleep 1
                 ;;
             v|V)
@@ -5889,7 +5724,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.14.1 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.15.0 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
@@ -5901,8 +5736,10 @@ BL_LINE="scanner=$(printf "%'d" "${SCANNER_NUM:-0}"), threat=$(printf "%'d" "${T
 echo -e "   • Blocklists:    ${BL_LINE}"
 if [ "${MOBILE_RU_NUM:-0}" -gt 0 ]; then
     echo -e "   • Mobile-RU:     $(printf "%'d" "$MOBILE_RU_NUM") CIDRs (relaxed: ct=1000, newconn=2000/min)"
-elif [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" = "1" ] && [ -z "${MAXMIND_LICENSE_KEY:-}" ]; then
-    echo -e "   • Mobile-RU:     ${YELLOW}отключён${NC} ${DIM}(нет MAXMIND_LICENSE_KEY в shieldnode.conf)${NC}"
+elif [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" = "1" ]; then
+    echo -e "   • Mobile-RU:     ${YELLOW}пустой${NC} ${DIM}(первый sync через несколько минут)${NC}"
+else
+    echo -e "   • Mobile-RU:     ${DIM}отключён${NC}"
 fi
 echo -e "   • Лимиты:        ct=400, new-conn=500/min ${DIM}(CGNAT-friendly)${NC}"
 # v3.14.0: статус auto-sync features
