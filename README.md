@@ -16,12 +16,12 @@ Bash-скрипт DDoS-защиты для VPN-нод (Reality / Xray / sing-box
   - `threat` — Spamhaus DROP + FireHOL Level 1 (high-confidence криминал)
   - `tor` — Tor exit nodes (опционально, `BLOCK_TOR=1`)
   - `custom` — личный список оператора (file-based + URL union)
-- **Mobile-RU AS whitelist** (v3.15.3): relaxed limits (ct=1000, newconn=2000/min)
+- **Mobile-RU AS whitelist** (v3.16.1): relaxed limits (ct=1000, newconn=2000/min)
   для МТС / T2 / МегаФон / Билайн. Список CIDR'ов автогенерируется раз в неделю
   через GitHub Actions с помощью публичного RIPEstat API (без MaxMind, без ключей).
-- **GitHub auto-sync** (v3.15.3): `lists/custom.txt` синкается с репо каждые 6ч.
+- **GitHub auto-sync** (v3.16.1): `lists/custom.txt` синкается с репо каждые 6ч.
   Локальные дополнения — в отдельном `custom-local.txt`, не перезаписываются.
-- **Version check** (v3.15.3): нода раз в день проверяет github на новую версию,
+- **Version check** (v3.16.1): нода раз в день проверяет github на новую версию,
   показывает `[upgrade] доступна v3.X.Y` в guard CLI
 - **CrowdSec** + nftables bouncer (SSH brute-force + community blocklist)
 - **guard CLI** — дашборд защиты с ASN/owner column для top attackers
@@ -93,7 +93,7 @@ sudo guard --json   # JSON-вывод для интеграций (Zabbix, Prome
 
 ## Версии
 
-- **v3.15.3** — убрана зависимость от MaxMind. `lists/mobile-ru.txt` теперь автогенерируется раз в неделю через GitHub Actions из публичного RIPEstat API. Все 13 mobile-RU AS проверены, ~2400 raw CIDR'ов → ~450 финальных после nft auto-merge. Mobile-RU стал обычным blocklist'ом через unified updater.
+- **v3.16.1** — убрана зависимость от MaxMind. `lists/mobile-ru.txt` теперь автогенерируется раз в неделю через GitHub Actions из публичного RIPEstat API. Все 13 mobile-RU AS проверены, ~2400 raw CIDR'ов → ~450 финальных после nft auto-merge. Mobile-RU стал обычным blocklist'ом через unified updater.
 - **v3.14.1** — hotfix: при reinstall настройки оператора в shieldnode.conf теперь сохраняются (раньше ENABLE_GITHUB_SYNC=0, ENABLE_VERSION_CHECK=0 и др. сбрасывались на дефолты при apply новой версии). Conf загружается ДО объявления дефолтов в установщике.
 - **v3.14.0** — GitHub auto-sync custom.txt (каждые 6ч) + version check для shieldnode.sh + guard CLI settings menu `[s]`. Команды `sudo guard upgrade/sync/check`. Двухфайловая модель: `custom.txt` (github sync) + `custom-local.txt` (локальные дополнения)
 - **v3.13.2** — hotfix: миграция legacy-артефактов от ≤v3.12.x при reinstall (старые update-scanner-blocklist.sh, scanner-blocklist-update.timer и т.п. чистятся автоматически)
