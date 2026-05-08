@@ -1,24 +1,31 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.15.0 (Commercial Edition)
-#  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
-#  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
-#  - nftables threat-blocklist (Spamhaus DROP + FireHOL Level 1, v3.12.0)
-#  - nftables custom-blocklist (operator personal IPs, v3.12.0)
-#  - nftables mobile-RU AS whitelist (CGNAT-friendly, v3.13.0+, v3.15.0 без MaxMind)
-#  - nftables connection-flood + slowloris защита (PROPER per-IP ct count)
-#  - nftables TCP flag sanity (drop invalid combinations)
-#  - nftables anti-spoofing (fib saddr — стронгер чем rp_filter loose)
-#  - nftables TCP MSS clamping (улучшает скорость VPN, устраняет фрагментацию)
-#  - Tor exit blocklist (опционально через BLOCK_TOR=1)
-#  - CrowdSec (SSH brute-force + community blocklist)
-#  - guard CLI с settings menu [s] (v3.14.0)
-#  - GitHub auto-sync custom.txt (v3.14.0)
-#  - Version check для shieldnode.sh (v3.14.0)
-#  - Человекочитаемые логи в /var/log/shieldnode/events.log
-#  - Опциональный конфиг /etc/shieldnode/shieldnode.conf (v3.12.0)
-#  - File-based blocklists в /etc/shieldnode/lists/*.txt (v3.12.0)
+#  VPN NODE DDoS PROTECTION v3.15.3 (Commercial Edition) — OBSERVABILITY HOTFIX
+#
+#  v3.15.3 changelog:
+#    [OBSERVABILITY] Добавлены оставшиеся log prefix'ы для полного покрытия:
+#      - [shield:tcp_invalid] — TCP пакеты с невалидными flag'ами (XMAS/NULL/
+#        SYN+FIN scans, anti-spoofing fib reverse-path drops). Это scanner'ы.
+#      - [shield:syn_escalate] — IP перешёл из suspect → confirmed_attack
+#        через SYN-flood. Видно момент эскалации атаки.
+#      - [shield:udp_escalate] — то же для UDP.
+#      Все три имеют rate-limit 1/second burst 5, чтобы не флудить лог.
+#      Aggregator парсит → events.db с type='tcp_invalid'/'syn_escalate'/
+#      'udp_escalate'. events.log пишет соответствующие строки.
+#
+#  v3.15.2 changelog:
+#    [OBSERVABILITY] conn-flood (ct>400) и newconn-flood теперь логируют SRC.
+#         Раньше счётчики тикали, но узнать КТО превысил лимит было нельзя.
+#         Добавлены log prefix '[shield:conn_flood]' и '[shield:newconn_flood]'.
+#         Aggregator парсит → events.db с type='conn_flood'/'newconn_flood'.
+#         events.log пишет 'CONN-FLOOD ip=X.X.X.X hits=N' lines.
+#         guard CLI Top-attackers теперь будет показывать и conn-flood источники.
+#
+#  v3.15.1 changelog:
+#    [UI] Удалён блок "Recent events (last 5)" из guard snapshot — дублировал
+#         информацию из events.log, можно посмотреть через [9].
+#    [UI] Убран "(v3.14)" в подписи меню Settings — теперь просто "[s] Settings".
 #
 #  v3.15.0 changelog:
 #
@@ -1022,8 +1029,8 @@ cscli_collection_installed() {
 # Можно переопределить через env (для тестинга на форке).
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
-# v3.15.0: версия для self-check
-SHIELDNODE_VERSION="3.15.0"
+# v3.15.2: версия для self-check
+SHIELDNODE_VERSION="3.15.3"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -2122,7 +2129,10 @@ if [ "${ENABLE_FIB_ANTISPOOF:-0}" = "1" ]; then
         # для которых kernel'у не известен обратный маршрут.
         # iif lo пропускаем (локальный трафик не должен попадать под fib check).
         # Включено потому что VPS single-homed (один upstream).
+        # v3.15.3: добавлен log prefix '[shield:fib_spoof]' для observability —
+        # видно spoofed-source attacks которые kernel не может маршрутизировать обратно.
         iif \"lo\" accept
+        fib saddr . iif oif missing limit rate 1/second burst 5 packets log prefix \"[shield:fib_spoof] \" level info flags ip options counter name tcp_invalid drop
         fib saddr . iif oif missing counter name tcp_invalid drop"
 else
     FIB_ANTISPOOF_RULE="        # fib anti-spoofing отключён (multi-homed VPS — может дать false-positive)"
@@ -2350,6 +2360,22 @@ $FIB_ANTISPOOF_RULE
         # tcp flags fin,rst    → FIN+RST одновременно (нет смысла)
         # tcp flags == 0x0     → null scan (все флаги выключены)
         # tcp flags == fin,psh,urg → XMAS scan (nmap -sX)
+        #
+        # v3.15.3: добавлено логирование (rate 1/sec burst 5) — видно SRC
+        # сканеров nmap -sN/-sF/-sX. Сами drop-правила ниже остались без
+        # логов для производительности (большинство атак тут rate-limited
+        # уже по факту, но первый пакет залогируется этим правилом).
+        tcp flags & (fin|syn) == (fin|syn) limit rate 1/second burst 5 packets \\
+            log prefix "[shield:tcp_invalid] " level info flags ip options
+        tcp flags & (syn|rst) == (syn|rst) limit rate 1/second burst 5 packets \\
+            log prefix "[shield:tcp_invalid] " level info flags ip options
+        tcp flags & (fin|rst) == (fin|rst) limit rate 1/second burst 5 packets \\
+            log prefix "[shield:tcp_invalid] " level info flags ip options
+        tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 limit rate 1/second burst 5 packets \\
+            log prefix "[shield:tcp_invalid] " level info flags ip options
+        tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|psh|urg) limit rate 1/second burst 5 packets \\
+            log prefix "[shield:tcp_invalid] " level info flags ip options
+
         tcp flags & (fin|syn) == (fin|syn) counter name tcp_invalid drop
         tcp flags & (syn|rst) == (syn|rst) counter name tcp_invalid drop
         tcp flags & (fin|rst) == (fin|rst) counter name tcp_invalid drop
@@ -2473,8 +2499,11 @@ $FIB_ANTISPOOF_RULE
         # Slowloris атаки которые держат 400+ коннектов всё равно дропаются.
         # v3.13.0: для mobile-RU AS используется relaxed-path выше; сюда попадает
         # только non-mobile трафик.
+        # v3.15.2: добавлен log prefix '[shield:conn_flood]' для observability —
+        # aggregator парсит и пишет в events.db с type='conn_flood' для top-attackers.
         tcp dport @protected_ports_tcp ct state new \\
             add @connlimit_v4 { ip saddr ct count over 400 } \\
+            log prefix "[shield:conn_flood] " level info flags ip options \\
             counter name conn_flood_v4 drop
 
         # === NEW CONNECTION RATE-LIMIT ===
@@ -2507,17 +2536,31 @@ $FIB_ANTISPOOF_RULE
     # Не трогают meter-set'ы → не могут вызвать double-charge.
     chain newconn_overflow {
         # Уже под наблюдением → escalate в confirmed (бан 1ч)
-        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name newconn_flood_v4 drop
+        # v3.15.2: log prefix для observability
+        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\
+            log prefix "[shield:newconn_flood] " level info flags ip options \\
+            counter name newconn_flood_v4 drop
         # Первое нарушение → suspect (наблюдение 30мин, без drop)
         add @suspect_v4 { ip saddr } counter name newconn_flood_v4
     }
 
     chain syn_overflow {
+        # v3.15.3: log prefix [shield:syn_escalate] на момент ESCALATION в confirmed_attack_v4.
+        # Виден SRC где IP перешёл из suspect → ban 1ч. Rate-limited чтобы не флудить.
+        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\
+            limit rate 1/second burst 5 packets \\
+            log prefix "[shield:syn_escalate] " level info flags ip options \\
+            counter name syn_confirmed_v4 drop
         ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name syn_confirmed_v4 drop
         add @suspect_v4 { ip saddr }
     }
 
     chain udp_overflow {
+        # v3.15.3: log prefix [shield:udp_escalate] на момент ESCALATION.
+        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\
+            limit rate 1/second burst 5 packets \\
+            log prefix "[shield:udp_escalate] " level info flags ip options \\
+            counter name udp_confirmed_v4 drop
         ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name udp_confirmed_v4 drop
         add @suspect_v4 { ip saddr }
     }
@@ -3041,7 +3084,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.15.0 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.15.3 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3300,7 +3343,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.15.0 — github sync для lists/custom.txt
+# shieldnode v3.15.3 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3360,7 +3403,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.15.0 — version check
+# shieldnode v3.15.3 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -4242,9 +4285,12 @@ fi
 NEW_CURSOR=$(grep -oE '^-- cursor: .+$' "$TMP" | tail -1 | sed 's/^-- cursor: //')
 
 # Парсим сообщения [shield:scanner], [shield:ddos], [shield:tor] (v3.11),
-# [shield:threat] и [shield:custom] (v3.12.0), [shield:mobile_ru_drop] (v3.13.1)
+# [shield:threat] и [shield:custom] (v3.12.0), [shield:mobile_ru_drop] (v3.13.1),
+# [shield:conn_flood] и [shield:newconn_flood] (v3.15.2),
+# [shield:tcp_invalid], [shield:fib_spoof], [shield:syn_escalate], [shield:udp_escalate] (v3.15.3)
 # Формат kernel-лога: "[shield:scanner] IN=eth0 SRC=85.142.100.2 DST=... PROTO=TCP DPT=8443 ..."
-declare -A scanner_ips ddos_ips tor_ips threat_ips custom_ips mobile_ru_ips
+declare -A scanner_ips ddos_ips tor_ips threat_ips custom_ips mobile_ru_ips conn_flood_ips newconn_flood_ips
+declare -A tcp_invalid_ips fib_spoof_ips syn_escalate_ips udp_escalate_ips
 # v3.5: для events.log — собираем порт назначения и тип flood'а
 declare -A ddos_ports ddos_proto
 
@@ -4274,6 +4320,24 @@ while IFS='|' read -r kind ip port proto; do
             ;;
         mobile_ru)
             [ -n "$ip" ] && mobile_ru_ips[$ip]=$((${mobile_ru_ips[$ip]:-0} + 1))
+            ;;
+        conn_flood)
+            [ -n "$ip" ] && conn_flood_ips[$ip]=$((${conn_flood_ips[$ip]:-0} + 1))
+            ;;
+        newconn_flood)
+            [ -n "$ip" ] && newconn_flood_ips[$ip]=$((${newconn_flood_ips[$ip]:-0} + 1))
+            ;;
+        tcp_invalid)
+            [ -n "$ip" ] && tcp_invalid_ips[$ip]=$((${tcp_invalid_ips[$ip]:-0} + 1))
+            ;;
+        fib_spoof)
+            [ -n "$ip" ] && fib_spoof_ips[$ip]=$((${fib_spoof_ips[$ip]:-0} + 1))
+            ;;
+        syn_escalate)
+            [ -n "$ip" ] && syn_escalate_ips[$ip]=$((${syn_escalate_ips[$ip]:-0} + 1))
+            ;;
+        udp_escalate)
+            [ -n "$ip" ] && udp_escalate_ips[$ip]=$((${udp_escalate_ips[$ip]:-0} + 1))
             ;;
     esac
 done < <(awk '
@@ -4312,6 +4376,42 @@ done < <(awk '
         if (match($0, /SRC=[^ ]+/)) {
             ip = substr($0, RSTART+4, RLENGTH-4)
             if (ip != "") print "mobile_ru|" ip "||"
+        }
+    }
+    /\[shield:conn_flood\]/ {
+        if (match($0, /SRC=[^ ]+/)) {
+            ip = substr($0, RSTART+4, RLENGTH-4)
+            if (ip != "") print "conn_flood|" ip "||"
+        }
+    }
+    /\[shield:newconn_flood\]/ {
+        if (match($0, /SRC=[^ ]+/)) {
+            ip = substr($0, RSTART+4, RLENGTH-4)
+            if (ip != "") print "newconn_flood|" ip "||"
+        }
+    }
+    /\[shield:tcp_invalid\]/ {
+        if (match($0, /SRC=[^ ]+/)) {
+            ip = substr($0, RSTART+4, RLENGTH-4)
+            if (ip != "") print "tcp_invalid|" ip "||"
+        }
+    }
+    /\[shield:fib_spoof\]/ {
+        if (match($0, /SRC=[^ ]+/)) {
+            ip = substr($0, RSTART+4, RLENGTH-4)
+            if (ip != "") print "fib_spoof|" ip "||"
+        }
+    }
+    /\[shield:syn_escalate\]/ {
+        if (match($0, /SRC=[^ ]+/)) {
+            ip = substr($0, RSTART+4, RLENGTH-4)
+            if (ip != "") print "syn_escalate|" ip "||"
+        }
+    }
+    /\[shield:udp_escalate\]/ {
+        if (match($0, /SRC=[^ ]+/)) {
+            ip = substr($0, RSTART+4, RLENGTH-4)
+            if (ip != "") print "udp_escalate|" ip "||"
         }
     }
 ' "$TMP")
@@ -4353,6 +4453,36 @@ TS=$(date '+%Y-%m-%d %H:%M:%S')
     for ip in "${!mobile_ru_ips[@]}"; do
         cnt=${mobile_ru_ips[$ip]}
         echo "[$TS] MOBILE_RU OVERFLOW ip=$ip hits=$cnt (CGNAT exceeded ct=1000)"
+    done
+    # v3.15.2: conn-flood drops (>400 одновременных connections, не mobile-RU)
+    for ip in "${!conn_flood_ips[@]}"; do
+        cnt=${conn_flood_ips[$ip]}
+        echo "[$TS] CONN-FLOOD ip=$ip hits=$cnt (exceeded ct=400)"
+    done
+    # v3.15.2: newconn-flood drops (>500 new conn/min, escalated to confirmed_attack)
+    for ip in "${!newconn_flood_ips[@]}"; do
+        cnt=${newconn_flood_ips[$ip]}
+        echo "[$TS] NEWCONN-FLOOD ip=$ip hits=$cnt (>500 new conn/min — banned 1h)"
+    done
+    # v3.15.3: TCP-flag-invalid drops (XMAS/NULL/SYN+FIN scans — nmap)
+    for ip in "${!tcp_invalid_ips[@]}"; do
+        cnt=${tcp_invalid_ips[$ip]}
+        echo "[$TS] TCP-INVALID ip=$ip hits=$cnt (nmap-like scanner: XMAS/NULL/SYN+FIN)"
+    done
+    # v3.15.3: FIB anti-spoof drops (spoofed source IP, no reverse route)
+    for ip in "${!fib_spoof_ips[@]}"; do
+        cnt=${fib_spoof_ips[$ip]}
+        echo "[$TS] FIB-SPOOF ip=$ip hits=$cnt (spoofed src, kernel can't route back)"
+    done
+    # v3.15.3: SYN-flood escalation (suspect → confirmed_attack ban 1h)
+    for ip in "${!syn_escalate_ips[@]}"; do
+        cnt=${syn_escalate_ips[$ip]}
+        echo "[$TS] SYN-ESCALATE ip=$ip hits=$cnt (suspect→confirmed via SYN-flood — banned 1h)"
+    done
+    # v3.15.3: UDP-flood escalation
+    for ip in "${!udp_escalate_ips[@]}"; do
+        cnt=${udp_escalate_ips[$ip]}
+        echo "[$TS] UDP-ESCALATE ip=$ip hits=$cnt (suspect→confirmed via UDP-flood — banned 1h)"
     done
 } >> "$EVENTS_LOG" 2>/dev/null
 
@@ -4426,6 +4556,35 @@ NOW=$(date +%s)
         cnt=${mobile_ru_ips[$ip]}
         echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('mobile_ru', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
     done
+    # v3.15.2: conn-flood events (ct>400, не mobile-RU)
+    for ip in "${!conn_flood_ips[@]}"; do
+        cnt=${conn_flood_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('conn_flood', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
+    # v3.15.2: newconn-flood events (>500/min, escalated to confirmed_attack)
+    for ip in "${!newconn_flood_ips[@]}"; do
+        cnt=${newconn_flood_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('newconn_flood', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
+    # v3.15.3: tcp-invalid (nmap scanner) events
+    for ip in "${!tcp_invalid_ips[@]}"; do
+        cnt=${tcp_invalid_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('tcp_invalid', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
+    # v3.15.3: fib-spoof events
+    for ip in "${!fib_spoof_ips[@]}"; do
+        cnt=${fib_spoof_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('fib_spoof', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
+    # v3.15.3: syn/udp escalation events
+    for ip in "${!syn_escalate_ips[@]}"; do
+        cnt=${syn_escalate_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('syn_escalate', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
+    for ip in "${!udp_escalate_ips[@]}"; do
+        cnt=${udp_escalate_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('udp_escalate', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
     if [ -n "$NEW_CURSOR" ]; then
         # Экранируем одинарные кавычки в cursor
         ESC_CURSOR=$(echo "$NEW_CURSOR" | sed "s/'/''/g")
@@ -4441,8 +4600,15 @@ TOTAL_TOR=${#tor_ips[@]}
 TOTAL_THREAT=${#threat_ips[@]}
 TOTAL_CUSTOM=${#custom_ips[@]}
 TOTAL_MOBILE_RU=${#mobile_ru_ips[@]}
-if [ $TOTAL_SCANNERS -gt 0 ] || [ $TOTAL_DDOS -gt 0 ] || [ $TOTAL_TOR -gt 0 ] || [ $TOTAL_THREAT -gt 0 ] || [ $TOTAL_CUSTOM -gt 0 ] || [ $TOTAL_MOBILE_RU -gt 0 ]; then
-    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS, ddos=$TOTAL_DDOS, tor=$TOTAL_TOR, threat=$TOTAL_THREAT, custom=$TOTAL_CUSTOM, mobile_ru=$TOTAL_MOBILE_RU unique IPs"
+TOTAL_CONN_FLOOD=${#conn_flood_ips[@]}
+TOTAL_NEWCONN_FLOOD=${#newconn_flood_ips[@]}
+TOTAL_TCP_INVALID=${#tcp_invalid_ips[@]}
+TOTAL_FIB_SPOOF=${#fib_spoof_ips[@]}
+TOTAL_SYN_ESC=${#syn_escalate_ips[@]}
+TOTAL_UDP_ESC=${#udp_escalate_ips[@]}
+TOTAL_ANY=$((TOTAL_SCANNERS + TOTAL_DDOS + TOTAL_TOR + TOTAL_THREAT + TOTAL_CUSTOM + TOTAL_MOBILE_RU + TOTAL_CONN_FLOOD + TOTAL_NEWCONN_FLOOD + TOTAL_TCP_INVALID + TOTAL_FIB_SPOOF + TOTAL_SYN_ESC + TOTAL_UDP_ESC))
+if [ $TOTAL_ANY -gt 0 ]; then
+    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS, ddos=$TOTAL_DDOS, tor=$TOTAL_TOR, threat=$TOTAL_THREAT, custom=$TOTAL_CUSTOM, mobile_ru=$TOTAL_MOBILE_RU, conn_flood=$TOTAL_CONN_FLOOD, newconn_flood=$TOTAL_NEWCONN_FLOOD, tcp_invalid=$TOTAL_TCP_INVALID, fib_spoof=$TOTAL_FIB_SPOOF, syn_esc=$TOTAL_SYN_ESC, udp_esc=$TOTAL_UDP_ESC unique IPs"
 fi
 AGG_EOF
 
@@ -4853,7 +5019,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.15.0${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.15.3${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -4955,19 +5121,7 @@ draw_snapshot() {
     printf  "  └─ ${M}ssh brute attempts:${N}  %12s unique IPs ${DIM}(crowdsec)${N}\n" "$(human_num "$CS_ALLTIME_BANS")"
     echo ""
 
-    # ===== RECENT EVENTS (v3.5) =====
-    local events_log="/var/log/shieldnode/events.log"
-    if [ -r "$events_log" ]; then
-        echo -e "  ${B}Recent events${N} ${DIM}(last 5 — [9] for full log)${N}"
-        local last_lines
-        last_lines=$(tail -5 "$events_log" 2>/dev/null)
-        if [ -z "$last_lines" ]; then
-            echo -e "  ${DIM}└─ (empty — no events yet)${N}"
-        else
-            echo "$last_lines" | sed 's/^/  /'
-        fi
-        echo ""
-    fi
+    # v3.15.1: блок "Recent events (last 5)" убран — дублировал [9] view full log
 
     printf "  ${DIM}Blocklist updated: %s${N}\n" "$LAST_UPDATE"
 }
@@ -5439,7 +5593,7 @@ while true; do
     echo -e "${C}│${N}  [${B}3${N}] Whitelist IPs          [${B}4${N}] Scanner blocklist               ${C}│${N}"
     echo -e "${C}│${N}  [${B}6${N}] Recent history         [${B}7${N}] Top attackers                   ${C}│${N}"
     echo -e "${C}│${N}  [${B}8${N}] Unban all              [${B}9${N}] View full events.log            ${C}│${N}"
-    echo -e "${C}│${N}  [${B}s${N}] Settings (v3.14)                                           ${C}│${N}"
+    echo -e "${C}│${N}  [${B}s${N}] Settings                                                   ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
     echo -e "${C}│${N}  [${B}r${N}] Refresh                [${B}0${N}] Exit                            ${C}│${N}"
     echo -e "${C}└─────────────────────────────────────────────────────────────────┘${N}"
@@ -5724,7 +5878,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.15.0 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.15.3 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
