@@ -1,4 +1,4 @@
-# shieldnode v3.14.0 — пример конфигурации
+# shieldnode v3.15.0 — пример конфигурации
 #
 # Этот файл ОПЦИОНАЛЕН. Если его НЕТ в /etc/shieldnode/shieldnode.conf
 # — используются hardcoded дефолты в скрипте (те что закомментированы ниже).
@@ -8,8 +8,8 @@
 #   sudo nano /etc/shieldnode/shieldnode.conf
 #   sudo systemctl restart 'shieldnode-update@*.service'
 #
-# Альтернативно — все toggle'ы можно изменить через ${CYAN}sudo guard${NC} →
-# меню [s] settings (auto-sync, version check, mobile-RU, tor, MaxMind key).
+# Альтернативно — все toggle'ы можно изменить через `sudo guard` →
+# меню [s] settings (auto-sync, version check, mobile-RU, tor).
 #
 # Синтаксис: bash array. Чтобы для одного set'а было НЕСКОЛЬКО URL'ов —
 # объединяй через запятую без пробелов.
@@ -28,7 +28,7 @@
 #ENABLE_VERSION_CHECK=1
 
 # ==============================================================================
-# v3.13.0: MOBILE-RU AS WHITELIST (CGNAT-friendly relaxed limits)
+# v3.15.0: MOBILE-RU AS WHITELIST (CGNAT-friendly relaxed limits)
 # ==============================================================================
 # Российские мобильные операторы дают CGNAT с 50-200 абонентами на 1 IP.
 # При активной нагрузке такой IP может выдавать 600-1000 concurrent — что
@@ -37,52 +37,25 @@
 #   - newconn rate: 500/min → 2000/min, burst 1000 → 4000
 #   - SYN/UDP rate-limit пропускаются для этих IPs (accept early)
 #
-# Включён по умолчанию (ENABLE_RU_MOBILE_WHITELIST=1). Без MAXMIND_LICENSE_KEY
-# работает как noop — set пустой, поведение идентично v3.12.0.
+# v3.15.0: список CIDR'ов берётся из github (lists/mobile-ru.txt), который
+# автогенерируется раз в неделю через GitHub Actions из RIPEstat API.
+# НИКАКИХ ключей или регистрации не нужно — обычный публичный blocklist.
 #
-# Получить бесплатный ключ: https://www.maxmind.com/en/geolite2/signup
-#   1) Зарегистрироваться (email + пароль)
-#   2) В панели → "Manage License Keys" → "Generate New License Key"
-#   3) Скопировать key (формат: 40 alphanumeric символов)
-
-#ENABLE_RU_MOBILE_WHITELIST=1
-#MAXMIND_LICENSE_KEY=""    # обязательно для работы whitelist'а
-
-# Список AS — российские мобильные операторы (проверены через RIPEstat).
-# По умолчанию: МТС + T2/Tele2 + МегаФон + Билайн (13 AS).
-#MOBILE_RU_AS_LIST=(
-#    8359   # МТС PJSC
-#    28884  # МТС Siberia
-#    12958  # T2 Mobile (Tele2)
-#    15378  # T2 Mobile (бывший Yota)
-#    41330  # T2 Mobile Novosibirsk
-#    42437  # T2 Mobile Rostov
-#    48190  # T2 Mobile Ekaterinburg
-#    31133  # MegaFon
-#    31163  # MegaFon Kavkaz
-#    12714  # MegaFon-AS (бэкбон)
-#    3216   # Vimpelcom (Beeline)
-#    8402   # Corbina (Vimpelcom)
-#    16345  # Beeline-AS
-#)
-
-# Обновление раз в неделю (MaxMind релизит CSV втор/пят).
-#MOBILE_RU_UPDATE_INTERVAL="1w"
-
-# Минимум CIDR'ов после фильтрации. Если меньше — подозрительно (что-то
-# сломалось), set не обновляется.
-#MIN_ENTRIES_MOBILE_RU=100
+# Включён по умолчанию. Можно отключить:
+#ENABLE_RU_MOBILE_WHITELIST=0
 
 # ==============================================================================
 # v3.12.0: LOCAL BLOCKLISTS (file-based)
 # ==============================================================================
 # Путь к локальному .txt файлу для каждого set'а. Объединяется (union) с URL'ами.
+# v3.14.0: custom поддерживает 2 файла через запятую — github sync + локальный.
 
 #LOCAL_BLOCKLISTS=(
 #    "scanner=/etc/shieldnode/lists/scanner.txt"
 #    "threat=/etc/shieldnode/lists/threat.txt"
 #    "tor=/etc/shieldnode/lists/tor.txt"
-#    "custom=/etc/shieldnode/lists/custom.txt"
+#    "custom=/etc/shieldnode/lists/custom.txt,/etc/shieldnode/lists/custom-local.txt"
+#    "mobile_ru=/etc/shieldnode/lists/mobile-ru.txt"
 #)
 
 # ==============================================================================
@@ -90,13 +63,13 @@
 # ==============================================================================
 # Несколько URL'ов через запятую — объединение для одного set'а.
 # Если для set'а нет URL'ов — оставь "name=" (пустое значение).
-# Custom по умолчанию работает ТОЛЬКО на локальном файле.
 
 #REMOTE_BLOCKLISTS=(
 #    "scanner=https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list,https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list,https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
 #    "threat=https://www.spamhaus.org/drop/drop.txt,https://iplists.firehol.org/files/firehol_level1.netset"
 #    "tor=https://check.torproject.org/torbulkexitlist"
 #    "custom="
+#    "mobile_ru=https://raw.githubusercontent.com/abcproxy70-ops/shield/main/lists/mobile-ru.txt"
 #)
 
 # ==============================================================================
@@ -106,6 +79,8 @@
 #THREAT_UPDATE_INTERVAL="1d"
 #TOR_UPDATE_INTERVAL="1h"
 #CUSTOM_UPDATE_INTERVAL="6h"
+#MOBILE_RU_UPDATE_INTERVAL="1d"   # github cron обновляет раз в неделю,
+                                   # клиент чекает раз в день
 
 # ==============================================================================
 # MIN ENTRIES (sanity check против corrupted upstream)
@@ -114,19 +89,29 @@
 #MIN_ENTRIES_THREAT=500
 #MIN_ENTRIES_TOR=100
 #MIN_ENTRIES_CUSTOM=0
+#MIN_ENTRIES_MOBILE_RU=100
 
 #FAIL_THRESHOLD=3
+
+# ==============================================================================
+# v3.11: TOR EXIT BLOCKLIST
+# ==============================================================================
+# Блокирует подключения Tor exit nodes. По умолчанию ОТКЛЮЧЕНО — операторы
+# которые хостят Tor → VPN bridge для параноиков должны оставлять выключенным.
+#BLOCK_TOR=0
 
 # ==============================================================================
 # Примеры кастомизации
 # ==============================================================================
 
 # Пример 1: offline-mode (только локальные файлы)
-#REMOTE_BLOCKLISTS=("scanner=" "threat=" "tor=" "custom=")
+#REMOTE_BLOCKLISTS=("scanner=" "threat=" "tor=" "custom=" "mobile_ru=")
 
-# Пример 2: только МТС в mobile-RU whitelist
-#MOBILE_RU_AS_LIST=(8359 28884)
-
-# Пример 3: реже обновлять (для слабого сервера)
+# Пример 2: реже обновлять (для слабого сервера)
 #SCANNER_UPDATE_INTERVAL="12h"
 #THREAT_UPDATE_INTERVAL="2d"
+
+# Пример 3: свой источник mobile-RU CIDR'ов (если форкнул репо)
+#REMOTE_BLOCKLISTS=(
+#    "mobile_ru=https://raw.githubusercontent.com/MY_FORK/shield/main/lists/mobile-ru.txt"
+#)
