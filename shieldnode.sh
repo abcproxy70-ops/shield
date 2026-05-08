@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.13.1 (Commercial Edition) — HOTFIX
+#  VPN NODE DDoS PROTECTION v3.13.2 (Commercial Edition) — HOTFIX
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables threat-blocklist (Spamhaus DROP + FireHOL Level 1, v3.12.0)
@@ -18,6 +18,25 @@
 #  - Мгновенное отслеживание изменений в фаерволе через inotify
 #  - Опциональный конфиг /etc/shieldnode/shieldnode.conf (v3.12.0)
 #  - File-based blocklists в /etc/shieldnode/lists/*.txt (v3.12.0)
+#
+#  v3.13.2 hotfix changelog:
+#
+#    [LEGACY-CLEANUP] При обновлении ≤v3.11.x → v3.12.x → v3.13.x на тех же
+#      серверах оставались мёртвые артефакты:
+#        - /usr/local/sbin/update-scanner-blocklist.sh  (v3.11.x → заменён единым updater)
+#        - /usr/local/sbin/update-tor-blocklist.sh      (v3.11.x → заменён единым updater)
+#        - /etc/systemd/system/scanner-blocklist-update.{service,timer}  (v3.11.x)
+#        - /etc/systemd/system/tor-blocklist-update.{service,timer}     (v3.11.x)
+#      Они не запускались (timer'ы disable), но загромождали /usr/local/sbin
+#      и могли путать диагностику. Чистились только при --uninstall.
+#
+#      FIX: добавлен migration block в начале установки. Перед созданием
+#      новых templated unit'ов скрипт:
+#        1) systemctl disable --now на legacy timer'ах/service'ах
+#        2) rm -f legacy unit-файлов
+#        3) rm -f legacy скриптов в /usr/local/sbin
+#        4) systemctl daemon-reload
+#      Идемпотентно: на свежей установке миграция — no-op (rm -f без error).
 #
 #  v3.13.1 hotfix changelog:
 #
@@ -1560,6 +1579,63 @@ nft list ruleset > "$BACKUP_DIR/nft-ruleset.before" 2>/dev/null || true
 print_ok "Бэкап текущих nft-правил: $BACKUP_DIR/nft-ruleset.before"
 
 # ==============================================================================
+# ШАГ 1.5: МИГРАЦИЯ С ЛЕГАСИ-ВЕРСИЙ (v3.13.2+)
+# ==============================================================================
+# При обновлении ≤v3.11.x → v3.12.x → v3.13.x на тех же серверах оставались
+# мёртвые артефакты от старых scanner-blocklist-update.* и tor-blocklist-update.*
+# unit'ов, заменённых единым shieldnode-update@<name>.* templated unit'ом.
+# Чистим их сейчас (идемпотентно — на свежей установке no-op).
+
+LEGACY_FOUND=0
+
+# 1) Legacy systemd unit'ы (v3.11.x scanner/tor отдельные timer'ы)
+for unit in scanner-blocklist-update.timer scanner-blocklist-update.service \
+            tor-blocklist-update.timer tor-blocklist-update.service \
+            cs-ssh-whitelist.service; do
+    if [ -f "/etc/systemd/system/$unit" ]; then
+        LEGACY_FOUND=1
+        systemctl disable --now "$unit" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$unit"
+    fi
+done
+
+# 2) Legacy updater-скрипты (v3.11.x — заменены единым shieldnode-update-blocklist.sh)
+for script in /usr/local/sbin/update-scanner-blocklist.sh \
+              /usr/local/sbin/update-tor-blocklist.sh \
+              /usr/local/sbin/cs-ssh-key-whitelist.sh; do
+    if [ -f "$script" ]; then
+        LEGACY_FOUND=1
+        rm -f "$script"
+    fi
+done
+
+# 3) Legacy postoverflow whitelist parser (≤v3.4)
+if [ -f /etc/crowdsec/postoverflows/s01-whitelist/ssh-key-whitelist.yaml ]; then
+    LEGACY_FOUND=1
+    rm -f /etc/crowdsec/postoverflows/s01-whitelist/ssh-key-whitelist.yaml
+fi
+
+# 4) Legacy UFW acquisition (v1.1-1.3)
+if [ -f /etc/crowdsec/acquis.d/ufw.yaml ] && \
+   grep -q "vpn-node-ddos-protect" /etc/crowdsec/acquis.d/ufw.yaml 2>/dev/null; then
+    LEGACY_FOUND=1
+    rm -f /etc/crowdsec/acquis.d/ufw.yaml
+fi
+
+# 5) Legacy sysctl имя (v3.7 переехал 99-shieldnode.conf → 90-shieldnode.conf)
+if [ -f /etc/sysctl.d/99-shieldnode.conf ]; then
+    LEGACY_FOUND=1
+    rm -f /etc/sysctl.d/99-shieldnode.conf
+fi
+
+if [ "$LEGACY_FOUND" = "1" ]; then
+    systemctl daemon-reload
+    print_ok "Legacy-артефакты от ≤v3.12.x удалены"
+else
+    print_info "Legacy-артефактов не обнаружено (свежая установка)"
+fi
+
+# ==============================================================================
 # ШАГ 2: AUTO-DETECT (порты из фаервола, SSH порт, IP)
 # ==============================================================================
 
@@ -2850,7 +2926,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.13.1 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.13.2 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3108,7 +3184,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_MOBILE_RU_UPDATER="/usr/local/sbin/shieldnode-update-mobile-ru.sh"
 cat > "$SHIELD_MOBILE_RU_UPDATER" <<'MOBILE_RU_UPDATER_EOF'
 #!/bin/bash
-# shieldnode v3.13.1 — mobile-RU AS whitelist updater.
+# shieldnode v3.13.2 — mobile-RU AS whitelist updater.
 # Скачивает MaxMind GeoLite2-ASN-CSV, фильтрует по списку AS,
 # заполняет nft set mobile_ru_whitelist_v4.
 #
@@ -4586,7 +4662,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.13.1${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.13.2${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
     echo ""
 
@@ -5276,7 +5352,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.13.1 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.13.2 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
