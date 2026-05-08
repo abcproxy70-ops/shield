@@ -1,0 +1,10 @@
+# shieldnode scanner blocklist (seed)
+# nft set: scanner_blocklist_v4
+#
+# Этот файл объединяется с URL'ами из конфига:
+#   - shadow-netlab/traffic-guard-lists/antiscanner.list
+#   - shadow-netlab/traffic-guard-lists/government_networks.list
+#   - tread-lightly/CyberOK_Skipa_ips/skipa_cidr.txt
+#
+# Добавляй сюда IPs которые URL-источники пропускают.
+# Один IP или CIDR на строку, # = комментарий.
