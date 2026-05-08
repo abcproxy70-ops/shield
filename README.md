@@ -16,8 +16,12 @@ Bash-скрипт DDoS-защиты для VPN-нод (Reality / Xray / sing-box
   - `threat` — Spamhaus DROP + FireHOL Level 1 (high-confidence криминал)
   - `tor` — Tor exit nodes (опционально, `BLOCK_TOR=1`)
   - `custom` — личный список оператора (file-based + URL union)
-- **Mobile-RU AS whitelist** (v3.13.2): relaxed limits (ct=1000, newconn=2000/min)
+- **Mobile-RU AS whitelist** (v3.13.1): relaxed limits (ct=1000, newconn=2000/min)
   для МТС / T2 / МегаФон / Билайн через MaxMind GeoLite2-ASN
+- **GitHub auto-sync** (v3.14.0): `lists/custom.txt` синкается с репо каждые 6ч.
+  Локальные дополнения — в отдельном `custom-local.txt`, не перезаписываются.
+- **Version check** (v3.14.0): нода раз в день проверяет github на новую версию,
+  показывает `[upgrade] доступна v3.X.Y` в guard CLI
 - **CrowdSec** + nftables bouncer (SSH brute-force + community blocklist)
 - **guard CLI** — дашборд защиты с ASN/owner column для top attackers
 - **Aggregator**: журналы → sqlite events.db с per-IP analytics
@@ -89,6 +93,7 @@ sudo guard --json   # JSON-вывод для интеграций (Zabbix, Prome
 
 ## Версии
 
+- **v3.14.0** — GitHub auto-sync custom.txt (каждые 6ч) + version check для shieldnode.sh + guard CLI settings menu `[s]` (toggle ON/OFF auto-sync, version check, mobile-RU, tor + edit MAXMIND_LICENSE_KEY). Команды `sudo guard upgrade/sync/check`. Двухфайловая модель: `custom.txt` (github sync) + `custom-local.txt` (локальные дополнения)
 - **v3.13.2** — hotfix: миграция legacy-артефактов от ≤v3.12.x при reinstall (старые update-scanner-blocklist.sh, scanner-blocklist-update.timer и т.п. чистятся автоматически)
 - **v3.13.1** — hotfix: mobile-RU whitelist выше blocklist drops, удалён мёртвый counter, observability `[shield:mobile_ru_drop]`
 - **v3.13.0** — mobile-RU AS whitelist (МТС, T2, МегаФон, Билайн через MaxMind)
