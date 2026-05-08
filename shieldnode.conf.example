@@ -1,0 +1,116 @@
+# shieldnode v3.13.0 — пример конфигурации
+#
+# Этот файл ОПЦИОНАЛЕН. Если его НЕТ в /etc/shieldnode/shieldnode.conf
+# — используются hardcoded дефолты в скрипте (те что закомментированы ниже).
+#
+# Установка:
+#   sudo cp shieldnode.conf.example /etc/shieldnode/shieldnode.conf
+#   sudo nano /etc/shieldnode/shieldnode.conf
+#   sudo systemctl restart 'shieldnode-update@*.service'
+#
+# Синтаксис: bash array. Чтобы для одного set'а было НЕСКОЛЬКО URL'ов —
+# объединяй через запятую без пробелов.
+
+# ==============================================================================
+# v3.13.0: MOBILE-RU AS WHITELIST (CGNAT-friendly relaxed limits)
+# ==============================================================================
+# Российские мобильные операторы дают CGNAT с 50-200 абонентами на 1 IP.
+# При активной нагрузке такой IP может выдавать 600-1000 concurrent — что
+# превышает стандартный ct=400. Mobile-RU whitelist даёт RELAXED лимиты:
+#   - ct count:    400  → 1000   (CGNAT с 100-200 юзерами)
+#   - newconn rate: 500/min → 2000/min, burst 1000 → 4000
+#   - SYN/UDP rate-limit пропускаются для этих IPs (accept early)
+#
+# Включён по умолчанию (ENABLE_RU_MOBILE_WHITELIST=1). Без MAXMIND_LICENSE_KEY
+# работает как noop — set пустой, поведение идентично v3.12.0.
+#
+# Получить бесплатный ключ: https://www.maxmind.com/en/geolite2/signup
+#   1) Зарегистрироваться (email + пароль)
+#   2) В панели → "Manage License Keys" → "Generate New License Key"
+#   3) Скопировать key (формат: 40 alphanumeric символов)
+
+#ENABLE_RU_MOBILE_WHITELIST=1
+#MAXMIND_LICENSE_KEY=""    # обязательно для работы whitelist'а
+
+# Список AS — российские мобильные операторы (проверены через RIPEstat).
+# По умолчанию: МТС + T2/Tele2 + МегаФон + Билайн (13 AS).
+#MOBILE_RU_AS_LIST=(
+#    8359   # МТС PJSC
+#    28884  # МТС Siberia
+#    12958  # T2 Mobile (Tele2)
+#    15378  # T2 Mobile (бывший Yota)
+#    41330  # T2 Mobile Novosibirsk
+#    42437  # T2 Mobile Rostov
+#    48190  # T2 Mobile Ekaterinburg
+#    31133  # MegaFon
+#    31163  # MegaFon Kavkaz
+#    12714  # MegaFon-AS (бэкбон)
+#    3216   # Vimpelcom (Beeline)
+#    8402   # Corbina (Vimpelcom)
+#    16345  # Beeline-AS
+#)
+
+# Обновление раз в неделю (MaxMind релизит CSV втор/пят).
+#MOBILE_RU_UPDATE_INTERVAL="1w"
+
+# Минимум CIDR'ов после фильтрации. Если меньше — подозрительно (что-то
+# сломалось), set не обновляется.
+#MIN_ENTRIES_MOBILE_RU=100
+
+# ==============================================================================
+# v3.12.0: LOCAL BLOCKLISTS (file-based)
+# ==============================================================================
+# Путь к локальному .txt файлу для каждого set'а. Объединяется (union) с URL'ами.
+
+#LOCAL_BLOCKLISTS=(
+#    "scanner=/etc/shieldnode/lists/scanner.txt"
+#    "threat=/etc/shieldnode/lists/threat.txt"
+#    "tor=/etc/shieldnode/lists/tor.txt"
+#    "custom=/etc/shieldnode/lists/custom.txt"
+#)
+
+# ==============================================================================
+# v3.12.0: REMOTE BLOCKLISTS (URL-based)
+# ==============================================================================
+# Несколько URL'ов через запятую — объединение для одного set'а.
+# Если для set'а нет URL'ов — оставь "name=" (пустое значение).
+# Custom по умолчанию работает ТОЛЬКО на локальном файле.
+
+#REMOTE_BLOCKLISTS=(
+#    "scanner=https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list,https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list,https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
+#    "threat=https://www.spamhaus.org/drop/drop.txt,https://iplists.firehol.org/files/firehol_level1.netset"
+#    "tor=https://check.torproject.org/torbulkexitlist"
+#    "custom="
+#)
+
+# ==============================================================================
+# UPDATE INTERVALS (формат systemd OnUnitActiveSec)
+# ==============================================================================
+#SCANNER_UPDATE_INTERVAL="6h"
+#THREAT_UPDATE_INTERVAL="1d"
+#TOR_UPDATE_INTERVAL="1h"
+#CUSTOM_UPDATE_INTERVAL="6h"
+
+# ==============================================================================
+# MIN ENTRIES (sanity check против corrupted upstream)
+# ==============================================================================
+#MIN_ENTRIES_SCANNER=100
+#MIN_ENTRIES_THREAT=500
+#MIN_ENTRIES_TOR=100
+#MIN_ENTRIES_CUSTOM=0
+
+#FAIL_THRESHOLD=3
+
+# ==============================================================================
+# Примеры кастомизации
+# ==============================================================================
+
+# Пример 1: offline-mode (только локальные файлы)
+#REMOTE_BLOCKLISTS=("scanner=" "threat=" "tor=" "custom=")
+
+# Пример 2: только МТС в mobile-RU whitelist
+#MOBILE_RU_AS_LIST=(8359 28884)
+
+# Пример 3: реже обновлять (для слабого сервера)
+#SCANNER_UPDATE_INTERVAL="12h"
+#THREAT_UPDATE_INTERVAL="2d"
