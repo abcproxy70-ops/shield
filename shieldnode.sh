@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.13.2 (Commercial Edition) — HOTFIX
+#  VPN NODE DDoS PROTECTION v3.14.0 (Commercial Edition)
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
 #  - nftables threat-blocklist (Spamhaus DROP + FireHOL Level 1, v3.12.0)
@@ -13,11 +13,48 @@
 #  - nftables TCP MSS clamping (улучшает скорость VPN, устраняет фрагментацию)
 #  - Tor exit blocklist (опционально через BLOCK_TOR=1)
 #  - CrowdSec (SSH brute-force + community blocklist)
-#  - guard CLI — дашборд защиты с ASN/owner column для top attackers (v3.12.0)
+#  - guard CLI с settings menu [s] (v3.14.0)
+#  - GitHub auto-sync custom.txt (v3.14.0)
+#  - Version check для shieldnode.sh (v3.14.0)
 #  - Человекочитаемые логи в /var/log/shieldnode/events.log
-#  - Мгновенное отслеживание изменений в фаерволе через inotify
 #  - Опциональный конфиг /etc/shieldnode/shieldnode.conf (v3.12.0)
 #  - File-based blocklists в /etc/shieldnode/lists/*.txt (v3.12.0)
+#
+#  v3.14.0 changelog:
+#
+#    [GITHUB-SYNC] Глобальный custom.txt теперь синкается с github каждые 6ч.
+#      Раньше lists/custom.txt с github скачивался ТОЛЬКО при первой установке.
+#      После — нода жила со своей локальной копией. Если оператор обновлял
+#      custom.txt на github (новые IPs), существующие ноды не получали.
+#
+#      РЕШЕНИЕ — двухфайловая модель:
+#        - /etc/shieldnode/lists/custom.txt        ← read-only sync с github
+#        - /etc/shieldnode/lists/custom-local.txt  ← локальные дополнения
+#                                                    оператора конкретной ноды
+#
+#      Updater 'custom' читает ОБА файла и union'ит их в custom_blocklist_v4.
+#      Path-watcher следит за обоими — изменение любого триггерит обновление.
+#
+#      Новый sync-updater shieldnode-github-sync.{service,timer} раз в 6ч
+#      качает lists/custom.txt с github → перезаписывает локальный.
+#      Локальный custom-local.txt НЕ трогается.
+#
+#    [VERSION-CHECK] Раз в сутки нода проверяет github на новую версию
+#      shieldnode.sh. Парсит header `v3.X.Y` из первых строк и сравнивает
+#      с локальной. Результат в /var/lib/shieldnode/.upstream_version.
+#      Никаких автоматических апгрейдов — только информирование.
+#
+#      guard CLI на главном экране показывает '[upgrade] v3.X.Y доступна'
+#      если есть новая версия. Команда: 'sudo guard upgrade' = re-run
+#      установщика с github.
+#
+#    [GUARD-SETTINGS] Новый пункт меню [s] settings в guard CLI:
+#        - Auto-sync github custom.txt: ON/OFF
+#        - Check for shieldnode updates: ON/OFF
+#        - Mobile-RU whitelist: ON/OFF (live edit MAXMIND_LICENSE_KEY)
+#        - Tor exit blocklist: ON/OFF (live edit BLOCK_TOR)
+#      Изменения пишутся в /etc/shieldnode/shieldnode.conf, при необходимости
+#      рестартуют соответствующие timer'ы / service'ы.
 #
 #  v3.13.2 hotfix changelog:
 #
@@ -928,6 +965,15 @@ cscli_collection_installed() {
 # Можно переопределить через env (для тестинга на форке).
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
+# v3.14.0: версия для self-check
+SHIELDNODE_VERSION="3.14.0"
+
+# v3.14.0: настройки auto-sync (можно переопределить в shieldnode.conf)
+ENABLE_GITHUB_SYNC="${ENABLE_GITHUB_SYNC:-1}"
+ENABLE_VERSION_CHECK="${ENABLE_VERSION_CHECK:-1}"
+DEFAULT_GITHUB_SYNC_INTERVAL="6h"
+DEFAULT_VERSION_CHECK_INTERVAL="1d"
+
 # Каталоги
 SHIELD_ETC_DIR="/etc/shieldnode"
 SHIELD_LISTS_DIR="$SHIELD_ETC_DIR/lists"
@@ -962,7 +1008,7 @@ DEFAULT_LOCAL_BLOCKLISTS=(
     "scanner=$SHIELD_LISTS_DIR/scanner.txt"
     "threat=$SHIELD_LISTS_DIR/threat.txt"
     "tor=$SHIELD_LISTS_DIR/tor.txt"
-    "custom=$SHIELD_LISTS_DIR/custom.txt"
+    "custom=$SHIELD_LISTS_DIR/custom.txt,$SHIELD_LISTS_DIR/custom-local.txt"
 )
 
 # Объединение URL'ов через запятую → один set
@@ -1066,7 +1112,9 @@ if [ "${1:-}" = "--uninstall" ]; then
                 shieldnode-update@tor.timer     shieldnode-update@tor.service \
                 shieldnode-update@custom.timer  shieldnode-update@custom.service \
                 shieldnode-update@custom.path \
-                shieldnode-update@mobile_ru.timer shieldnode-update@mobile_ru.service; do
+                shieldnode-update@mobile_ru.timer shieldnode-update@mobile_ru.service \
+                shieldnode-github-sync.timer shieldnode-github-sync.service \
+                shieldnode-version-check.timer shieldnode-version-check.service; do
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
     done
@@ -1087,6 +1135,8 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /usr/local/sbin/shieldnode-aggregator.sh
     rm -f /usr/local/sbin/shieldnode-update-blocklist.sh
     rm -f /usr/local/sbin/shieldnode-update-mobile-ru.sh
+    rm -f /usr/local/sbin/shieldnode-github-sync.sh
+    rm -f /usr/local/sbin/shieldnode-version-check.sh
     rm -f /usr/local/sbin/shieldnode-defaults.sh
     rm -f /usr/local/bin/guard
     print_ok "Скрипты удалены (включая команду guard)"
@@ -2926,7 +2976,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.13.2 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.14.0 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3184,7 +3234,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_MOBILE_RU_UPDATER="/usr/local/sbin/shieldnode-update-mobile-ru.sh"
 cat > "$SHIELD_MOBILE_RU_UPDATER" <<'MOBILE_RU_UPDATER_EOF'
 #!/bin/bash
-# shieldnode v3.13.2 — mobile-RU AS whitelist updater.
+# shieldnode v3.14.0 — mobile-RU AS whitelist updater.
 # Скачивает MaxMind GeoLite2-ASN-CSV, фильтрует по списку AS,
 # заполняет nft set mobile_ru_whitelist_v4.
 #
@@ -3356,6 +3406,209 @@ MOBILE_RU_UPDATER_EOF
 chmod 0755 "$SHIELD_MOBILE_RU_UPDATER"
 print_ok "Mobile-RU updater: $SHIELD_MOBILE_RU_UPDATER"
 
+# 2.6) v3.14.0: GitHub sync updater — качает lists/custom.txt с github,
+#      обновляет /etc/shieldnode/lists/custom.txt (custom-local.txt не трогает).
+SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
+cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
+#!/bin/bash
+# shieldnode v3.14.0 — github sync для lists/custom.txt
+# Запускается через shieldnode-github-sync.timer (раз в 6ч).
+# Без интернета или 404 — оставляет существующий файл как есть.
+
+set -o pipefail
+export LANG=C LC_ALL=C
+
+LOG_TAG="shieldnode-github-sync"
+TARGET="/etc/shieldnode/lists/custom.txt"
+URL="$SHIELD_REPO_URL/lists/custom.txt"
+
+# Загружаем конфиг (опциональный)
+if [ -f /etc/shieldnode/shieldnode.conf ]; then
+    # shellcheck source=/dev/null
+    . /etc/shieldnode/shieldnode.conf
+fi
+
+# Если sync выключен в конфиге — exit
+if [ "\${ENABLE_GITHUB_SYNC:-1}" != "1" ]; then
+    logger -t "\$LOG_TAG" "ENABLE_GITHUB_SYNC=\${ENABLE_GITHUB_SYNC}, sync пропущен"
+    exit 0
+fi
+
+TMP=\$(mktemp)
+trap 'rm -f "\$TMP"' EXIT
+
+if ! curl -fsSL --max-time 30 --retry 2 "\$URL" -o "\$TMP" 2>/dev/null; then
+    logger -t "\$LOG_TAG" "WARN: не смог скачать \$URL — оставляю текущий \$TARGET"
+    exit 1
+fi
+
+if [ ! -s "\$TMP" ]; then
+    logger -t "\$LOG_TAG" "WARN: github вернул пустой файл — оставляю текущий"
+    exit 1
+fi
+
+# Sanity-check: новый файл должен быть валидным (хотя бы 1 IP-подобная строка
+# или хотя бы заголовок-комментарий — пустые тоже ОК для seed'ов).
+NEW_LINES=\$(wc -l < "\$TMP")
+NEW_LINES="\${NEW_LINES:-0}"
+
+# Сравниваем с текущим файлом — если идентичны, не делаем ничего
+if [ -f "\$TARGET" ] && cmp -s "\$TARGET" "\$TMP"; then
+    logger -t "\$LOG_TAG" "no-change: github custom.txt идентичен локальному"
+    exit 0
+fi
+
+# Атомарная замена
+mv "\$TMP" "\$TARGET"
+chmod 0644 "\$TARGET"
+logger -t "\$LOG_TAG" "sync OK: \$TARGET обновлён (\$NEW_LINES lines). path-watcher триггерит nft update."
+exit 0
+GITHUB_SYNC_EOF
+chmod 0755 "$SHIELD_GITHUB_SYNC_SCRIPT"
+print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
+
+# 2.7) v3.14.0: Version check updater — проверяет github на новую версию.
+SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
+cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
+#!/bin/bash
+# shieldnode v3.14.0 — version check
+# Запускается через shieldnode-version-check.timer (раз в день).
+# Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
+# Результат пишет в /var/lib/shieldnode/.upstream_version
+# guard CLI читает этот файл и показывает [upgrade] на главном экране.
+
+set -o pipefail
+export LANG=C LC_ALL=C
+
+LOG_TAG="shieldnode-version-check"
+STATE_DIR="/var/lib/shieldnode"
+mkdir -p "\$STATE_DIR"
+STATE_FILE="\$STATE_DIR/.upstream_version"
+URL="$SHIELD_REPO_URL/shieldnode.sh"
+LOCAL_VERSION="$SHIELDNODE_VERSION"
+
+if [ -f /etc/shieldnode/shieldnode.conf ]; then
+    # shellcheck source=/dev/null
+    . /etc/shieldnode/shieldnode.conf
+fi
+
+if [ "\${ENABLE_VERSION_CHECK:-1}" != "1" ]; then
+    rm -f "\$STATE_FILE"
+    exit 0
+fi
+
+# Качаем только первые 4KB (для парсинга версии достаточно)
+UPSTREAM_HEADER=\$(curl -fsSL --max-time 10 --range 0-4095 "\$URL" 2>/dev/null)
+if [ -z "\$UPSTREAM_HEADER" ]; then
+    logger -t "\$LOG_TAG" "WARN: не смог скачать header с \$URL"
+    exit 1
+fi
+
+# Ищем строку формата 'VPN NODE DDoS PROTECTION v3.X.Y' в первых строках
+UPSTREAM_VERSION=\$(echo "\$UPSTREAM_HEADER" | grep -oE 'VPN NODE DDoS PROTECTION v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+
+if [ -z "\$UPSTREAM_VERSION" ]; then
+    logger -t "\$LOG_TAG" "WARN: не смог распарсить версию из github header"
+    exit 1
+fi
+
+# Сравниваем (semver через sort -V)
+if [ "\$UPSTREAM_VERSION" = "\$LOCAL_VERSION" ]; then
+    # Та же версия — записываем для guard но без флага апгрейда
+    echo "current=\$LOCAL_VERSION" > "\$STATE_FILE"
+    echo "upstream=\$UPSTREAM_VERSION" >> "\$STATE_FILE"
+    echo "upgrade_available=0" >> "\$STATE_FILE"
+    echo "checked_at=\$(date +%s)" >> "\$STATE_FILE"
+    exit 0
+fi
+
+NEWER=\$(printf '%s\n%s\n' "\$LOCAL_VERSION" "\$UPSTREAM_VERSION" | sort -V | tail -1)
+if [ "\$NEWER" = "\$UPSTREAM_VERSION" ]; then
+    # Upstream новее
+    {
+        echo "current=\$LOCAL_VERSION"
+        echo "upstream=\$UPSTREAM_VERSION"
+        echo "upgrade_available=1"
+        echo "checked_at=\$(date +%s)"
+    } > "\$STATE_FILE"
+    logger -t "\$LOG_TAG" "Доступна новая версия: \$UPSTREAM_VERSION (текущая: \$LOCAL_VERSION). Run: sudo guard upgrade"
+else
+    # Local новее (dev-версия) — не показываем upgrade
+    {
+        echo "current=\$LOCAL_VERSION"
+        echo "upstream=\$UPSTREAM_VERSION"
+        echo "upgrade_available=0"
+        echo "checked_at=\$(date +%s)"
+    } > "\$STATE_FILE"
+fi
+exit 0
+VERSION_CHECK_EOF
+chmod 0755 "$SHIELD_VERSION_CHECK_SCRIPT"
+print_ok "Version-check updater: $SHIELD_VERSION_CHECK_SCRIPT"
+
+# Systemd units для github-sync и version-check
+cat > /etc/systemd/system/shieldnode-github-sync.service <<EOF
+[Unit]
+Description=Sync shieldnode custom.txt from github
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SHIELD_GITHUB_SYNC_SCRIPT
+EOF
+
+cat > /etc/systemd/system/shieldnode-github-sync.timer <<EOF
+[Unit]
+Description=Sync shieldnode custom.txt from github every $DEFAULT_GITHUB_SYNC_INTERVAL
+Requires=shieldnode-github-sync.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=$DEFAULT_GITHUB_SYNC_INTERVAL
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+cat > /etc/systemd/system/shieldnode-version-check.service <<EOF
+[Unit]
+Description=Check github for new shieldnode version
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SHIELD_VERSION_CHECK_SCRIPT
+EOF
+
+cat > /etc/systemd/system/shieldnode-version-check.timer <<EOF
+[Unit]
+Description=Check github for new shieldnode version every $DEFAULT_VERSION_CHECK_INTERVAL
+Requires=shieldnode-version-check.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=$DEFAULT_VERSION_CHECK_INTERVAL
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+if [ "${ENABLE_GITHUB_SYNC:-1}" = "1" ]; then
+    systemctl enable --now shieldnode-github-sync.timer >/dev/null 2>&1
+    print_ok "GitHub sync timer активен (раз в $DEFAULT_GITHUB_SYNC_INTERVAL)"
+fi
+if [ "${ENABLE_VERSION_CHECK:-1}" = "1" ]; then
+    systemctl enable --now shieldnode-version-check.timer >/dev/null 2>&1
+    print_ok "Version-check timer активен (раз в $DEFAULT_VERSION_CHECK_INTERVAL)"
+fi
+
 # 3) Templated systemd unit (обслуживает все 4 blocklist'а)
 cat > /etc/systemd/system/shieldnode-update@.service <<EOF
 [Unit]
@@ -3401,10 +3654,11 @@ make_timer mobile_ru "$DEFAULT_MOBILE_RU_UPDATE_INTERVAL"
 # 5) inotify path-watcher для custom (мгновенно реагирует на изменение файла)
 cat > /etc/systemd/system/shieldnode-update@custom.path <<EOF
 [Unit]
-Description=Watch custom blocklist file
+Description=Watch custom blocklist files (custom.txt + custom-local.txt)
 
 [Path]
 PathChanged=$SHIELD_LISTS_DIR/custom.txt
+PathChanged=$SHIELD_LISTS_DIR/custom-local.txt
 PathExists=$SHIELD_LISTS_DIR/custom.txt
 Unit=shieldnode-update@custom.service
 
@@ -3445,6 +3699,26 @@ for n in scanner threat tor custom; do
     prepare_seed_list "$n"
 done
 
+# v3.14.0: создаём custom-local.txt если нет (пустой с заголовком).
+# Этот файл оператор редактирует руками на ноде — github sync его не трогает.
+LOCAL_CUSTOM="$SHIELD_LISTS_DIR/custom-local.txt"
+if [ ! -e "$LOCAL_CUSTOM" ]; then
+    cat > "$LOCAL_CUSTOM" <<'LOCAL_HDR_EOF'
+# shieldnode custom-local blocklist (this node only)
+# nft set: custom_blocklist_v4 (объединяется с custom.txt)
+#
+# Этот файл — ЛОКАЛЬНЫЙ список этой конкретной ноды.
+# github auto-sync (если включён) НЕ трогает этот файл — только custom.txt.
+#
+# Добавить IP в ban на лету (path-watcher подхватит за <1сек):
+#   echo '198.51.100.42' | sudo tee -a /etc/shieldnode/lists/custom-local.txt
+#
+# Один IP или CIDR на строку, # = комментарий.
+
+LOCAL_HDR_EOF
+    chmod 0644 "$LOCAL_CUSTOM"
+fi
+
 # Опциональный shieldnode.conf — если оператор положил рядом со скриптом, копируем
 if [ -n "$SHIELD_SCRIPT_DIR" ] && [ -f "$SHIELD_SCRIPT_DIR/shieldnode.conf" ] && [ ! -f "$SHIELD_CONF_FILE" ]; then
     cp "$SHIELD_SCRIPT_DIR/shieldnode.conf" "$SHIELD_CONF_FILE"
@@ -3452,7 +3726,7 @@ if [ -n "$SHIELD_SCRIPT_DIR" ] && [ -f "$SHIELD_SCRIPT_DIR/shieldnode.conf" ] &&
     print_ok "Config: $SHIELD_CONF_FILE (из git-clone)"
 fi
 
-print_ok "Lists: $SHIELD_LISTS_DIR/{scanner,threat,tor,custom}.txt"
+print_ok "Lists: $SHIELD_LISTS_DIR/{scanner,threat,tor,custom,custom-local}.txt"
 
 # 7) Включаем и запускаем blocklists. Tor — только если BLOCK_TOR=1.
 # v3.13.0: mobile_ru — только если ENABLE_RU_MOBILE_WHITELIST=1 (по умолчанию ON,
@@ -4364,15 +4638,43 @@ Usage:
   sudo guard            snapshot + interactive menu
   sudo guard --once     snapshot only, no menu (for cron / monitoring)
   sudo guard --json     JSON output (for integrations)
+  sudo guard upgrade    re-run installer from github (apply latest version)
+  sudo guard sync       force github sync of custom.txt now
+  sudo guard check      force version check now
 
 Interactive menu:
   [1] active attacks            [4] scanner blocklist samples
   [2] crowdsec banned IPs       [6] recent history
   [3] whitelist IPs             [7] top attackers (all-time)
-                                [9] view full /var/log/shieldnode/events.log
+  [s] settings                  [9] view full /var/log/shieldnode/events.log
   [r] refresh                   [0] exit
 
 HELP
+        exit 0
+        ;;
+    upgrade)
+        # v3.14.0: re-run установщика с github
+        if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard upgrade"; exit 1; fi
+        REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
+        echo "Re-installing from $REPO_URL/shieldnode.sh ..."
+        exec bash <(curl -sL "$REPO_URL/shieldnode.sh")
+        ;;
+    sync)
+        if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard sync"; exit 1; fi
+        echo "Syncing lists/custom.txt from github..."
+        systemctl start shieldnode-github-sync.service
+        sleep 2
+        journalctl -t shieldnode-github-sync -n 5 --no-pager 2>/dev/null
+        exit 0
+        ;;
+    check)
+        if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard check"; exit 1; fi
+        echo "Checking for new version..."
+        systemctl start shieldnode-version-check.service
+        sleep 2
+        if [ -r /var/lib/shieldnode/.upstream_version ]; then
+            cat /var/lib/shieldnode/.upstream_version
+        fi
         exit 0
         ;;
 esac
@@ -4662,8 +4964,17 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.13.2${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.14.0${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
+
+    # v3.14.0: upgrade banner (если version-check нашёл новую версию)
+    if [ -r /var/lib/shieldnode/.upstream_version ]; then
+        UPGRADE_AVAIL=$(grep '^upgrade_available=' /var/lib/shieldnode/.upstream_version 2>/dev/null | cut -d= -f2)
+        UPSTREAM_VER=$(grep '^upstream=' /var/lib/shieldnode/.upstream_version 2>/dev/null | cut -d= -f2)
+        if [ "$UPGRADE_AVAIL" = "1" ] && [ -n "$UPSTREAM_VER" ]; then
+            echo -e "  ${Y}▲${N} ${B}upgrade available:${N} ${G}v$UPSTREAM_VER${N} — run ${C}sudo guard upgrade${N}"
+        fi
+    fi
     echo ""
 
     # ===== ACTIVE THREATS (right now) =====
@@ -5003,6 +5314,188 @@ show_full_log() {
     echo ""
 }
 
+# v3.14.0: settings menu — toggle ENABLE_* flags + edit MAXMIND_LICENSE_KEY
+show_settings_menu() {
+    local CONF="/etc/shieldnode/shieldnode.conf"
+    mkdir -p /etc/shieldnode
+    [ -f "$CONF" ] || touch "$CONF"
+
+    # Хелпер: читает текущее значение настройки (ищет в конфиге, fallback на default)
+    _read_setting() {
+        local key="$1" default="$2"
+        local val
+        val=$(grep -E "^${key}=" "$CONF" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+        if [ -n "$val" ]; then
+            echo "$val"
+        else
+            echo "$default"
+        fi
+    }
+
+    # Хелпер: пишет/обновляет настройку в конфиге (idempotent)
+    _write_setting() {
+        local key="$1" value="$2"
+        if grep -qE "^${key}=" "$CONF" 2>/dev/null; then
+            # Замена существующей строки (sed in-place)
+            sed -i -E "s|^${key}=.*|${key}=\"${value}\"|" "$CONF"
+        else
+            echo "${key}=\"${value}\"" >> "$CONF"
+        fi
+    }
+
+    while true; do
+        clear 2>/dev/null
+        local sync_state vc_state mobile_state tor_state mm_key
+        sync_state=$(_read_setting "ENABLE_GITHUB_SYNC" "1")
+        vc_state=$(_read_setting "ENABLE_VERSION_CHECK" "1")
+        mobile_state=$(_read_setting "ENABLE_RU_MOBILE_WHITELIST" "1")
+        tor_state=$(_read_setting "BLOCK_TOR" "0")
+        mm_key=$(_read_setting "MAXMIND_LICENSE_KEY" "")
+
+        # ON/OFF строки (зелёный для ON, серый для OFF)
+        local s1 s2 s3 s4
+        [ "$sync_state"   = "1" ] && s1="${G}ON ${N}" || s1="${DIM}OFF${N}"
+        [ "$vc_state"     = "1" ] && s2="${G}ON ${N}" || s2="${DIM}OFF${N}"
+        [ "$mobile_state" = "1" ] && s3="${G}ON ${N}" || s3="${DIM}OFF${N}"
+        [ "$tor_state"    = "1" ] && s4="${G}ON ${N}" || s4="${DIM}OFF${N}"
+
+        # Mobile-RU dependency hint: если ON но ключа нет — показываем WARN
+        local mobile_extra=""
+        if [ "$mobile_state" = "1" ] && [ -z "$mm_key" ]; then
+            mobile_extra=" ${Y}(no key — set empty)${N}"
+        elif [ -n "$mm_key" ]; then
+            mobile_extra=" ${DIM}(key: ${mm_key:0:8}…)${N}"
+        fi
+
+        echo ""
+        echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
+        echo -e "  ${B}Settings${N}                                                       "
+        echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
+        echo ""
+        echo -e "  [${B}1${N}] Auto-sync github custom.txt    $s1  ${DIM}(every 6h)${N}"
+        echo -e "  [${B}2${N}] Check for shieldnode updates  $s2  ${DIM}(every 1d)${N}"
+        echo -e "  [${B}3${N}] Mobile-RU whitelist           $s3 $mobile_extra"
+        echo -e "  [${B}4${N}] Tor exit blocklist            $s4"
+        echo ""
+        echo -e "  [${B}k${N}] Edit MAXMIND_LICENSE_KEY"
+        echo -e "  [${B}f${N}] Force github sync now"
+        echo -e "  [${B}v${N}] Force version check now"
+        echo ""
+        echo -e "  [${B}q${N}] Back to main menu"
+        echo ""
+        echo -e "  ${DIM}Config: $CONF${N}"
+        echo -ne "  ${B}>${N} "
+        read -r SC
+
+        case "$SC" in
+            1)
+                if [ "$sync_state" = "1" ]; then
+                    _write_setting "ENABLE_GITHUB_SYNC" "0"
+                    systemctl disable --now shieldnode-github-sync.timer >/dev/null 2>&1
+                    echo -e "  ${G}✓${N} GitHub sync ${R}disabled${N}"
+                else
+                    _write_setting "ENABLE_GITHUB_SYNC" "1"
+                    systemctl enable --now shieldnode-github-sync.timer >/dev/null 2>&1
+                    echo -e "  ${G}✓${N} GitHub sync ${G}enabled${N}"
+                fi
+                sleep 1
+                ;;
+            2)
+                if [ "$vc_state" = "1" ]; then
+                    _write_setting "ENABLE_VERSION_CHECK" "0"
+                    systemctl disable --now shieldnode-version-check.timer >/dev/null 2>&1
+                    rm -f /var/lib/shieldnode/.upstream_version
+                    echo -e "  ${G}✓${N} Version check ${R}disabled${N}"
+                else
+                    _write_setting "ENABLE_VERSION_CHECK" "1"
+                    systemctl enable --now shieldnode-version-check.timer >/dev/null 2>&1
+                    echo -e "  ${G}✓${N} Version check ${G}enabled${N}"
+                fi
+                sleep 1
+                ;;
+            3)
+                if [ "$mobile_state" = "1" ]; then
+                    _write_setting "ENABLE_RU_MOBILE_WHITELIST" "0"
+                    nft flush set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null
+                    echo -e "  ${G}✓${N} Mobile-RU whitelist ${R}disabled${N}"
+                else
+                    _write_setting "ENABLE_RU_MOBILE_WHITELIST" "1"
+                    if [ -z "$mm_key" ]; then
+                        echo -e "  ${Y}⚠${N} Включено, но MAXMIND_LICENSE_KEY не задан — set будет пустой"
+                        echo -e "    ${DIM}Получи бесплатный ключ: https://www.maxmind.com/en/geolite2/signup${N}"
+                        echo -e "    ${DIM}Затем в Settings → [k] Edit MAXMIND_LICENSE_KEY${N}"
+                    else
+                        # Триггерим updater сразу
+                        systemctl start shieldnode-update@mobile_ru.service >/dev/null 2>&1 &
+                        echo -e "  ${G}✓${N} Mobile-RU whitelist ${G}enabled${N} (обновление запущено)"
+                    fi
+                fi
+                sleep 1
+                ;;
+            4)
+                if [ "$tor_state" = "1" ]; then
+                    _write_setting "BLOCK_TOR" "0"
+                    rm -f /etc/shieldnode/block_tor
+                    nft flush set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null
+                    systemctl disable --now shieldnode-update@tor.timer >/dev/null 2>&1
+                    echo -e "  ${G}✓${N} Tor blocklist ${R}disabled${N}"
+                else
+                    _write_setting "BLOCK_TOR" "1"
+                    touch /etc/shieldnode/block_tor
+                    systemctl enable --now shieldnode-update@tor.timer >/dev/null 2>&1
+                    systemctl start shieldnode-update@tor.service >/dev/null 2>&1 &
+                    echo -e "  ${G}✓${N} Tor blocklist ${G}enabled${N} (загрузка запущена)"
+                fi
+                sleep 1
+                ;;
+            k|K)
+                echo ""
+                echo -e "  ${B}MAXMIND_LICENSE_KEY${N}"
+                echo -e "  ${DIM}Текущий: ${mm_key:-(не задан)}${N}"
+                echo -e "  ${DIM}Получить бесплатный ключ: https://www.maxmind.com/en/geolite2/signup${N}"
+                echo -ne "  Новый key (Enter — пропустить): "
+                read -r NEW_KEY
+                if [ -n "$NEW_KEY" ]; then
+                    _write_setting "MAXMIND_LICENSE_KEY" "$NEW_KEY"
+                    chmod 0600 "$CONF"
+                    echo -e "  ${G}✓${N} MAXMIND_LICENSE_KEY обновлён"
+                    if [ "$mobile_state" = "1" ]; then
+                        echo -e "  ${DIM}Триггерю обновление mobile-RU whitelist...${N}"
+                        systemctl start shieldnode-update@mobile_ru.service >/dev/null 2>&1 &
+                    fi
+                    sleep 1
+                fi
+                ;;
+            f|F)
+                echo ""
+                echo -e "  ${DIM}Запускаю github sync...${N}"
+                systemctl start shieldnode-github-sync.service
+                sleep 2
+                journalctl -t shieldnode-github-sync -n 3 --no-pager 2>/dev/null | sed 's/^/  /'
+                sleep 1
+                ;;
+            v|V)
+                echo ""
+                echo -e "  ${DIM}Запускаю version check...${N}"
+                systemctl start shieldnode-version-check.service
+                sleep 2
+                if [ -r /var/lib/shieldnode/.upstream_version ]; then
+                    echo ""
+                    sed 's/^/  /' /var/lib/shieldnode/.upstream_version
+                fi
+                sleep 1
+                ;;
+            q|Q|"")
+                return
+                ;;
+            *)
+                echo -e "  ${Y}Unknown: $SC${N}"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 # === MODE: JSON ===
 if [ "$MODE" = "json" ]; then
     collect_stats
@@ -5068,7 +5561,8 @@ while true; do
     echo -e "${C}│${N}  [${B}1${N}] Active attacks         [${B}2${N}] CrowdSec bans                   ${C}│${N}"
     echo -e "${C}│${N}  [${B}3${N}] Whitelist IPs          [${B}4${N}] Scanner blocklist               ${C}│${N}"
     echo -e "${C}│${N}  [${B}6${N}] Recent history         [${B}7${N}] Top attackers                   ${C}│${N}"
-    echo -e "${C}│${N}  [${B}8${N}] Unban all (suspect+confirmed)  [${B}9${N}] View full events.log    ${C}│${N}"
+    echo -e "${C}│${N}  [${B}8${N}] Unban all              [${B}9${N}] View full events.log            ${C}│${N}"
+    echo -e "${C}│${N}  [${B}s${N}] Settings (v3.14)                                           ${C}│${N}"
     echo -e "${C}├─────────────────────────────────────────────────────────────────┤${N}"
     echo -e "${C}│${N}  [${B}r${N}] Refresh                [${B}0${N}] Exit                            ${C}│${N}"
     echo -e "${C}└─────────────────────────────────────────────────────────────────┘${N}"
@@ -5084,6 +5578,7 @@ while true; do
         7) show_top_attackers    ;;
         8) unban_all             ;;
         9) show_full_log         ;;
+        s|S) show_settings_menu  ;;
         r|R|"") continue ;;
         0|q|quit|exit) clear 2>/dev/null; exit 0 ;;
         *) echo -e "  ${Y}Unknown: $CHOICE${N}" ;;
@@ -5352,7 +5847,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.13.2 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.14.0 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
@@ -5368,10 +5863,24 @@ elif [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" = "1" ] && [ -z "${MAXMIND_LICENSE_KEY
     echo -e "   • Mobile-RU:     ${YELLOW}отключён${NC} ${DIM}(нет MAXMIND_LICENSE_KEY в shieldnode.conf)${NC}"
 fi
 echo -e "   • Лимиты:        ct=400, new-conn=500/min ${DIM}(CGNAT-friendly)${NC}"
+# v3.14.0: статус auto-sync features
+if [ "${ENABLE_GITHUB_SYNC:-1}" = "1" ]; then
+    echo -e "   • GitHub sync:   ${GREEN}ON${NC}  ${DIM}(custom.txt каждые 6ч)${NC}"
+else
+    echo -e "   • GitHub sync:   ${DIM}OFF${NC}"
+fi
+if [ "${ENABLE_VERSION_CHECK:-1}" = "1" ]; then
+    echo -e "   • Version check: ${GREEN}ON${NC}  ${DIM}(раз в день)${NC}"
+else
+    echo -e "   • Version check: ${DIM}OFF${NC}"
+fi
 echo ""
 echo -e "  ${BOLD}Команды:${NC}"
-echo -e "   ${CYAN}sudo guard${NC}                — дашборд защиты"
+echo -e "   ${CYAN}sudo guard${NC}                — дашборд защиты + меню (включая [s] settings)"
 echo -e "   ${CYAN}sudo guard --once${NC}         — снимок без меню"
+echo -e "   ${CYAN}sudo guard upgrade${NC}        — обновить до новой версии с github"
+echo -e "   ${CYAN}sudo guard sync${NC}           — синк custom.txt прямо сейчас"
+echo -e "   ${CYAN}sudo guard check${NC}          — проверить новую версию прямо сейчас"
 echo -e "   ${CYAN}sudo bash $SCRIPT_NAME --uninstall${NC}  — удалить"
 echo ""
 if [ "${SSHD_PASSWORD_AUTH_ENABLED:-0}" = "1" ]; then
