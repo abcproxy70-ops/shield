@@ -1,0 +1,12 @@
+# shieldnode Tor exit blocklist (seed)
+# nft set: tor_exit_blocklist_v4
+#
+# АКТИВЕН ТОЛЬКО ПРИ BLOCK_TOR=1 при установке.
+#
+# Этот файл объединяется с URL'ами из конфига:
+#   - https://check.torproject.org/torbulkexitlist (~1500 active exit nodes)
+#
+# torproject.org обновляет официальный список ~раз в час.
+# Локальные дополнения тут — для известных Tor exits которые ещё не попали
+# в официальный список.
+# Один IP или CIDR на строку, # = комментарий.
