@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.15.3 (Commercial Edition) — OBSERVABILITY HOTFIX
+#  VPN NODE DDoS PROTECTION v3.16.1 (Commercial Edition) — PATH-WATCHER HOTFIX
 #
 #  v3.15.3 changelog:
 #    [OBSERVABILITY] Добавлены оставшиеся log prefix'ы для полного покрытия:
@@ -1029,8 +1029,8 @@ cscli_collection_installed() {
 # Можно переопределить через env (для тестинга на форке).
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
-# v3.15.2: версия для self-check
-SHIELDNODE_VERSION="3.15.3"
+# v3.16.1: версия для self-check
+SHIELDNODE_VERSION="3.16.1"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1634,6 +1634,21 @@ if command -v ufw >/dev/null 2>&1; then
         FIREWALL_TYPE="ufw"
         UFW_RULES_COUNT=$(LANG=C LC_ALL=C ufw status numbered 2>/dev/null | grep -cE "^\[ ?[0-9]+\]")
         print_ok "Фаервол: ${BOLD}UFW активен${NC} (${UFW_RULES_COUNT} правил)"
+
+        # v3.16.0 (Variant C): включаем UFW logging если выключен.
+        # UFW дропы (на закрытые порты) тогда станут видимы в kernel.log,
+        # aggregator парсит их в events.db с type='ufw_block' → видно в
+        # guard CLI top-attackers все атаки, а не только наши shieldnode.
+        UFW_LOG_LEVEL=$(LANG=C LC_ALL=C ufw status verbose 2>/dev/null | grep -oE "^Logging: (on|off)( \([a-z]+\))?" | head -1)
+        if echo "$UFW_LOG_LEVEL" | grep -q "off"; then
+            print_info "UFW logging выключен — включаю 'low' для observability"
+            ufw logging low >/dev/null 2>&1 && print_ok "UFW logging: low (atypical packets)"
+        elif [ -z "$UFW_LOG_LEVEL" ]; then
+            # На некоторых дистрах ufw верх. case или новый формат — не парсим, оставляем
+            true
+        else
+            print_info "UFW logging уже включён ($UFW_LOG_LEVEL) — оставляю как есть"
+        fi
     fi
 fi
 
@@ -3084,7 +3099,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.15.3 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.16.1 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3343,7 +3358,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.15.3 — github sync для lists/custom.txt
+# shieldnode v3.16.1 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3403,7 +3418,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.15.3 — version check
+# shieldnode v3.16.1 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -3548,6 +3563,10 @@ Description=Update shieldnode %i blocklist
 After=network-online.target shieldnode-nftables.service
 Wants=network-online.target
 Requires=shieldnode-nftables.service
+# v3.16.1: при rapid edit файла path-watcher может триггерить service'ы
+# серией. Расширяем лимит запусков чтобы избежать unit-start-limit-hit.
+StartLimitBurst=30
+StartLimitIntervalSec=60
 
 [Service]
 Type=oneshot
@@ -3587,6 +3606,12 @@ make_timer mobile_ru "$DEFAULT_MOBILE_RU_UPDATE_INTERVAL"
 cat > /etc/systemd/system/shieldnode-update@custom.path <<EOF
 [Unit]
 Description=Watch custom blocklist files (custom.txt + custom-local.txt)
+# v3.16.1: при rapid edit файла (например 'tee -a' через скрипт) path-watcher
+# может триггерить updater несколько раз в секунду → systemd default
+# (StartLimitBurst=5 / Interval=10s) выключает unit как 'unit-start-limit-hit'.
+# Расширяем лимит: 30 запусков за минуту.
+StartLimitBurst=30
+StartLimitIntervalSec=60
 
 [Path]
 PathChanged=$SHIELD_LISTS_DIR/custom.txt
@@ -3697,6 +3722,11 @@ for n in "${ENABLED_LISTS[@]}"; do
 done
 
 # Path-watcher для custom (всегда активен независимо от BLOCK_TOR)
+# v3.16.1: при reinstall может быть unit в failed-state из-за прошлых
+# StartLimit hit'ов. Сбрасываем перед перезапуском.
+systemctl reset-failed shieldnode-update@custom.path 2>/dev/null
+systemctl reset-failed 'shieldnode-update@*.service' 2>/dev/null
+systemctl daemon-reload
 systemctl enable --now shieldnode-update@custom.path >/dev/null 2>&1
 
 print_ok "Blocklists активны: $(
@@ -4291,6 +4321,8 @@ NEW_CURSOR=$(grep -oE '^-- cursor: .+$' "$TMP" | tail -1 | sed 's/^-- cursor: //
 # Формат kernel-лога: "[shield:scanner] IN=eth0 SRC=85.142.100.2 DST=... PROTO=TCP DPT=8443 ..."
 declare -A scanner_ips ddos_ips tor_ips threat_ips custom_ips mobile_ru_ips conn_flood_ips newconn_flood_ips
 declare -A tcp_invalid_ips fib_spoof_ips syn_escalate_ips udp_escalate_ips
+# v3.16.0: UFW дропы (если оператор включил 'ufw logging on')
+declare -A ufw_block_ips ufw_block_ports
 # v3.5: для events.log — собираем порт назначения и тип flood'а
 declare -A ddos_ports ddos_proto
 
@@ -4338,6 +4370,12 @@ while IFS='|' read -r kind ip port proto; do
             ;;
         udp_escalate)
             [ -n "$ip" ] && udp_escalate_ips[$ip]=$((${udp_escalate_ips[$ip]:-0} + 1))
+            ;;
+        ufw_block)
+            if [ -n "$ip" ]; then
+                ufw_block_ips[$ip]=$((${ufw_block_ips[$ip]:-0} + 1))
+                [ -n "$port" ] && ufw_block_ports[$ip]="$port"
+            fi
             ;;
     esac
 done < <(awk '
@@ -4414,6 +4452,15 @@ done < <(awk '
             if (ip != "") print "udp_escalate|" ip "||"
         }
     }
+    # v3.16.0: UFW BLOCK дропы (когда оператор включил ufw logging on)
+    # Формат: "[UFW BLOCK] IN=ens3 OUT= MAC=... SRC=1.2.3.4 DST=... DPT=22 ..."
+    # Включает [UFW BLOCK] и [UFW LIMIT BLOCK]. AUDIT мы НЕ парсим (это accept'ы).
+    /\[UFW (LIMIT )?BLOCK\]/ {
+        ip=""; port=""
+        if (match($0, /SRC=[^ ]+/))  ip   = substr($0, RSTART+4, RLENGTH-4)
+        if (match($0, /DPT=[0-9]+/)) port = substr($0, RSTART+4, RLENGTH-4)
+        if (ip != "") print "ufw_block|" ip "|" port "|"
+    }
 ' "$TMP")
 
 # v3.5: пишем человекочитаемые строки в events.log
@@ -4483,6 +4530,12 @@ TS=$(date '+%Y-%m-%d %H:%M:%S')
     for ip in "${!udp_escalate_ips[@]}"; do
         cnt=${udp_escalate_ips[$ip]}
         echo "[$TS] UDP-ESCALATE ip=$ip hits=$cnt (suspect→confirmed via UDP-flood — banned 1h)"
+    done
+    # v3.16.0: UFW BLOCK дропы (на закрытые порты)
+    for ip in "${!ufw_block_ips[@]}"; do
+        cnt=${ufw_block_ips[$ip]}
+        port="${ufw_block_ports[$ip]:-?}"
+        echo "[$TS] UFW-BLOCK ip=$ip dpt=$port hits=$cnt (port scan / closed port)"
     done
 } >> "$EVENTS_LOG" 2>/dev/null
 
@@ -4585,6 +4638,11 @@ NOW=$(date +%s)
         cnt=${udp_escalate_ips[$ip]}
         echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('udp_escalate', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
     done
+    # v3.16.0: UFW BLOCK events
+    for ip in "${!ufw_block_ips[@]}"; do
+        cnt=${ufw_block_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('ufw_block', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
     if [ -n "$NEW_CURSOR" ]; then
         # Экранируем одинарные кавычки в cursor
         ESC_CURSOR=$(echo "$NEW_CURSOR" | sed "s/'/''/g")
@@ -4606,9 +4664,10 @@ TOTAL_TCP_INVALID=${#tcp_invalid_ips[@]}
 TOTAL_FIB_SPOOF=${#fib_spoof_ips[@]}
 TOTAL_SYN_ESC=${#syn_escalate_ips[@]}
 TOTAL_UDP_ESC=${#udp_escalate_ips[@]}
-TOTAL_ANY=$((TOTAL_SCANNERS + TOTAL_DDOS + TOTAL_TOR + TOTAL_THREAT + TOTAL_CUSTOM + TOTAL_MOBILE_RU + TOTAL_CONN_FLOOD + TOTAL_NEWCONN_FLOOD + TOTAL_TCP_INVALID + TOTAL_FIB_SPOOF + TOTAL_SYN_ESC + TOTAL_UDP_ESC))
+TOTAL_UFW_BLOCK=${#ufw_block_ips[@]}
+TOTAL_ANY=$((TOTAL_SCANNERS + TOTAL_DDOS + TOTAL_TOR + TOTAL_THREAT + TOTAL_CUSTOM + TOTAL_MOBILE_RU + TOTAL_CONN_FLOOD + TOTAL_NEWCONN_FLOOD + TOTAL_TCP_INVALID + TOTAL_FIB_SPOOF + TOTAL_SYN_ESC + TOTAL_UDP_ESC + TOTAL_UFW_BLOCK))
 if [ $TOTAL_ANY -gt 0 ]; then
-    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS, ddos=$TOTAL_DDOS, tor=$TOTAL_TOR, threat=$TOTAL_THREAT, custom=$TOTAL_CUSTOM, mobile_ru=$TOTAL_MOBILE_RU, conn_flood=$TOTAL_CONN_FLOOD, newconn_flood=$TOTAL_NEWCONN_FLOOD, tcp_invalid=$TOTAL_TCP_INVALID, fib_spoof=$TOTAL_FIB_SPOOF, syn_esc=$TOTAL_SYN_ESC, udp_esc=$TOTAL_UDP_ESC unique IPs"
+    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS, ddos=$TOTAL_DDOS, tor=$TOTAL_TOR, threat=$TOTAL_THREAT, custom=$TOTAL_CUSTOM, mobile_ru=$TOTAL_MOBILE_RU, conn_flood=$TOTAL_CONN_FLOOD, newconn_flood=$TOTAL_NEWCONN_FLOOD, tcp_invalid=$TOTAL_TCP_INVALID, fib_spoof=$TOTAL_FIB_SPOOF, syn_esc=$TOTAL_SYN_ESC, udp_esc=$TOTAL_UDP_ESC, ufw_block=$TOTAL_UFW_BLOCK unique IPs"
 fi
 AGG_EOF
 
@@ -5019,7 +5078,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.15.3${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.16.1${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -5878,7 +5937,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.15.3 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.16.1 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
