@@ -3106,7 +3106,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.16.1 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.16.3 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3365,7 +3365,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.16.1 — github sync для lists/custom.txt
+# shieldnode v3.16.3 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3425,7 +3425,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.16.1 — version check
+# shieldnode v3.16.3 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -5108,7 +5108,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.16.1${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.16.3${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -5979,7 +5979,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.16.1 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.16.3 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
