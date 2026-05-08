@@ -1,7 +1,11 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.16.2 (Commercial Edition) — CRITICAL HOTFIX
+#  VPN NODE DDoS PROTECTION v3.16.3 (Commercial Edition) — BOUNCER RACE FIX
+#  v3.16.3: bouncer pre-inst hook на Ubuntu 24.04 с custom kernel flush'ил
+#           nftables → наша table исчезала после установки. Добавлен
+#           re-load nft template после bouncer setup + retry в smoke-test.
+#
 #  v3.16.2: aggregator падал с syntax error на /\[UFW (LIMIT )?BLOCK\]/ —
 #           bash heredoc интерпретировал () как subshell. Заменено на 2
 #           отдельные регулярки без capture groups.
@@ -1032,8 +1036,8 @@ cscli_collection_installed() {
 # Можно переопределить через env (для тестинга на форке).
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
-# v3.16.2: версия для self-check
-SHIELDNODE_VERSION="3.16.2"
+# v3.16.3: версия для self-check
+SHIELDNODE_VERSION="3.16.3"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -4136,6 +4140,20 @@ else
     print_info "Логи: journalctl -u crowdsec -u crowdsec-firewall-bouncer -n 50"
 fi
 
+# v3.16.3 BUG-FIX: bouncer pre-inst hook на некоторых дистрах (Ubuntu 24.04
+# с custom kernel) может flush'нуть nftables ruleset → наша table inet
+# ddos_protect исчезает. Восстанавливаем её принудительной перезагрузкой
+# nft конфига после установки bouncer'а.
+if ! nft list table inet ddos_protect >/dev/null 2>&1; then
+    print_warn "Table inet ddos_protect исчезла после установки bouncer'а — восстанавливаю"
+    if nft -f /etc/nftables.d/ddos-protect.conf 2>/dev/null; then
+        print_ok "Table inet ddos_protect восстановлена"
+        systemctl restart shieldnode-nftables.service >/dev/null 2>&1
+    else
+        print_error "Не удалось восстановить — проверь: sudo nft -f /etc/nftables.d/ddos-protect.conf"
+    fi
+fi
+
 # ============================================================================
 # v3.10.3 BUG-11 SECURITY FIX: добавляем mgmt IPs в CrowdSec whitelist
 # ============================================================================
@@ -5710,9 +5728,21 @@ print_status "Smoke-test: проверяю что защита реально а
 SMOKE_FAIL=0
 
 # 1. Таблица создана?
+# v3.16.3: если нет — пробуем re-load один раз (например bouncer pre-inst flushed)
+if ! nft list table inet ddos_protect >/dev/null 2>&1; then
+    print_warn "Таблица inet ddos_protect отсутствует — пробую перезагрузить"
+    nft -f /etc/nftables.d/ddos-protect.conf 2>/dev/null
+    sleep 1
+    systemctl restart shieldnode-nftables.service >/dev/null 2>&1
+    sleep 2
+fi
+
 if ! nft list table inet ddos_protect >/dev/null 2>&1; then
     print_error "FAIL: таблица inet ddos_protect не создана"
+    print_info "Manual fix: sudo nft -f /etc/nftables.d/ddos-protect.conf"
     SMOKE_FAIL=1
+else
+    print_ok "Smoke: таблица inet ddos_protect создана"
 fi
 
 # 2. protected_ports_tcp непустой если в UFW есть TCP-правила
