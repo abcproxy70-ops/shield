@@ -1,0 +1,10 @@
+# shieldnode threat blocklist (seed)
+# nft set: threat_blocklist_v4
+#
+# Этот файл объединяется с URL'ами из конфига:
+#   - Spamhaus DROP (https://www.spamhaus.org/drop/drop.txt)
+#   - FireHOL Level 1 (https://iplists.firehol.org/files/firehol_level1.netset)
+#
+# Spamhaus + FireHOL дают ~5000+ IPs (high-confidence криминальные сети).
+# Локальные дополнения тут — для специфичных нод/регионов.
+# Один IP или CIDR на строку, # = комментарий.
