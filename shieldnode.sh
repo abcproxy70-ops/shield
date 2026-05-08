@@ -1,18 +1,127 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.11.3 (Commercial Edition) — HOTFIX
+#  VPN NODE DDoS PROTECTION v3.13.1 (Commercial Edition) — HOTFIX
 #  - nftables rate-limit (kernel-level SYN flood protection, IPv4-only)
 #  - nftables scanner-blocklist (pre-emptive drop известных сканеров)
+#  - nftables threat-blocklist (Spamhaus DROP + FireHOL Level 1, v3.12.0)
+#  - nftables custom-blocklist (operator personal IPs, v3.12.0)
+#  - nftables mobile-RU AS whitelist (CGNAT-friendly, v3.13.0+)
 #  - nftables connection-flood + slowloris защита (PROPER per-IP ct count)
 #  - nftables TCP flag sanity (drop invalid combinations)
 #  - nftables anti-spoofing (fib saddr — стронгер чем rp_filter loose)
 #  - nftables TCP MSS clamping (улучшает скорость VPN, устраняет фрагментацию)
 #  - Tor exit blocklist (опционально через BLOCK_TOR=1)
 #  - CrowdSec (SSH brute-force + community blocklist)
-#  - guard CLI — снимок состояния защиты + кнопка [8] Unban all
+#  - guard CLI — дашборд защиты с ASN/owner column для top attackers (v3.12.0)
 #  - Человекочитаемые логи в /var/log/shieldnode/events.log
 #  - Мгновенное отслеживание изменений в фаерволе через inotify
+#  - Опциональный конфиг /etc/shieldnode/shieldnode.conf (v3.12.0)
+#  - File-based blocklists в /etc/shieldnode/lists/*.txt (v3.12.0)
+#
+#  v3.13.1 hotfix changelog:
+#
+#    [BUG-MOBILE-RU-ORDER] В v3.13.0 mobile_ru_whitelist стоял ПОСЛЕ
+#      threat/scanner/custom/tor blocklist drop'ов в prerouting. Это значит:
+#      если mobile-RU CIDR попал в один из blocklist'ов (например retail
+#      pool 90.150.64.0/20 в gov_networks scanner-list), весь /20 дропался
+#      ДО проверки whitelist'а. Семантика "whitelist выигрывает" не работала.
+#
+#      FIX: правила mobile_ru_whitelist'а перенесены ВЫШЕ всех blocklist
+#      drop'ов в prerouting — сразу после manual_whitelist. Теперь mobile-RU
+#      IP проходит relaxed-проверки и accept'ится, минуя scanner/threat/custom
+#      blocklist'ы. Реальные атаки всё ещё ловятся через ct=1000 / 2000-newconn.
+#
+#    [BUG-DEAD-COUNTER] Counter mobile_ru_newconn_flood_v4 был определён в
+#      template, но никогда не инкрементировался — newconn-overflow проходил
+#      через общий newconn_overflow chain со стандартными counters.
+#      Guard CLI всегда показывал 0 для этого counter'а.
+#
+#      FIX: counter удалён из template и из guard CLI. Newconn drops для
+#      mobile-RU теперь идут через стандартный newconn_flood_v4 (правильно —
+#      это не отличается от обычной overflow-логики).
+#
+#    [OBSERVABILITY] Добавлен log prefix '[shield:mobile_ru_drop]' для
+#      mobile_ru_conn_flood_v4 (когда CGNAT превысил даже relaxed-лимит
+#      ct>1000). Aggregator парсит этот prefix → events.db с type='mobile_ru'.
+#      Per-IP analytics для mobile-RU drops теперь работает.
+#
+#  v3.13.0 changelog:
+#
+#    [MOBILE-RU-WHITELIST] Российские мобильные операторы (МТС, T2/Tele2,
+#      МегаФон, Билайн) выдают CGNAT-IP с 50-200 абонентами за один IP.
+#      Даже после CGNAT-fix v3.12.0 (ct=400) бывают ложные срабатывания —
+#      когда несколько активных юзеров одновременно дают пик 400+ conn.
+#
+#      РЕШЕНИЕ: отдельный nft set mobile_ru_whitelist_v4 (interval, auto-merge,
+#      ~5000-10000 CIDR'ов) с ОТДЕЛЬНЫМИ relaxed limits:
+#         - ct count: 400 → 1000  (массивный CGNAT)
+#         - newconn:  500/min → 2000/min, burst 1000 → 4000
+#         - SYN/UDP rate-limit остаются (защита от реальных flood-атак)
+#
+#      Whitelist'нутые AS (12 шт., проверены через RIPEstat):
+#         AS8359 MTS, AS28884 MTS Siberia
+#         AS12958 T2, AS15378 T2 (Yota), AS41330 T2 NSK, AS42437 T2 RND, AS48190 T2 EKB
+#         AS31133 MegaFon, AS31163 MegaFon Kavkaz, AS12714 MegaFon
+#         AS3216 Vimpelcom, AS8402 Corbina, AS16345 Beeline
+#
+#      ИСТОЧНИК: MaxMind GeoLite2-ASN-CSV (бесплатный, license key).
+#      Обновляется раз в неделю (MaxMind релизит втор/пят).
+#
+#      БЕЗ KEY: установка продолжается с WARN, set остаётся пустым,
+#      поведение идентично v3.12.0. Включается заданием в /etc/shieldnode/shieldnode.conf:
+#         MAXMIND_LICENSE_KEY="abcd1234..."
+#
+#      OBSERVABILITY: updater логирует overlap c scanner_blocklist'ом
+#      (если ваш AS попал в чей-то scanner-list).
+#
+#  v3.12.0 changelog:
+#
+#    [CGNAT FIX] Российские мобильные операторы (T2/Tele2 AS12958/AS15378/
+#      AS48190, МТС AS8359, МегаФон AS25513) выдают CGNAT-IP с 200-350
+#      concurrent connections от одного IP к одному dst-port. Старые лимиты
+#      (ct count 150, new-conn 200/min, suspect→confirmed бан 1h) банили
+#      легитимных мобильных юзеров.
+#
+#      FIX:
+#        - ct count: 150 → 400 (CGNAT-friendly, ловит slowloris >400)
+#        - new-conn rate: 200/min burst 500 → 500/min burst 1000
+#        - confirmed_attack timeout: 1h → 15min (быстрая разблокировка
+#          false-positive CGNAT, реальная атака возобновится → re-ban)
+#
+#      Регресс: ct count 400 ловит реальные slowloris (200-500 conn). UDP
+#      rate-limit (600/sec) и SYN rate-limit (300/sec) не трогали.
+#
+#    [BLOCKLISTS-V2] Новая архитектура blocklists. Раньше: 2 жёстко зашитых
+#      updater'а (scanner, tor) с дублирующимся кодом. Теперь: единый
+#      универсальный updater /usr/local/sbin/shieldnode-update-blocklist.sh
+#      обслуживает 4 blocklist'а (scanner, threat, tor, custom).
+#
+#      Возможности:
+#        - File-based lists: оператор кладёт IPs в /etc/shieldnode/lists/*.txt
+#        - URL-based: дефолтные источники + переопределение через конфиг
+#        - Union: file + URL объединяются для одного set'а
+#        - Опциональный /etc/shieldnode/shieldnode.conf (override defaults)
+#        - Templated systemd units: shieldnode-update@<name>.{service,timer}
+#        - Path-watcher для custom.txt (inotify trigger на изменение файла)
+#
+#      Парсер поддерживает Spamhaus (";SBL"), FireHOL (комментарии),
+#      MISP/CIRCL JSON, plain IP/CIDR.
+#
+#    [GUARD-CLI-v2] Главный экран guard переделан:
+#        - Active threats (верхний блок) — текущее состояние банов
+#        - Top attackers с ASN/owner column через ipinfo.io (кэш 7d в events.db)
+#        - Today drops/bytes по типам (scanner, threat, custom, tor, attack)
+#        - Меньше кнопок (1/2/3/4/u/r/q вместо 1-8)
+#
+#    [INSTALL-UI] Сжатый final summary (~10 строк вместо 100). Шаги установки
+#      объединены: меньше зелёных галочек, больше сигнала.
+#
+#    [PIPE-MODE] При установке через `bash <(curl ...)` скрипт сам скачивает
+#      дефолтные /etc/shieldnode/lists/*.txt с github. При git-clone установке
+#      использует ./lists/ из репо.
+#
+#    [v3.12.0 OPEN] Российские мобильные whitelist (AS-based) — отложено в v3.13.
 #
 #  v3.11.3 hotfix changelog:
 #
@@ -793,6 +902,112 @@ cscli_collection_installed() {
 }
 
 # ==============================================================================
+# v3.12.0 GLOBAL CONFIG (paths, repo URL, defaults)
+# ==============================================================================
+
+# Github repo для скачивания дефолтных lists/*.txt при pipe-mode установке.
+# Можно переопределить через env (для тестинга на форке).
+SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
+
+# Каталоги
+SHIELD_ETC_DIR="/etc/shieldnode"
+SHIELD_LISTS_DIR="$SHIELD_ETC_DIR/lists"
+SHIELD_CONF_FILE="$SHIELD_ETC_DIR/shieldnode.conf"
+SHIELD_DEFAULTS_FILE="/usr/local/sbin/shieldnode-defaults.sh"
+SHIELD_UPDATER_SCRIPT="/usr/local/sbin/shieldnode-update-blocklist.sh"
+SHIELD_STATE_DIR="/var/lib/shieldnode"
+
+# v3.12.0: detect pipe-mode (curl | bash) vs git-clone-mode (./shieldnode.sh)
+# Pipe-mode → BASH_SOURCE[0] = /dev/fd/* или похожее → нет ./lists рядом со скриптом
+# Git-mode → BASH_SOURCE[0] — реальный файл, рядом может лежать ./lists/
+SHIELD_SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SHIELD_PIPE_MODE=0
+case "$SHIELD_SCRIPT_PATH" in
+    /dev/fd/*|/proc/*|bash|-bash|sh|-sh|"")
+        SHIELD_PIPE_MODE=1
+        SHIELD_SCRIPT_DIR=""
+        ;;
+    *)
+        if [ -f "$SHIELD_SCRIPT_PATH" ]; then
+            SHIELD_SCRIPT_DIR="$(cd "$(dirname "$SHIELD_SCRIPT_PATH")" && pwd)"
+        else
+            SHIELD_PIPE_MODE=1
+            SHIELD_SCRIPT_DIR=""
+        fi
+        ;;
+esac
+
+# v3.12.0: дефолтные blocklist sources. Если /etc/shieldnode/shieldnode.conf
+# существует — он переопределит эти массивы (через source).
+DEFAULT_LOCAL_BLOCKLISTS=(
+    "scanner=$SHIELD_LISTS_DIR/scanner.txt"
+    "threat=$SHIELD_LISTS_DIR/threat.txt"
+    "tor=$SHIELD_LISTS_DIR/tor.txt"
+    "custom=$SHIELD_LISTS_DIR/custom.txt"
+)
+
+# Объединение URL'ов через запятую → один set
+DEFAULT_REMOTE_BLOCKLISTS=(
+    "scanner=https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list,https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list,https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
+    "threat=https://www.spamhaus.org/drop/drop.txt,https://iplists.firehol.org/files/firehol_level1.netset"
+    "tor=https://check.torproject.org/torbulkexitlist"
+    # custom: только локальный файл, без URL
+    "custom="
+)
+
+DEFAULT_SCANNER_UPDATE_INTERVAL="6h"
+DEFAULT_THREAT_UPDATE_INTERVAL="1d"
+DEFAULT_TOR_UPDATE_INTERVAL="1h"
+DEFAULT_CUSTOM_UPDATE_INTERVAL="6h"   # для custom: timer редкий, основной trigger — path-watcher
+
+DEFAULT_MIN_ENTRIES_SCANNER=100
+DEFAULT_MIN_ENTRIES_THREAT=500
+DEFAULT_MIN_ENTRIES_TOR=100
+DEFAULT_MIN_ENTRIES_CUSTOM=0
+
+DEFAULT_FAIL_THRESHOLD=3
+
+# nft set names — для совместимости с v3.11.x state на проде сохраняем
+# имя tor_exit_blocklist_v4 (старое). Маппинг: имя в updater'е → реальный nft set.
+shield_nft_set_name() {
+    case "$1" in
+        scanner)    echo "scanner_blocklist_v4" ;;
+        threat)     echo "threat_blocklist_v4"  ;;
+        tor)        echo "tor_exit_blocklist_v4" ;;   # legacy compat
+        custom)     echo "custom_blocklist_v4"  ;;
+        mobile_ru)  echo "mobile_ru_whitelist_v4" ;;  # v3.13.0
+        *) return 1 ;;
+    esac
+}
+
+# v3.13.0: mobile-RU whitelist defaults
+ENABLE_RU_MOBILE_WHITELIST="${ENABLE_RU_MOBILE_WHITELIST:-1}"
+MAXMIND_LICENSE_KEY="${MAXMIND_LICENSE_KEY:-}"
+
+# Список AS — российские мобильные операторы (CGNAT pool'ы).
+# Проверены через RIPEstat: stat.ripe.net/data/as-overview/data.json?resource=ASxxxx
+# Включены: явные mobile/Vimpelcom AS. Исключены: МГТС fixed-line (AS25513),
+# Mod MVNO (AS39855), gov-only AS.
+DEFAULT_MOBILE_RU_AS_LIST=(
+    8359   # МТС PJSC
+    28884  # МТС Siberia
+    12958  # T2 Mobile (Tele2)
+    15378  # T2 Mobile (бывший Yota)
+    41330  # T2 Mobile Novosibirsk
+    42437  # T2 Mobile Rostov
+    48190  # T2 Mobile Ekaterinburg
+    31133  # MegaFon
+    31163  # MegaFon Kavkaz
+    12714  # MegaFon-AS (бэкбон)
+    3216   # Vimpelcom (Beeline)
+    8402   # Corbina (Vimpelcom)
+    16345  # Beeline-AS
+)
+
+DEFAULT_MOBILE_RU_UPDATE_INTERVAL="1w"   # MaxMind обновляется 2 раза в неделю
+DEFAULT_MIN_ENTRIES_MOBILE_RU=100        # ниже — что-то сломалось
+
+# ==============================================================================
 # UNINSTALL MODE
 # ==============================================================================
 
@@ -826,10 +1041,19 @@ if [ "${1:-}" = "--uninstall" ]; then
                 protected-ports-update.timer protected-ports-update.service \
                 protected-ports-update.path \
                 shieldnode-aggregator.timer shieldnode-aggregator.service \
-                shieldnode-nftables.service; do
+                shieldnode-nftables.service \
+                shieldnode-update@scanner.timer shieldnode-update@scanner.service \
+                shieldnode-update@threat.timer  shieldnode-update@threat.service \
+                shieldnode-update@tor.timer     shieldnode-update@tor.service \
+                shieldnode-update@custom.timer  shieldnode-update@custom.service \
+                shieldnode-update@custom.path \
+                shieldnode-update@mobile_ru.timer shieldnode-update@mobile_ru.service; do
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
     done
+    # v3.12.0: убираем templated unit-файлы (если timer'ы создавались из шаблона)
+    rm -f /etc/systemd/system/shieldnode-update@.service
+    rm -f /etc/systemd/system/shieldnode-update@.timer
     # v3.5: legacy unit от ≤v3.4 — удаляем если осталось от старой установки
     systemctl disable --now cs-ssh-whitelist 2>/dev/null || true
     rm -f /etc/systemd/system/cs-ssh-whitelist.service
@@ -842,14 +1066,20 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /usr/local/sbin/update-tor-blocklist.sh
     rm -f /usr/local/sbin/update-protected-ports.sh
     rm -f /usr/local/sbin/shieldnode-aggregator.sh
+    rm -f /usr/local/sbin/shieldnode-update-blocklist.sh
+    rm -f /usr/local/sbin/shieldnode-update-mobile-ru.sh
+    rm -f /usr/local/sbin/shieldnode-defaults.sh
     rm -f /usr/local/bin/guard
     print_ok "Скрипты удалены (включая команду guard)"
 
     # v3.11: BLOCK_TOR marker
     rm -f /etc/shieldnode/block_tor
+    # v3.12.0: lists и опциональный config
+    rm -rf /etc/shieldnode/lists
+    rm -f /etc/shieldnode/shieldnode.conf
     rmdir /etc/shieldnode 2>/dev/null || true
 
-    # БД истории событий (v2.9)
+    # БД истории событий (v2.9), включая ASN cache (v3.12.0) и fail counters
     rm -rf /var/lib/shieldnode
 
     # v3.5: human-readable логи + logrotate
@@ -1754,7 +1984,7 @@ $XRAY_PORTS_UDP_INIT
     }
 
     # --- Pre-emptive blocklist (известные сканеры) ---
-    # Заполняется скриптом /usr/local/sbin/update-scanner-blocklist.sh
+    # Заполняется скриптом /usr/local/sbin/shieldnode-update-blocklist.sh scanner
     set scanner_blocklist_v4 {
         type ipv4_addr
         flags interval
@@ -1763,9 +1993,46 @@ $XRAY_PORTS_UDP_INIT
         size 131072
     }
 
+    # --- v3.12.0: Threat blocklist (Spamhaus DROP, FireHOL Level 1) ---
+    # Заполняется /usr/local/sbin/shieldnode-update-blocklist.sh threat
+    # Spamhaus DROP — известные criminally-controlled сети (low false-positive).
+    # FireHOL Level 1 — агрегатор RBL'ов (high-confidence атакующие).
+    set threat_blocklist_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        size 65536
+    }
+
+    # --- v3.12.0: Custom blocklist (operator personal IPs) ---
+    # Заполняется /usr/local/sbin/shieldnode-update-blocklist.sh custom
+    # Источник: /etc/shieldnode/lists/custom.txt + опциональные URL'ы из конфига.
+    # Path-watcher inotify-триггерит обновление сразу при изменении файла.
+    set custom_blocklist_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        size 32768
+    }
+
+    # --- v3.13.0: Mobile-RU AS whitelist ---
+    # Подсети российских мобильных операторов (AS8359 МТС, AS12958 T2, etc).
+    # Заполняется /usr/local/sbin/shieldnode-update-blocklist.sh mobile_ru
+    # Источник: MaxMind GeoLite2-ASN-CSV (требует MAXMIND_LICENSE_KEY).
+    # Если key нет — set пустой, никакого whitelist'инга (поведение v3.12.0).
+    # ВАЖНО: эти IP получают РЕЛАКСИРОВАННЫЕ лимиты (ct=1000, newconn=2000/min)
+    # вместо стандартных (ct=400, newconn=500/min) — для CGNAT с 50-200 абонентами.
+    # Scanner/threat/custom blocklist'ы НЕ обходятся — реальные атаки всё равно ловятся.
+    set mobile_ru_whitelist_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        size 65536
+    }
+
     # --- v3.11: Tor exit blocklist ---
-    # Заполняется /usr/local/sbin/update-tor-blocklist.sh hourly из
-    # check.torproject.org/torbulkexitlist (~1500 IPs, individual /32).
+    # Заполняется /usr/local/sbin/shieldnode-update-blocklist.sh tor (v3.12.0)
+    # из check.torproject.org/torbulkexitlist (~1500 IPs, individual /32).
     # Активен только если оператор включил BLOCK_TOR=1 при установке.
     # Если выключен — set пустой, правило 'ip saddr @... drop' no-op.
     set tor_exit_blocklist_v4 {
@@ -1803,10 +2070,12 @@ $XRAY_PORTS_UDP_INIT
     # --- v2.5: STAGE 2 — CONFIRMED ATTACK (бан 1 час) ---
     # Сюда IP попадает если уже сидел в suspect и опять превысил лимит.
     # Это значит — точно атака, баним всерьёз.
+    # v3.12.0 CGNAT FIX: timeout 1h → 15min. Если CGNAT IP попал false-positive,
+    # быстро разблочится. Реальная атака возобновится — снова попадёт в бан.
     set confirmed_attack_v4 {
         type ipv4_addr
         flags dynamic, timeout
-        timeout 1h
+        timeout 15m
         size 65536
     }
 
@@ -1857,8 +2126,12 @@ $MANUAL_WHITELIST_V4_INIT
     counter syn_confirmed_v4 { }
     counter udp_confirmed_v4 { }
     counter tor_drops_v4 { }      # v3.11: Tor exit nodes dropped
+    counter threat_drops_v4 { }   # v3.12.0: Spamhaus/FireHOL drops
+    counter custom_drops_v4 { }   # v3.12.0: operator personal blocklist drops
+    counter mobile_ru_passes_v4 { }   # v3.13.0: mobile-RU IPs прошли relaxed-path
+    counter mobile_ru_conn_flood_v4 { }   # v3.13.0: drops в relaxed-path (ct>1000)
     # v3.5: counters для HTTP/connection-flood защиты
-    counter conn_flood_v4 { }     # ct count > 150 на src
+    counter conn_flood_v4 { }     # ct count > 400 на src (v3.12.0: CGNAT-friendly)
     counter newconn_flood_v4 { }  # >50 new conn/min на src
     counter tcp_invalid { }       # invalid TCP flag combos
 
@@ -1891,6 +2164,60 @@ $FIB_ANTISPOOF_RULE
         tcp flags & (fin|rst) == (fin|rst) counter name tcp_invalid drop
         tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter name tcp_invalid drop
         tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|psh|urg) counter name tcp_invalid drop
+
+        # === v3.13.1: MOBILE-RU AS WHITELIST (relaxed limits, true whitelist) ===
+        # Российские мобильные операторы (МТС, T2, МегаФон, Билайн) дают CGNAT
+        # с 50-200 абонентами на 1 IP. Стандартный лимит ct=400 их банит при
+        # пиковой активности (одновременная работа множества юзеров).
+        #
+        # ПОРЯДОК: правила здесь стоят ВЫШЕ blocklist drop'ов (threat/scanner/
+        # custom/tor) — true whitelist semantics. Если mobile-RU CIDR попал
+        # в один из blocklist'ов (например retail-pool в gov_networks), он
+        # всё равно проходит через relaxed-проверки тут.
+        #
+        # ЛИМИТЫ:
+        #   - ct=1000 (vs 400 default): покрывает CGNAT 100-200 юзеров.
+        #   - newconn=2000/min burst 4000 (vs 500/min burst 1000): запас x4.
+        #   - SYN/UDP rate-limit пропускаются (early accept).
+        #
+        # ATTACK PROTECTION остаётся:
+        #   - реальный flood даже на mobile-RU поймается (>1000 conn = drop).
+        #   - FIB anti-spoofing (если включён) отсеет spoofed mobile src.
+        #
+        # OBSERVABILITY: log prefix '[shield:mobile_ru_drop]' для overflow'ов
+        # (когда mobile-RU IP превысил даже relaxed-лимит ct=1000). Aggregator
+        # парсит → events.db с type='mobile_ru'.
+        ip saddr @mobile_ru_whitelist_v4 tcp dport @protected_ports_tcp ct state new \\
+            add @connlimit_v4 { ip saddr ct count over 1000 } \\
+            log prefix "[shield:mobile_ru_drop] " level info flags ip options \\
+            counter name mobile_ru_conn_flood_v4 drop
+        ip saddr @mobile_ru_whitelist_v4 tcp dport @protected_ports_tcp ct state new \\
+            add @newconn_rate_v4 { ip saddr limit rate over 2000/minute burst 4000 packets } \\
+            jump newconn_overflow
+        # Если mobile-RU IP прошёл relaxed-проверки — accept.
+        # Это означает: blocklist drop'ы (threat/scanner/custom/tor) ниже
+        # пропускаются для mobile-RU IP. Это корректное поведение для CGNAT —
+        # 200 юзеров за одним IP не должны страдать из-за одного scanner'а среди них.
+        ip saddr @mobile_ru_whitelist_v4 tcp dport @protected_ports_tcp ct state new \\
+            counter name mobile_ru_passes_v4 accept
+
+        # === v3.12.0: THREAT BLOCKLIST (Spamhaus DROP, FireHOL Level 1) ===
+        # High-confidence криминальные сети. Идёт ПЕРВЫМ — самый дорогой
+        # источник нежелательного трафика, отсекаем сразу.
+        # Лог с rate-limit 1/sec для агрегатора и guard статистики.
+        ip saddr @threat_blocklist_v4 limit rate 1/second \\
+            log prefix "[shield:threat] " level info flags ip options \\
+            counter name threat_drops_v4 drop
+        ip saddr @threat_blocklist_v4 counter name threat_drops_v4 drop
+
+        # === v3.12.0: CUSTOM BLOCKLIST (operator personal IPs) ===
+        # Источник: /etc/shieldnode/lists/custom.txt (+ опциональные URL'ы).
+        # Идёт после threat но до scanner — оператор может явно перехватить
+        # любой IP даже если других списков его пока нет.
+        ip saddr @custom_blocklist_v4 limit rate 1/second \\
+            log prefix "[shield:custom] " level info flags ip options \\
+            counter name custom_drops_v4 drop
+        ip saddr @custom_blocklist_v4 counter name custom_drops_v4 drop
 
         # Pre-emptive drop известных сканеров (с counter v2.7).
         # Стоит ПЕРЕД rate-limit — экономит conntrack-слоты и CPU.
@@ -1935,47 +2262,49 @@ $FIB_ANTISPOOF_RULE
         # Set ОБЯЗАТЕЛЬНО без timeout (иначе "Operation is not supported").
         # Conntrack timers сами cleanup элементы.
         #
+        # v3.13.1: правила mobile_ru_whitelist перенесены ВЫШЕ blocklist drop'ов
+        # (см. секцию 'MOBILE-RU AS WHITELIST' между TCP-flag-sanity и threat).
+        # Здесь остаются только обычные conn-flood / newconn / SYN / UDP правила
+        # которые применяются к НЕ-mobile трафику (mobile-RU уже accept выше).
+
         # === v3.5+v3.9+v3.10.2: CONNECTION-FLOOD / SLOWLORIS ЗАЩИТА ===
         # Защищает от: тысяч одновременных TCP-соединений с одного IP,
         # медленного TLS handshake (slowloris), HTTP-flood через established TCP.
         # Применяется только к защищаемым TCP-портам (Xray/Reality/sing-box).
         # manual_whitelist уже пропущен выше.
         #
-        # v3.10.2: лимит 100 → 150 (CGNAT 50 юзеров с TCP+UDP легко даёт 80-120
-        # concurrent после refactoring meter-touch ниже).
-        # Логика проще чем у SYN-flood: ct count работает в реальном времени,
-        # ban-once stage не нужен — если IP реально держит >150 concurrent, это
-        # однозначно flood/slowloris/scanner. Прямой drop.
+        # v3.12.0 CGNAT FIX: лимит 150 → 400.
+        # Анализ production traffic показал что российские мобильные операторы
+        # (T2/Tele2 AS12958, AS15378, AS48190; МТС AS8359; МегаФон AS25513)
+        # дают CGNAT-IP с 200-350 concurrent connections от одного IP к одному
+        # dst-port. Лимит 150 банил легитимных мобильных юзеров.
+        # 400 ловит slowloris (200-500 коннектов с одного IP), но не банит CGNAT.
+        # Slowloris атаки которые держат 400+ коннектов всё равно дропаются.
+        # v3.13.0: для mobile-RU AS используется relaxed-path выше; сюда попадает
+        # только non-mobile трафик.
         tcp dport @protected_ports_tcp ct state new \\
-            add @connlimit_v4 { ip saddr ct count over 150 } \\
+            add @connlimit_v4 { ip saddr ct count over 400 } \\
             counter name conn_flood_v4 drop
 
-        # === v3.10.2: NEW CONNECTION RATE-LIMIT (refactor: один meter touch на пакет) ===
-        # Раньше (v3.5..v3.10.1): два правила делали 'add @newconn_rate_v4' на
-        # один и тот же пакет от suspect-IP, что эффективно ВДВОЕ снижало
-        # лимит. Эмпирически проверено в network-namespace с реальным kernel'ом:
-        # single-rule burst=10 → 10 free; double-rule burst=10 → 5 free.
-        # Для CGNAT IP, держащих 100 conn/min при номинальном лимите 150/min,
-        # эффективно 200 токенов/min расхода → bucket пустеет за 6 мин →
-        # confirmed_attack. Это отдельный механизм false-positive'ов CGNAT.
-        #
-        # Refactor: meter-update делается ОДИН раз. Решение confirm-vs-suspect
-        # вынесено в подцепочку newconn_overflow.
-        # v3.10.2: лимит поднят 150/min → 200/min, burst 300 → 500 (после фикса
-        # double-charge, реальная capacity увеличилась).
+        # === NEW CONNECTION RATE-LIMIT ===
+        # v3.12.0 CGNAT FIX: 200/min → 500/min, burst 500 → 1000.
+        # Один CGNAT IP с 50 юзерами легко даёт 200 new-conn/min при норме
+        # (Telegram + браузер + Spotify + WhatsApp + бэкграунд = 4-5 conn/min/юзер).
+        # 500/min даёт запас x2.5 для CGNAT, всё ещё ловит реальный HTTP-flood
+        # (1000+ new-conn/min с одного IP).
         tcp dport @protected_ports_tcp ct state new \\
-            add @newconn_rate_v4 { ip saddr limit rate over 200/minute burst 500 packets } \\
+            add @newconn_rate_v4 { ip saddr limit rate over 500/minute burst 1000 packets } \\
             jump newconn_overflow
 
-        # === v3.10.2: TCP SYN rate-limit (refactor: один meter touch на пакет) ===
-        # См. comment выше про newconn — та же проблема и тот же фикс.
-        # Лимит: 300 SYN/sec, burst 500. CGNAT-friendly.
+        # === TCP SYN rate-limit ===
+        # v3.12.0: лимит остаётся 300/sec, CGNAT 50 юзеров обычно даёт 50-80 SYN/sec
+        # реальная атака — 1000+ SYN/sec. 300 — хороший middle-ground.
         tcp dport @protected_ports_tcp ct state new \\
             add @syn_flood_v4 { ip saddr limit rate over 300/second burst 500 packets } \\
             jump syn_overflow
 
-        # === v3.10.2: UDP rate-limit (refactor: один meter touch на пакет) ===
-        # Лимит: 600 packets/sec, burst 1000. UDP шлёт больше мелких пакетов.
+        # === UDP rate-limit ===
+        # v3.12.0: 600/sec остаётся (UDP менее проблематичен с CGNAT)
         udp dport @protected_ports_udp \\
             add @udp_flood_v4 { ip saddr limit rate over 600/second burst 1000 packets } \\
             jump udp_overflow
@@ -2492,46 +2821,138 @@ else
 fi
 
 # ==============================================================================
-# ШАГ 6: SCANNER-BLOCKLIST UPDATER (pre-emptive drop)
+# ШАГ 6: BLOCKLIST UPDATER (universal, v3.12.0)
 # ==============================================================================
 
-print_header "ШАГ 6: SCANNER-BLOCKLIST UPDATER"
+print_header "ШАГ 6: BLOCKLIST UPDATER"
 
-# v1.3: качаем подсети известных сканеров (Shodan, Censys, BinaryEdge,
-# госсканеры РФ/CN/etc) и кладём их в nft set scanner_blocklist_v4.
-# Источник: https://github.com/shadow-netlab/traffic-guard-lists
+# v3.12.0: единый универсальный updater для всех blocklist'ов:
+#   scanner — Shodan/Censys/government scanners (sources в DEFAULT_REMOTE_BLOCKLISTS)
+#   threat  — Spamhaus DROP + FireHOL Level 1 (high-confidence атакующие)
+#   tor     — официальный Tor exit list (если BLOCK_TOR=1)
+#   custom  — operator personal /etc/shieldnode/lists/custom.txt
 #
-# Обновляется раз в 6 часов через systemd timer.
-# Атомарный обмен через одну nft-транзакцию (flush + add) — split-brain
-# состояния невозможно.
+# Каждый name → один nft set:
+#   scanner → scanner_blocklist_v4
+#   threat  → threat_blocklist_v4
+#   tor     → tor_exit_blocklist_v4   (legacy compat name)
+#   custom  → custom_blocklist_v4
+#
+# Источники для каждого set'а — union: file-based (./lists/*.txt) +
+# URL-based (REMOTE_BLOCKLISTS). Минимум: либо файл, либо URL'ы; если ничего —
+# set остаётся пустым, drop-rule no-op.
+#
+# Конфиг /etc/shieldnode/shieldnode.conf опционален. Если есть — переопределяет
+# DEFAULT_LOCAL_BLOCKLISTS, DEFAULT_REMOTE_BLOCKLISTS, *_UPDATE_INTERVAL,
+# MIN_ENTRIES_*, FAIL_THRESHOLD.
 
-UPDATER_SCRIPT="/usr/local/sbin/update-scanner-blocklist.sh"
-
-cat > "$UPDATER_SCRIPT" <<'UPDATER_EOF'
+# 1) Дефолты в /usr/local/sbin/shieldnode-defaults.sh — отдельный файл, чтобы
+#    updater и установщик использовали один источник истины.
+cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# Обновляет nft set inet ddos_protect scanner_blocklist_v4/v6
-# из публичных списков подсетей сканеров.
-# Запускается через scanner-blocklist-update.timer.
+# shieldnode v3.13.1 — дефолты blocklists (генерится установщиком)
+# НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
+# Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
-set -o pipefail
-
-# v2.6: множественные источники blocklist'а для максимального покрытия
-# российских госсканеров с минимальным риском ложных банов.
-LISTS=(
-    # Основной общий blocklist (Shodan, Censys, общие сканеры, RU gov частично)
-    "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list"
-    "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list"
-    # v2.6: SKIPA scanner-серверы (CyberOK, ГРЧЦ, НКЦКИ).
-    # Курируется вручную автором с верификацией по логам — низкий риск ложных банов.
-    "https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
+DEFAULT_LOCAL_BLOCKLISTS=(
+$(for entry in "${DEFAULT_LOCAL_BLOCKLISTS[@]}"; do printf "    %q\n" "$entry"; done)
 )
 
-# v2.6: MISP/CIRCL — honeypot-verified scanner IPs (JSON-формат, требует jq для парсинга)
-MISP_LIST="https://raw.githubusercontent.com/MISP/misp-warninglists/main/lists/skipa-nt-scanning/list.json"
+DEFAULT_REMOTE_BLOCKLISTS=(
+$(for entry in "${DEFAULT_REMOTE_BLOCKLISTS[@]}"; do printf "    %q\n" "$entry"; done)
+)
 
-LOG_TAG="scanner-blocklist"
+DEFAULT_SCANNER_UPDATE_INTERVAL="$DEFAULT_SCANNER_UPDATE_INTERVAL"
+DEFAULT_THREAT_UPDATE_INTERVAL="$DEFAULT_THREAT_UPDATE_INTERVAL"
+DEFAULT_TOR_UPDATE_INTERVAL="$DEFAULT_TOR_UPDATE_INTERVAL"
+DEFAULT_CUSTOM_UPDATE_INTERVAL="$DEFAULT_CUSTOM_UPDATE_INTERVAL"
+DEFAULT_MOBILE_RU_UPDATE_INTERVAL="$DEFAULT_MOBILE_RU_UPDATE_INTERVAL"
 
-# Если nft-таблицы нет — выходим (скрипт может стартануть до первой установки)
+DEFAULT_MIN_ENTRIES_SCANNER=$DEFAULT_MIN_ENTRIES_SCANNER
+DEFAULT_MIN_ENTRIES_THREAT=$DEFAULT_MIN_ENTRIES_THREAT
+DEFAULT_MIN_ENTRIES_TOR=$DEFAULT_MIN_ENTRIES_TOR
+DEFAULT_MIN_ENTRIES_CUSTOM=$DEFAULT_MIN_ENTRIES_CUSTOM
+DEFAULT_MIN_ENTRIES_MOBILE_RU=$DEFAULT_MIN_ENTRIES_MOBILE_RU
+
+DEFAULT_FAIL_THRESHOLD=$DEFAULT_FAIL_THRESHOLD
+
+# v3.13.0: список AS для mobile-RU whitelist
+DEFAULT_MOBILE_RU_AS_LIST=(
+$(for asn in "${DEFAULT_MOBILE_RU_AS_LIST[@]}"; do printf "    %s\n" "$asn"; done)
+)
+DEFAULTS_EOF
+chmod 0644 "$SHIELD_DEFAULTS_FILE"
+print_ok "Defaults: $SHIELD_DEFAULTS_FILE"
+
+# 2) Универсальный updater
+cat > "$SHIELD_UPDATER_SCRIPT" <<'UPDATER_EOF'
+#!/bin/bash
+# shieldnode v3.12.0 — универсальный blocklist updater.
+# Usage: shieldnode-update-blocklist.sh <scanner|threat|tor|custom>
+
+set -o pipefail
+export LANG=C LC_ALL=C
+
+NAME="${1:-}"
+case "$NAME" in
+    scanner|threat|tor|custom) ;;
+    mobile_ru)
+        # v3.13.0: mobile_ru использует отдельный updater (MaxMind CSV).
+        exec /usr/local/sbin/shieldnode-update-mobile-ru.sh "$@"
+        ;;
+    *) echo "Usage: $0 <scanner|threat|tor|custom|mobile_ru>" >&2; exit 1 ;;
+esac
+
+LOG_TAG="shieldnode-update-$NAME"
+STATE_DIR="/var/lib/shieldnode"
+mkdir -p "$STATE_DIR"
+FAIL_COUNTER="$STATE_DIR/${NAME}_fail_count"
+
+# nft set name (legacy compat для tor → tor_exit_blocklist_v4)
+case "$NAME" in
+    scanner) NFT_SET="scanner_blocklist_v4" ;;
+    threat)  NFT_SET="threat_blocklist_v4"  ;;
+    tor)     NFT_SET="tor_exit_blocklist_v4" ;;
+    custom)  NFT_SET="custom_blocklist_v4"  ;;
+esac
+
+# Загружаем дефолты + опциональный override
+# shellcheck source=/dev/null
+. /usr/local/sbin/shieldnode-defaults.sh
+if [ -f /etc/shieldnode/shieldnode.conf ]; then
+    # shellcheck source=/dev/null
+    . /etc/shieldnode/shieldnode.conf
+fi
+
+# Резолвим финальные значения: оператор может задать LOCAL_BLOCKLISTS /
+# REMOTE_BLOCKLISTS; иначе берём DEFAULT_*.
+[ "${#LOCAL_BLOCKLISTS[@]}"  -gt 0 ] || LOCAL_BLOCKLISTS=("${DEFAULT_LOCAL_BLOCKLISTS[@]}")
+[ "${#REMOTE_BLOCKLISTS[@]}" -gt 0 ] || REMOTE_BLOCKLISTS=("${DEFAULT_REMOTE_BLOCKLISTS[@]}")
+
+# Извлекаем для нашего NAME
+LOCAL_PATHS=""
+for entry in "${LOCAL_BLOCKLISTS[@]}"; do
+    case "$entry" in
+        "$NAME="*) LOCAL_PATHS="${entry#$NAME=}" ;;
+    esac
+done
+REMOTE_URLS=""
+for entry in "${REMOTE_BLOCKLISTS[@]}"; do
+    case "$entry" in
+        "$NAME="*) REMOTE_URLS="${entry#$NAME=}" ;;
+    esac
+done
+
+# MIN_ENTRIES + FAIL_THRESHOLD: per-name override → DEFAULT_*
+case "$NAME" in
+    scanner) MIN_ENTRIES="${MIN_ENTRIES_SCANNER:-$DEFAULT_MIN_ENTRIES_SCANNER}" ;;
+    threat)  MIN_ENTRIES="${MIN_ENTRIES_THREAT:-$DEFAULT_MIN_ENTRIES_THREAT}"   ;;
+    tor)     MIN_ENTRIES="${MIN_ENTRIES_TOR:-$DEFAULT_MIN_ENTRIES_TOR}"         ;;
+    custom)  MIN_ENTRIES="${MIN_ENTRIES_CUSTOM:-$DEFAULT_MIN_ENTRIES_CUSTOM}"   ;;
+esac
+FAIL_THRESHOLD_VAL="${FAIL_THRESHOLD:-$DEFAULT_FAIL_THRESHOLD}"
+
+# Если nft-таблицы нет — выходим (скрипт может запуститься до первой установки)
 if ! nft list table inet ddos_protect >/dev/null 2>&1; then
     logger -t "$LOG_TAG" "table inet ddos_protect не существует — пропускаю"
     exit 0
@@ -2540,245 +2961,89 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# Качаем все списки в один файл
-for url in "${LISTS[@]}"; do
-    if curl -fsSL --max-time 30 --retry 2 "$url" -o "$TMP/dl.tmp" 2>/dev/null; then
-        cat "$TMP/dl.tmp" >> "$TMP/all.raw"
-    else
-        logger -t "$LOG_TAG" "WARN: не смог скачать $url"
-    fi
-done
+REMOTE_DOWNLOADED=0
+REMOTE_TRIED=0
 
-# v2.6: MISP/CIRCL JSON-список — отдельный парсинг через jq
-if [ -n "$MISP_LIST" ] && command -v jq >/dev/null 2>&1; then
-    if curl -fsSL --max-time 30 --retry 2 "$MISP_LIST" -o "$TMP/misp.json" 2>/dev/null; then
-        # MISP-формат: {"list": ["IP1/CIDR1", "IP2/CIDR2", ...]}
-        jq -r '.list[]?' "$TMP/misp.json" 2>/dev/null >> "$TMP/all.raw"
-        MISP_COUNT=$(jq -r '.list | length' "$TMP/misp.json" 2>/dev/null || echo "0")
-        logger -t "$LOG_TAG" "MISP/CIRCL: добавлено $MISP_COUNT honeypot-verified IP"
-    else
-        logger -t "$LOG_TAG" "WARN: не смог скачать MISP/CIRCL список"
-    fi
-fi
-
-if [ ! -s "$TMP/all.raw" ]; then
-    logger -t "$LOG_TAG" "ERROR: пустой результат скачивания, не обновляю set"
-    exit 1
-fi
-
-# v3.10.2 BUG-6 SECURITY FIX: extract IPv4-подсети с проверкой prefix и bogons.
-# Защита от supply-chain poisoning: если кто-то запушит 0.0.0.0/0, 8.8.8.8/8 или
-# RFC1918 в upstream-source, эти entries отфильтрованы и не попадут в drop-set.
-#
-# Правила:
-#   - prefix < 8 отвергнут (слишком широко, /0../7 — это сотни миллионов IP)
-#   - bogons отвергнуты: 0/8, 10/8, 127/8, 169.254/16, 172.16-31/12, 192.168/16
-#   - multicast и reserved отвергнуты: 224-255/8 (224-239 multicast, 240+ reserved)
-#   - всё остальное (1-9 кроме 0/10, 11-126, 128-168, 170-171, 173-191, 193-223) допустимо
-grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$TMP/all.raw" | \
-    awk -F'[./]' '
-    {
-        # default prefix /32 если CIDR не указан
-        prefix = (NF >= 5) ? $5 : 32
-        if (prefix < 8 || prefix > 32) next
-
-        # Bogon-отсев по первому октету
-        o1 = $1 + 0
-        if (o1 == 0)   next                       # 0.0.0.0/8 — "this network"
-        if (o1 == 10)  next                       # RFC1918
-        if (o1 == 127) next                       # loopback
-        if (o1 >= 224) next                       # multicast + reserved (224-255)
-
-        # 169.254.0.0/16 link-local
-        if (o1 == 169 && $2 + 0 == 254) next
-
-        # 172.16.0.0/12 RFC1918
-        if (o1 == 172) {
-            o2 = $2 + 0
-            if (o2 >= 16 && o2 <= 31) next
-        }
-
-        # 192.168.0.0/16 RFC1918
-        if (o1 == 192 && $2 + 0 == 168) next
-
-        # Печатаем оригинальную строку (с CIDR или без)
-        print $0
-    }' | sort -u > "$TMP/v4.list"
-
-V4_COUNT=$(wc -l < "$TMP/v4.list")
-
-# Sanity: если в списке слишком мало — что-то сломалось, не применяем
-if [ "$V4_COUNT" -lt 10 ]; then
-    logger -t "$LOG_TAG" "ERROR: только $V4_COUNT IPv4 подсетей после sanity-фильтра — выглядит сломанным, не применяю"
-    exit 1
-fi
-
-# v3.10.2: warn если sanity отбросил подозрительно много (>10% от raw)
-RAW_V4_COUNT=$(grep -cE '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$TMP/all.raw" 2>/dev/null)
-RAW_V4_COUNT="${RAW_V4_COUNT:-0}"
-if [ "$RAW_V4_COUNT" -gt 0 ]; then
-    REJECTED=$((RAW_V4_COUNT - V4_COUNT))
-    if [ "$REJECTED" -gt $((RAW_V4_COUNT / 10)) ]; then
-        logger -t "$LOG_TAG" "WARN: sanity отбросил $REJECTED из $RAW_V4_COUNT записей (bogons/wide-prefix). Возможно, upstream-источник скомпрометирован."
-    fi
-fi
-
-# Атомарный обмен: всё в одной nft-транзакции
-{
-    echo "flush set inet ddos_protect scanner_blocklist_v4"
-    if [ -s "$TMP/v4.list" ]; then
-        # Группами по 1000 элементов на add (производительнее чем по одному)
-        awk 'NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet ddos_protect scanner_blocklist_v4 { " } { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 } END { print " }" }' "$TMP/v4.list"
-    fi
-} > "$TMP/nft-batch"
-
-if nft -f "$TMP/nft-batch" 2>"$TMP/nft.err"; then
-    logger -t "$LOG_TAG" "Updated: $V4_COUNT IPv4 подсетей"
-    exit 0
-else
-    logger -t "$LOG_TAG" "ERROR: nft -f failed: $(cat "$TMP/nft.err")"
-    exit 1
-fi
-UPDATER_EOF
-
-chmod 0755 "$UPDATER_SCRIPT"
-print_ok "Updater script: $UPDATER_SCRIPT"
-
-# Systemd service + timer
-cat > /etc/systemd/system/scanner-blocklist-update.service <<EOF
-[Unit]
-Description=Update scanner blocklist (Shodan, Censys, gov scanners)
-After=network-online.target nftables.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=$UPDATER_SCRIPT
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-EOF
-
-cat > /etc/systemd/system/scanner-blocklist-update.timer <<'EOF'
-[Unit]
-Description=Update scanner blocklist every 6 hours
-Requires=scanner-blocklist-update.service
-
-[Timer]
-# Первый запуск через 30 секунд после boot (чтобы nft уже точно был готов)
-OnBootSec=30s
-# Потом каждые 6 часов
-OnUnitActiveSec=6h
-# Если пропустили запуск (сервер был выключен) — догнать сразу
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl daemon-reload
-systemctl enable scanner-blocklist-update.timer >/dev/null 2>&1
-
-# Запускаем сразу первый апдейт (blocking)
-print_status "Качаю scanner blocklist (первый запуск)..."
-if systemctl start scanner-blocklist-update.service; then
-    sleep 2
-    BLOCKLIST_V4_SIZE=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | grep -c '/')
-    BLOCKLIST_V4_SIZE="${BLOCKLIST_V4_SIZE:-0}"
-    if [ "$BLOCKLIST_V4_SIZE" -gt 0 ]; then
-        print_ok "Blocklist загружен: $BLOCKLIST_V4_SIZE v4 подсетей"
-    else
-        print_warn "Blocklist пуст — проверь логи: journalctl -u scanner-blocklist-update"
-    fi
-else
-    print_warn "Первый запуск updater'а провалился — продолжаем без blocklist"
-    print_info "Проверь: journalctl -u scanner-blocklist-update -n 30"
-fi
-
-systemctl start scanner-blocklist-update.timer >/dev/null 2>&1
-print_ok "Timer активен (обновление каждые 6 часов)"
-
-# ==============================================================================
-# ШАГ 6.1: TOR EXIT BLOCKLIST UPDATER (опционально, v3.11)
-# ==============================================================================
-
-if [ "$BLOCK_TOR" = "1" ]; then
-    print_header "ШАГ 6.1: TOR EXIT BLOCKLIST"
-
-    TOR_UPDATER_SCRIPT="/usr/local/sbin/update-tor-blocklist.sh"
-
-    cat > "$TOR_UPDATER_SCRIPT" <<'TOR_UPDATER_EOF'
-#!/bin/bash
-# v3.11: обновление nft set tor_exit_blocklist_v4 из публичных списков.
-# Запускается через cron.hourly или systemd timer.
-#
-# Поведение при ошибках:
-#   - Если ОБА источника недоступны → НЕ очищаем set (оставляем последний
-#     known-good). Это важно: иначе короткий network-glitch снимет защиту.
-#   - Если 3 раза подряд fail (file /var/lib/shieldnode/tor_fail_count >=3)
-#     → очищаем set (старые IPs устарели), пишем алерт в logger.
-
-set -o pipefail
-export LANG=C LC_ALL=C
-
-LOG_TAG="tor-blocklist"
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-STATE_DIR="/var/lib/shieldnode"
-mkdir -p "$STATE_DIR"
-FAIL_COUNTER="$STATE_DIR/tor_fail_count"
-
-# Источник 1: официальный torproject (preferred)
-PRIMARY_URL="https://check.torproject.org/torbulkexitlist"
-# Источник 2: dan.me.uk (fallback). Включает IPv6, фильтруем потом.
-FALLBACK_URL="https://www.dan.me.uk/torlist/?exit"
-
-DOWNLOADED=0
-if curl -fsSL --max-time 30 "$PRIMARY_URL" -o "$TMP_DIR/tor.raw" 2>/dev/null; then
-    if [ -s "$TMP_DIR/tor.raw" ]; then
-        DOWNLOADED=1
-        logger -t "$LOG_TAG" "downloaded primary source ($(wc -l < "$TMP_DIR/tor.raw") lines)"
-    fi
-fi
-
-if [ "$DOWNLOADED" = "0" ]; then
-    # Fallback. Уважаем rate-limit dan.me.uk (раз в 30 мин/IP), используем
-    # только если primary не сработал.
-    if curl -fsSL --max-time 30 "$FALLBACK_URL" -o "$TMP_DIR/tor.raw" 2>/dev/null; then
-        if [ -s "$TMP_DIR/tor.raw" ]; then
-            DOWNLOADED=1
-            logger -t "$LOG_TAG" "downloaded fallback source ($(wc -l < "$TMP_DIR/tor.raw") lines)"
+# 1) Скачиваем все URL'ы (через запятую в REMOTE_URLS)
+if [ -n "$REMOTE_URLS" ]; then
+    IFS=',' read -ra URL_ARR <<< "$REMOTE_URLS"
+    for url in "${URL_ARR[@]}"; do
+        url="${url## }"; url="${url%% }"   # trim spaces
+        [ -z "$url" ] && continue
+        REMOTE_TRIED=$((REMOTE_TRIED + 1))
+        # JSON-формат (MISP/CIRCL) — отдельная обработка через jq
+        if echo "$url" | grep -qE '\.json($|\?)' && command -v jq >/dev/null 2>&1; then
+            if curl -fsSL --max-time 30 --retry 2 "$url" -o "$TMP/dl-$REMOTE_TRIED.json" 2>/dev/null; then
+                jq -r '..|strings? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+(/[0-9]+)?$"))' \
+                    "$TMP/dl-$REMOTE_TRIED.json" 2>/dev/null >> "$TMP/all.raw" && \
+                    REMOTE_DOWNLOADED=$((REMOTE_DOWNLOADED + 1))
+            else
+                logger -t "$LOG_TAG" "WARN: не смог скачать (json) $url"
+            fi
+        else
+            if curl -fsSL --max-time 30 --retry 2 "$url" -o "$TMP/dl-$REMOTE_TRIED.raw" 2>/dev/null; then
+                cat "$TMP/dl-$REMOTE_TRIED.raw" >> "$TMP/all.raw"
+                REMOTE_DOWNLOADED=$((REMOTE_DOWNLOADED + 1))
+            else
+                logger -t "$LOG_TAG" "WARN: не смог скачать $url"
+            fi
         fi
-    fi
+    done
 fi
 
-if [ "$DOWNLOADED" = "0" ]; then
-    # Оба источника failed. Инкрементируем счётчик.
+# 2) Читаем локальные .txt (через запятую в LOCAL_PATHS — обычно один путь)
+LOCAL_FOUND=0
+if [ -n "$LOCAL_PATHS" ]; then
+    IFS=',' read -ra PATH_ARR <<< "$LOCAL_PATHS"
+    for p in "${PATH_ARR[@]}"; do
+        p="${p## }"; p="${p%% }"
+        [ -z "$p" ] && continue
+        if [ -r "$p" ]; then
+            cat "$p" >> "$TMP/all.raw"
+            LOCAL_FOUND=$((LOCAL_FOUND + 1))
+        fi
+    done
+fi
+
+# 3) Если нет ничего — fail handling
+if [ "$REMOTE_TRIED" -gt 0 ] && [ "$REMOTE_DOWNLOADED" -eq 0 ] && [ "$LOCAL_FOUND" -eq 0 ]; then
+    # Все URL'ы failed AND нет локальных → инкрементируем fail counter
     CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
+    CURRENT="${CURRENT:-0}"
     CURRENT=$((CURRENT + 1))
     echo "$CURRENT" > "$FAIL_COUNTER"
-    logger -t "$LOG_TAG" "ERROR: both sources unreachable (fail #$CURRENT)"
-
-    if [ "$CURRENT" -ge 3 ]; then
-        # 3+ failures подряд → очищаем set (старые данные устарели)
-        nft flush set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null && \
-            logger -t "$LOG_TAG" "cleared set after 3+ failures (data is stale)"
+    logger -t "$LOG_TAG" "ERROR: все URL'ы недоступны и нет local files (fail #$CURRENT/$FAIL_THRESHOLD_VAL)"
+    if [ "$CURRENT" -ge "$FAIL_THRESHOLD_VAL" ]; then
+        # 3+ подряд провалов → flush set'а (stale data protection)
+        nft flush set inet ddos_protect "$NFT_SET" 2>/dev/null && \
+            logger -t "$LOG_TAG" "flushed $NFT_SET после $CURRENT подряд провалов"
     fi
     exit 1
 fi
 
-# Reset fail counter
-echo 0 > "$FAIL_COUNTER"
+# 4) Если ничего не скачано и нет local → set остаётся как есть (no-op)
+if [ ! -s "$TMP/all.raw" ]; then
+    logger -t "$LOG_TAG" "пустой результат, нет источников — пропускаю"
+    exit 0
+fi
 
-# Извлекаем IPv4 (one-per-line), применяем тот же sanity-filter что в
-# scanner_blocklist (BUG-6 fix): отсев bogons, prefix>=8.
-# Tor exit nodes — это всегда /32 (single IPs), поэтому prefix-фильтр не критичен,
-# но bogon-фильтр полезен на случай supply-chain атаки на источник.
-grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' "$TMP_DIR/tor.raw" | \
-    awk -F'.' '
+# 5) Парсинг + sanity. Поддерживаем форматы:
+#    - plain IP:           8.8.8.8
+#    - CIDR:               1.2.3.0/24
+#    - Spamhaus:           "1.2.3.0/24 ; SBL12345"
+#    - FireHOL:            "# comment\n1.2.3.0/24"
+#    - inline комментарий: "8.8.8.8 # google"
+#
+# Sanity (тот же что в v3.11.x scanner-update):
+#    - prefix < 8 → отсев (слишком широко)
+#    - bogons: 0/8, 10/8, 127/8, 169.254/16, 172.16-31/12, 192.168/16
+#    - multicast/reserved: 224-255/8
+grep -oE '^[[:space:]]*[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]+)?' "$TMP/all.raw" | \
+    awk '{ sub(/^[[:space:]]+/, ""); print }' | \
+    awk -F'[./]' '
     {
+        prefix = (NF >= 5) ? $5 : 32
+        if (prefix < 8 || prefix > 32) next
         o1 = $1 + 0
         if (o1 == 0)   next
         if (o1 == 10)  next
@@ -2791,85 +3056,373 @@ grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' "$TMP_DIR/tor.raw" | \
         }
         if (o1 == 192 && $2 + 0 == 168) next
         print $0
-    }' | sort -u > "$TMP_DIR/tor.list"
+    }' | sort -u > "$TMP/parsed.list"
 
-V4_COUNT=$(wc -l < "$TMP_DIR/tor.list")
+V4_COUNT=$(wc -l < "$TMP/parsed.list")
+V4_COUNT="${V4_COUNT:-0}"
 
-# Sanity: Tor list реально имеет 1000-2000 IPs. Если меньше 100 — что-то
-# сломалось, не применяем (защита от corrupted upstream).
-if [ "$V4_COUNT" -lt 100 ]; then
-    logger -t "$LOG_TAG" "ERROR: only $V4_COUNT IPs after parse (expected 1000+) — not applying"
+# 6) Min check (для custom MIN_ENTRIES может быть 0 — допускается пустой)
+if [ "$V4_COUNT" -lt "$MIN_ENTRIES" ]; then
+    logger -t "$LOG_TAG" "ERROR: только $V4_COUNT IPv4 подсетей (ожидали >=$MIN_ENTRIES) — не применяю"
+    # Инкрементируем fail counter
+    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
+    CURRENT="${CURRENT:-0}"
+    CURRENT=$((CURRENT + 1))
+    echo "$CURRENT" > "$FAIL_COUNTER"
+    if [ "$CURRENT" -ge "$FAIL_THRESHOLD_VAL" ]; then
+        nft flush set inet ddos_protect "$NFT_SET" 2>/dev/null && \
+            logger -t "$LOG_TAG" "flushed $NFT_SET после $CURRENT провалов min-check"
+    fi
     exit 1
 fi
 
-# Атомарная замена через flush + add (одна транзакция nft -f)
+# 7) Атомарный flush + add (одна nft транзакция)
 {
-    echo "flush set inet ddos_protect tor_exit_blocklist_v4"
-    if [ -s "$TMP_DIR/tor.list" ]; then
-        # nft set elements limit ~65k за один add — у Tor списка <2000, OK
-        awk 'BEGIN { printf "add element inet ddos_protect tor_exit_blocklist_v4 { " }
-             { printf "%s%s", (NR == 1 ? "" : ", "), $0 }
-             END { print " }" }' "$TMP_DIR/tor.list"
+    echo "flush set inet ddos_protect $NFT_SET"
+    if [ -s "$TMP/parsed.list" ]; then
+        # Группами по 1000 элементов (производительнее чем по одному)
+        awk -v setname="$NFT_SET" '
+            NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet ddos_protect %s { ", setname }
+            { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
+            END { print " }" }' "$TMP/parsed.list"
     fi
-} | nft -f - 2>&1 | logger -t "$LOG_TAG"
+} > "$TMP/nft-batch"
 
-logger -t "$LOG_TAG" "applied $V4_COUNT Tor exit IPs"
-exit 0
-TOR_UPDATER_EOF
-    chmod 755 "$TOR_UPDATER_SCRIPT"
+if nft -f "$TMP/nft-batch" 2>"$TMP/nft.err"; then
+    # Reset fail counter on success
+    echo 0 > "$FAIL_COUNTER"
+    logger -t "$LOG_TAG" "Updated $NFT_SET: $V4_COUNT IPv4 подсетей (remote=$REMOTE_DOWNLOADED/$REMOTE_TRIED, local=$LOCAL_FOUND)"
+    exit 0
+else
+    logger -t "$LOG_TAG" "ERROR: nft -f failed: $(cat "$TMP/nft.err")"
+    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
+    CURRENT="${CURRENT:-0}"
+    echo $((CURRENT + 1)) > "$FAIL_COUNTER"
+    exit 1
+fi
+UPDATER_EOF
+chmod 0755 "$SHIELD_UPDATER_SCRIPT"
+print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 
-    # systemd timer (hourly)
-    cat > /etc/systemd/system/tor-blocklist-update.service <<EOF
+# 2.5) v3.13.0: dedicated mobile-RU updater (использует MaxMind GeoLite2-ASN-CSV)
+SHIELD_MOBILE_RU_UPDATER="/usr/local/sbin/shieldnode-update-mobile-ru.sh"
+cat > "$SHIELD_MOBILE_RU_UPDATER" <<'MOBILE_RU_UPDATER_EOF'
+#!/bin/bash
+# shieldnode v3.13.1 — mobile-RU AS whitelist updater.
+# Скачивает MaxMind GeoLite2-ASN-CSV, фильтрует по списку AS,
+# заполняет nft set mobile_ru_whitelist_v4.
+#
+# Требует MAXMIND_LICENSE_KEY в /etc/shieldnode/shieldnode.conf или env.
+# Без key — выходит с WARN, set остаётся пустым (поведение v3.12.0).
+
+set -o pipefail
+export LANG=C LC_ALL=C
+
+LOG_TAG="shieldnode-update-mobile_ru"
+STATE_DIR="/var/lib/shieldnode"
+mkdir -p "$STATE_DIR"
+FAIL_COUNTER="$STATE_DIR/mobile_ru_fail_count"
+NFT_SET="mobile_ru_whitelist_v4"
+
+# Загружаем дефолты + опциональный override
+# shellcheck source=/dev/null
+. /usr/local/sbin/shieldnode-defaults.sh
+if [ -f /etc/shieldnode/shieldnode.conf ]; then
+    # shellcheck source=/dev/null
+    . /etc/shieldnode/shieldnode.conf
+fi
+
+# AS-список: из конфига MOBILE_RU_AS_LIST или DEFAULT_MOBILE_RU_AS_LIST
+[ "${#MOBILE_RU_AS_LIST[@]}" -gt 0 ] || MOBILE_RU_AS_LIST=("${DEFAULT_MOBILE_RU_AS_LIST[@]}")
+
+MIN_ENTRIES="${MIN_ENTRIES_MOBILE_RU:-$DEFAULT_MIN_ENTRIES_MOBILE_RU}"
+FAIL_THRESHOLD_VAL="${FAIL_THRESHOLD:-$DEFAULT_FAIL_THRESHOLD}"
+ENABLED="${ENABLE_RU_MOBILE_WHITELIST:-1}"
+
+# Если фича выключена в конфиге — flush и exit
+if [ "$ENABLED" != "1" ]; then
+    nft flush set inet ddos_protect "$NFT_SET" 2>/dev/null
+    logger -t "$LOG_TAG" "ENABLE_RU_MOBILE_WHITELIST=$ENABLED, set очищен"
+    exit 0
+fi
+
+# Если license key нет — graceful WARN
+if [ -z "$MAXMIND_LICENSE_KEY" ]; then
+    logger -t "$LOG_TAG" "MAXMIND_LICENSE_KEY не задан, set остаётся пустым (поведение v3.12.0). Получи бесплатный ключ на https://www.maxmind.com/en/geolite2/signup и добавь в /etc/shieldnode/shieldnode.conf"
+    exit 0
+fi
+
+# Если nft-таблицы нет — выходим
+if ! nft list table inet ddos_protect >/dev/null 2>&1; then
+    logger -t "$LOG_TAG" "table inet ddos_protect не существует — пропускаю"
+    exit 0
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+# 1) Скачиваем GeoLite2-ASN-CSV.zip (v3.13.0: ~5 MB архив)
+URL="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN-CSV&license_key=${MAXMIND_LICENSE_KEY}&suffix=zip"
+if ! curl -fsSL --max-time 60 --retry 2 "$URL" -o "$TMP/asn.zip" 2>"$TMP/curl.err"; then
+    logger -t "$LOG_TAG" "ERROR: не смог скачать MaxMind ($(cat "$TMP/curl.err"))"
+    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
+    CURRENT="${CURRENT:-0}"
+    echo $((CURRENT + 1)) > "$FAIL_COUNTER"
+    exit 1
+fi
+
+# 2) Извлекаем CSV (внутри архива GeoLite2-ASN-Blocks-IPv4.csv)
+if ! command -v unzip >/dev/null 2>&1; then
+    logger -t "$LOG_TAG" "ERROR: unzip не установлен (apt install unzip)"
+    exit 1
+fi
+
+if ! unzip -j -o -q "$TMP/asn.zip" "*/GeoLite2-ASN-Blocks-IPv4.csv" -d "$TMP/" 2>/dev/null; then
+    logger -t "$LOG_TAG" "ERROR: не смог распаковать MaxMind ZIP (формат изменился?)"
+    exit 1
+fi
+
+CSV="$TMP/GeoLite2-ASN-Blocks-IPv4.csv"
+if [ ! -s "$CSV" ]; then
+    logger -t "$LOG_TAG" "ERROR: CSV пустой или не найден после unzip"
+    exit 1
+fi
+
+# 3) Парсим CSV. Формат: network,autonomous_system_number,autonomous_system_organization
+# Пример: 1.0.0.0/24,13335,"CLOUDFLARENET"
+# Берём только наши AS, выводим CIDR.
+AS_FILTER=$(IFS='|'; echo "${MOBILE_RU_AS_LIST[*]}")
+awk -F, -v asns="$AS_FILTER" '
+BEGIN {
+    n = split(asns, arr, "|")
+    for (i = 1; i <= n; i++) want[arr[i]] = 1
+}
+NR == 1 { next }   # skip header
+{
+    # CSV формат: "1.2.3.0/24",12345,"OrgName"
+    cidr = $1
+    asn = $2
+    gsub(/"/, "", cidr)
+    gsub(/"/, "", asn)
+    if (asn in want) print cidr
+}' "$CSV" > "$TMP/mobile_ru.list"
+
+# Sanity-фильтр (тот же что в обычном updater'е): отсеиваем bogons и слишком широкие.
+awk -F'[./]' '
+{
+    prefix = (NF >= 5) ? $5 : 32
+    if (prefix < 8 || prefix > 32) next
+    o1 = $1 + 0
+    if (o1 == 0)   next
+    if (o1 == 10)  next
+    if (o1 == 127) next
+    if (o1 >= 224) next
+    if (o1 == 169 && $2 + 0 == 254) next
+    if (o1 == 172) {
+        o2 = $2 + 0
+        if (o2 >= 16 && o2 <= 31) next
+    }
+    if (o1 == 192 && $2 + 0 == 168) next
+    print $0
+}' "$TMP/mobile_ru.list" | sort -u > "$TMP/mobile_ru.parsed"
+
+V4_COUNT=$(wc -l < "$TMP/mobile_ru.parsed")
+V4_COUNT="${V4_COUNT:-0}"
+
+if [ "$V4_COUNT" -lt "$MIN_ENTRIES" ]; then
+    logger -t "$LOG_TAG" "ERROR: только $V4_COUNT CIDR'ов (ожидали >=$MIN_ENTRIES) — не применяю. Возможно AS-список пустой или MaxMind вернул мало данных."
+    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
+    CURRENT="${CURRENT:-0}"
+    echo $((CURRENT + 1)) > "$FAIL_COUNTER"
+    if [ "$CURRENT" -ge "$FAIL_THRESHOLD_VAL" ]; then
+        nft flush set inet ddos_protect "$NFT_SET" 2>/dev/null && \
+            logger -t "$LOG_TAG" "flushed $NFT_SET после $CURRENT провалов"
+    fi
+    exit 1
+fi
+
+# 4) Атомарный flush + add
+{
+    echo "flush set inet ddos_protect $NFT_SET"
+    if [ -s "$TMP/mobile_ru.parsed" ]; then
+        awk -v setname="$NFT_SET" '
+            NR % 1000 == 1 { if (NR > 1) print "}"; printf "add element inet ddos_protect %s { ", setname }
+            { printf "%s%s", (NR % 1000 == 1 ? "" : ", "), $0 }
+            END { print " }" }' "$TMP/mobile_ru.parsed"
+    fi
+} > "$TMP/nft-batch"
+
+if nft -f "$TMP/nft-batch" 2>"$TMP/nft.err"; then
+    echo 0 > "$FAIL_COUNTER"
+    logger -t "$LOG_TAG" "Updated $NFT_SET: $V4_COUNT CIDR'ов из ${#MOBILE_RU_AS_LIST[@]} AS"
+
+    # 5) Observability: проверяем overlap с scanner_blocklist (informational only)
+    SCANNER_OVERLAP=0
+    if SCANNER_DUMP=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null); then
+        # Извлекаем CIDR'ы из scanner_blocklist
+        echo "$SCANNER_DUMP" | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u > "$TMP/scanner.cidrs"
+        # Сравниваем (наивная string-проверка, не subnet-overlap, но даёт сигнал)
+        SCANNER_OVERLAP=$(comm -12 "$TMP/mobile_ru.parsed" "$TMP/scanner.cidrs" | wc -l)
+        SCANNER_OVERLAP="${SCANNER_OVERLAP:-0}"
+        if [ "$SCANNER_OVERLAP" -gt 0 ]; then
+            logger -t "$LOG_TAG" "INFO: overlap mobile-RU ↔ scanner_blocklist: $SCANNER_OVERLAP CIDR'ов. Whitelist выигрывает (правило стоит раньше в prerouting)."
+        fi
+    fi
+    exit 0
+else
+    logger -t "$LOG_TAG" "ERROR: nft -f failed: $(cat "$TMP/nft.err")"
+    CURRENT=$(cat "$FAIL_COUNTER" 2>/dev/null || echo 0)
+    CURRENT="${CURRENT:-0}"
+    echo $((CURRENT + 1)) > "$FAIL_COUNTER"
+    exit 1
+fi
+MOBILE_RU_UPDATER_EOF
+chmod 0755 "$SHIELD_MOBILE_RU_UPDATER"
+print_ok "Mobile-RU updater: $SHIELD_MOBILE_RU_UPDATER"
+
+# 3) Templated systemd unit (обслуживает все 4 blocklist'а)
+cat > /etc/systemd/system/shieldnode-update@.service <<EOF
 [Unit]
-Description=Update shieldnode Tor exit blocklist
-Wants=network-online.target
+Description=Update shieldnode %i blocklist
 After=network-online.target shieldnode-nftables.service
+Wants=network-online.target
 Requires=shieldnode-nftables.service
 
 [Service]
 Type=oneshot
-ExecStart=$TOR_UPDATER_SCRIPT
+ExecStart=$SHIELD_UPDATER_SCRIPT %i
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=$SHIELD_STATE_DIR
 EOF
 
-    cat > /etc/systemd/system/tor-blocklist-update.timer <<'EOF'
+# 4) Per-list timers (с разными интервалами из defaults/config)
+make_timer() {
+    local n="$1" interval="$2"
+    cat > "/etc/systemd/system/shieldnode-update@${n}.timer" <<EOF
 [Unit]
-Description=Update shieldnode Tor exit blocklist hourly
-Requires=tor-blocklist-update.service
+Description=Update $n blocklist (every $interval)
+Requires=shieldnode-update@${n}.service
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=1h
-RandomizedDelaySec=300
+OnBootSec=1min
+OnUnitActiveSec=$interval
+RandomizedDelaySec=10min
+Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
+}
+make_timer scanner   "$DEFAULT_SCANNER_UPDATE_INTERVAL"
+make_timer threat    "$DEFAULT_THREAT_UPDATE_INTERVAL"
+make_timer tor       "$DEFAULT_TOR_UPDATE_INTERVAL"
+make_timer custom    "$DEFAULT_CUSTOM_UPDATE_INTERVAL"
+make_timer mobile_ru "$DEFAULT_MOBILE_RU_UPDATE_INTERVAL"
 
-    systemctl daemon-reload
-    systemctl enable tor-blocklist-update.timer >/dev/null 2>&1
+# 5) inotify path-watcher для custom (мгновенно реагирует на изменение файла)
+cat > /etc/systemd/system/shieldnode-update@custom.path <<EOF
+[Unit]
+Description=Watch custom blocklist file
 
-    # Первый запуск (blocking)
-    print_status "Качаю Tor exit list (первый запуск)..."
-    if systemctl start tor-blocklist-update.service; then
-        sleep 2
-        TOR_SIZE=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
-        if [ "$TOR_SIZE" -gt 0 ]; then
-            print_ok "Tor blocklist загружен: ${BOLD}$TOR_SIZE${NC} exit nodes"
-        else
-            print_warn "Tor blocklist пуст — проверь: journalctl -u tor-blocklist-update"
-        fi
-    else
-        print_warn "Первый запуск Tor updater'а провалился — продолжаем"
-        print_info "Проверь: journalctl -u tor-blocklist-update -n 30"
+[Path]
+PathChanged=$SHIELD_LISTS_DIR/custom.txt
+PathExists=$SHIELD_LISTS_DIR/custom.txt
+Unit=shieldnode-update@custom.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+
+# 6) Подготовка lists/ (pipe-mode скачивает с github, git-mode копирует ./lists/)
+mkdir -p "$SHIELD_LISTS_DIR"
+chmod 0755 "$SHIELD_LISTS_DIR"
+
+prepare_seed_list() {
+    local name="$1" target="$SHIELD_LISTS_DIR/${1}.txt"
+    # Если уже есть (от прошлой установки) — оставляем как есть
+    if [ -s "$target" ]; then
+        return 0
     fi
+    if [ "$SHIELD_PIPE_MODE" = "1" ]; then
+        # Pipe-mode: качаем дефолтный seed с github
+        if curl -fsSL --max-time 15 "$SHIELD_REPO_URL/lists/${name}.txt" -o "$target.tmp" 2>/dev/null; then
+            mv "$target.tmp" "$target"
+            return 0
+        fi
+        rm -f "$target.tmp"
+    elif [ -n "$SHIELD_SCRIPT_DIR" ] && [ -f "$SHIELD_SCRIPT_DIR/lists/${name}.txt" ]; then
+        cp "$SHIELD_SCRIPT_DIR/lists/${name}.txt" "$target"
+        return 0
+    fi
+    # Fallback: пустой файл с заголовком
+    cat > "$target" <<HDR_EOF
+# shieldnode $name blocklist (one IP or CIDR per line, # = comment)
+# Auto-merged with URL sources при наличии конфига.
+HDR_EOF
+}
+for n in scanner threat tor custom; do
+    prepare_seed_list "$n"
+done
 
-    systemctl start tor-blocklist-update.timer >/dev/null 2>&1
-    print_ok "Timer активен (обновление ежечасно с jitter ±5min)"
+# Опциональный shieldnode.conf — если оператор положил рядом со скриптом, копируем
+if [ -n "$SHIELD_SCRIPT_DIR" ] && [ -f "$SHIELD_SCRIPT_DIR/shieldnode.conf" ] && [ ! -f "$SHIELD_CONF_FILE" ]; then
+    cp "$SHIELD_SCRIPT_DIR/shieldnode.conf" "$SHIELD_CONF_FILE"
+    chmod 0644 "$SHIELD_CONF_FILE"
+    print_ok "Config: $SHIELD_CONF_FILE (из git-clone)"
+fi
 
-    # Маркер для повторных запусков скрипта
+print_ok "Lists: $SHIELD_LISTS_DIR/{scanner,threat,tor,custom}.txt"
+
+# 7) Включаем и запускаем blocklists. Tor — только если BLOCK_TOR=1.
+# v3.13.0: mobile_ru — только если ENABLE_RU_MOBILE_WHITELIST=1 (по умолчанию ON,
+# но без MAXMIND_LICENSE_KEY первый запуск запишет WARN и оставит set пустым).
+ENABLED_LISTS=(scanner threat custom)
+if [ "$BLOCK_TOR" = "1" ]; then
+    ENABLED_LISTS+=(tor)
     mkdir -p /etc/shieldnode
     touch /etc/shieldnode/block_tor
 fi
+if [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" = "1" ]; then
+    ENABLED_LISTS+=(mobile_ru)
+fi
+
+declare -A LIST_SIZES
+for n in "${ENABLED_LISTS[@]}"; do
+    systemctl enable "shieldnode-update@${n}.timer" >/dev/null 2>&1
+    # Первый запуск (blocking) для немедленного заполнения set'а
+    print_status "Загружаю $n blocklist..."
+    if systemctl start "shieldnode-update@${n}.service" 2>/dev/null; then
+        sleep 1
+        SET_NAME=$(case "$n" in
+            scanner)   echo "scanner_blocklist_v4" ;;
+            threat)    echo "threat_blocklist_v4"  ;;
+            tor)       echo "tor_exit_blocklist_v4" ;;
+            custom)    echo "custom_blocklist_v4"  ;;
+            mobile_ru) echo "mobile_ru_whitelist_v4" ;;
+        esac)
+        SIZE=$(nft list set inet ddos_protect "$SET_NAME" 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+        SIZE="${SIZE:-0}"
+        LIST_SIZES[$n]="$SIZE"
+    else
+        LIST_SIZES[$n]=0
+    fi
+    systemctl start "shieldnode-update@${n}.timer" >/dev/null 2>&1
+done
+
+# Path-watcher для custom (всегда активен независимо от BLOCK_TOR)
+systemctl enable --now shieldnode-update@custom.path >/dev/null 2>&1
+
+print_ok "Blocklists активны: $(
+    for n in "${ENABLED_LISTS[@]}"; do
+        printf "%s=%s " "$n" "${LIST_SIZES[$n]:-0}"
+    done
+)"
+
 
 # ==============================================================================
 # ШАГ 7: УСТАНОВКА CROWDSEC
@@ -3397,6 +3950,17 @@ CREATE TABLE IF NOT EXISTS aggregator_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- v3.12.0: ASN/owner кэш для guard CLI top-attackers column
+-- TTL 7 дней (cached_at + 604800 < now → re-fetch from ipinfo.io/<IP>)
+CREATE TABLE IF NOT EXISTS asn_cache (
+    ip         TEXT PRIMARY KEY,
+    asn        TEXT,
+    owner      TEXT,
+    country    TEXT,
+    cached_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_asn_cache_cached_at ON asn_cache(cached_at);
 SQL_EOF
 chmod 0640 "$DB_FILE"
 print_ok "БД создана: $DB_FILE"
@@ -3438,9 +4002,10 @@ fi
 # Извлекаем cursor из последней строки и удаляем его из вывода
 NEW_CURSOR=$(grep -oE '^-- cursor: .+$' "$TMP" | tail -1 | sed 's/^-- cursor: //')
 
-# Парсим сообщения [shield:scanner], [shield:ddos] и [shield:tor]   v3.11
+# Парсим сообщения [shield:scanner], [shield:ddos], [shield:tor] (v3.11),
+# [shield:threat] и [shield:custom] (v3.12.0), [shield:mobile_ru_drop] (v3.13.1)
 # Формат kernel-лога: "[shield:scanner] IN=eth0 SRC=85.142.100.2 DST=... PROTO=TCP DPT=8443 ..."
-declare -A scanner_ips ddos_ips tor_ips
+declare -A scanner_ips ddos_ips tor_ips threat_ips custom_ips mobile_ru_ips
 # v3.5: для events.log — собираем порт назначения и тип flood'а
 declare -A ddos_ports ddos_proto
 
@@ -3462,6 +4027,15 @@ while IFS='|' read -r kind ip port proto; do
         tor)
             [ -n "$ip" ] && tor_ips[$ip]=$((${tor_ips[$ip]:-0} + 1))
             ;;
+        threat)
+            [ -n "$ip" ] && threat_ips[$ip]=$((${threat_ips[$ip]:-0} + 1))
+            ;;
+        custom)
+            [ -n "$ip" ] && custom_ips[$ip]=$((${custom_ips[$ip]:-0} + 1))
+            ;;
+        mobile_ru)
+            [ -n "$ip" ] && mobile_ru_ips[$ip]=$((${mobile_ru_ips[$ip]:-0} + 1))
+            ;;
     esac
 done < <(awk '
     /\[shield:scanner\]/ {
@@ -3481,6 +4055,24 @@ done < <(awk '
         if (match($0, /SRC=[^ ]+/)) {
             ip = substr($0, RSTART+4, RLENGTH-4)
             if (ip != "") print "tor|" ip "||"
+        }
+    }
+    /\[shield:threat\]/ {
+        if (match($0, /SRC=[^ ]+/)) {
+            ip = substr($0, RSTART+4, RLENGTH-4)
+            if (ip != "") print "threat|" ip "||"
+        }
+    }
+    /\[shield:custom\]/ {
+        if (match($0, /SRC=[^ ]+/)) {
+            ip = substr($0, RSTART+4, RLENGTH-4)
+            if (ip != "") print "custom|" ip "||"
+        }
+    }
+    /\[shield:mobile_ru_drop\]/ {
+        if (match($0, /SRC=[^ ]+/)) {
+            ip = substr($0, RSTART+4, RLENGTH-4)
+            if (ip != "") print "mobile_ru|" ip "||"
         }
     }
 ' "$TMP")
@@ -3508,6 +4100,20 @@ TS=$(date '+%Y-%m-%d %H:%M:%S')
     for ip in "${!tor_ips[@]}"; do
         cnt=${tor_ips[$ip]}
         echo "[$TS] TOR EXIT BLOCK ip=$ip hits=$cnt"
+    done
+    # v3.12.0: threat + custom blocklists
+    for ip in "${!threat_ips[@]}"; do
+        cnt=${threat_ips[$ip]}
+        echo "[$TS] THREAT BLOCK ip=$ip hits=$cnt"
+    done
+    for ip in "${!custom_ips[@]}"; do
+        cnt=${custom_ips[$ip]}
+        echo "[$TS] CUSTOM BLOCK ip=$ip hits=$cnt"
+    done
+    # v3.13.1: mobile-RU drops (превысили даже relaxed-лимит ct=1000)
+    for ip in "${!mobile_ru_ips[@]}"; do
+        cnt=${mobile_ru_ips[$ip]}
+        echo "[$TS] MOBILE_RU OVERFLOW ip=$ip hits=$cnt (CGNAT exceeded ct=1000)"
     done
 } >> "$EVENTS_LOG" 2>/dev/null
 
@@ -3567,6 +4173,20 @@ NOW=$(date +%s)
         cnt=${tor_ips[$ip]}
         echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('tor', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
     done
+    # v3.12.0: threat + custom blocklists
+    for ip in "${!threat_ips[@]}"; do
+        cnt=${threat_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('threat', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
+    for ip in "${!custom_ips[@]}"; do
+        cnt=${custom_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('custom', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
+    # v3.13.1: mobile-RU overflow events
+    for ip in "${!mobile_ru_ips[@]}"; do
+        cnt=${mobile_ru_ips[$ip]}
+        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('mobile_ru', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
+    done
     if [ -n "$NEW_CURSOR" ]; then
         # Экранируем одинарные кавычки в cursor
         ESC_CURSOR=$(echo "$NEW_CURSOR" | sed "s/'/''/g")
@@ -3579,8 +4199,11 @@ NOW=$(date +%s)
 TOTAL_SCANNERS=${#scanner_ips[@]}
 TOTAL_DDOS=${#ddos_ips[@]}
 TOTAL_TOR=${#tor_ips[@]}
-if [ $TOTAL_SCANNERS -gt 0 ] || [ $TOTAL_DDOS -gt 0 ] || [ $TOTAL_TOR -gt 0 ]; then
-    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS, ddos=$TOTAL_DDOS, tor=$TOTAL_TOR unique IPs"
+TOTAL_THREAT=${#threat_ips[@]}
+TOTAL_CUSTOM=${#custom_ips[@]}
+TOTAL_MOBILE_RU=${#mobile_ru_ips[@]}
+if [ $TOTAL_SCANNERS -gt 0 ] || [ $TOTAL_DDOS -gt 0 ] || [ $TOTAL_TOR -gt 0 ] || [ $TOTAL_THREAT -gt 0 ] || [ $TOTAL_CUSTOM -gt 0 ] || [ $TOTAL_MOBILE_RU -gt 0 ]; then
+    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS, ddos=$TOTAL_DDOS, tor=$TOTAL_TOR, threat=$TOTAL_THREAT, custom=$TOTAL_CUSTOM, mobile_ru=$TOTAL_MOBILE_RU unique IPs"
 fi
 AGG_EOF
 
@@ -3741,7 +4364,7 @@ collect_stats() {
         CS_BANS=$(cscli decisions list --type ban -o raw 2>/dev/null | tail -n +2 | wc -l)
     fi
 
-    LAST_UPDATE=$(systemctl show scanner-blocklist-update.service \
+    LAST_UPDATE=$(systemctl show shieldnode-update@scanner.service \
         --property=ExecMainExitTimestamp --value 2>/dev/null | \
         xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
     LAST_UPDATE="${LAST_UPDATE:-—}"
@@ -3768,6 +4391,9 @@ collect_stats() {
     read SYN_CONF_PKTS_V4 SYN_CONF_BYTES_V4 <<< "$(read_counter syn_confirmed_v4)"
     read UDP_CONF_PKTS_V4 UDP_CONF_BYTES_V4 <<< "$(read_counter udp_confirmed_v4)"
     read TOR_PKTS_V4 TOR_BYTES_V4 <<< "$(read_counter tor_drops_v4)"     # v3.11
+    # v3.12.0: threat + custom counters
+    read THREAT_PKTS_V4 THREAT_BYTES_V4 <<< "$(read_counter threat_drops_v4)"
+    read CUSTOM_PKTS_V4 CUSTOM_BYTES_V4 <<< "$(read_counter custom_drops_v4)"
     # v3.5: HTTP/conn-flood counters
     read CONN_FLOOD_PKTS_V4 CONN_FLOOD_BYTES_V4 <<< "$(read_counter conn_flood_v4)"
     read NEWCONN_FLOOD_PKTS_V4 NEWCONN_FLOOD_BYTES_V4 <<< "$(read_counter newconn_flood_v4)"
@@ -3775,8 +4401,23 @@ collect_stats() {
 
     # v3.11: размер tor blocklist set'а
     TOR_SET_SIZE=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+        tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
     TOR_SET_SIZE="${TOR_SET_SIZE:-0}"
+
+    # v3.12.0: размеры threat + custom blocklist set'ов
+    THREAT_SET_SIZE=$(nft list set inet ddos_protect threat_blocklist_v4 2>/dev/null | \
+        tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+    THREAT_SET_SIZE="${THREAT_SET_SIZE:-0}"
+    CUSTOM_SET_SIZE=$(nft list set inet ddos_protect custom_blocklist_v4 2>/dev/null | \
+        tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+    CUSTOM_SET_SIZE="${CUSTOM_SET_SIZE:-0}"
+
+    # v3.13.0: размер mobile-RU whitelist + counters
+    MOBILE_RU_SET_SIZE=$(nft list set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null | \
+        tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+    MOBILE_RU_SET_SIZE="${MOBILE_RU_SET_SIZE:-0}"
+    read MOBILE_RU_PASS_PKTS MOBILE_RU_PASS_BYTES <<< "$(read_counter mobile_ru_passes_v4)"
+    read MOBILE_RU_CONN_PKTS MOBILE_RU_CONN_BYTES <<< "$(read_counter mobile_ru_conn_flood_v4)"
 
     # Когда nft started — для "stats since"
     NFT_SINCE=$(systemctl show nftables.service --property=ActiveEnterTimestamp --value 2>/dev/null | \
@@ -3844,31 +4485,130 @@ fmt_status() {
     esac
 }
 
+# v3.12.0: ASN/owner lookup для top attackers через ipinfo.io.
+# Кэш в events.db (asn_cache table), TTL 7 дней.
+# При no-internet или rate-limit возвращает "?" — guard продолжает работать.
+asn_ttl=604800   # 7 дней
+
+asn_cache_get() {
+    # echoes "asn|owner|country" if cached and fresh; empty otherwise
+    local ip="$1" db="/var/lib/shieldnode/events.db"
+    [ -r "$db" ] || return 1
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    local now; now=$(date +%s)
+    sqlite3 "$db" "SELECT asn || '|' || COALESCE(owner,'') || '|' || COALESCE(country,'') FROM asn_cache WHERE ip = '$ip' AND cached_at + $asn_ttl > $now LIMIT 1" 2>/dev/null
+}
+
+asn_cache_put() {
+    local ip="$1" asn="$2" owner="$3" country="$4" db="/var/lib/shieldnode/events.db"
+    [ -w "$db" ] || return 1
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    local now; now=$(date +%s)
+    # SQL-escape одинарных кавычек
+    local esc_asn esc_owner esc_country
+    esc_asn=$(echo "$asn"     | sed "s/'/''/g")
+    esc_owner=$(echo "$owner" | sed "s/'/''/g")
+    esc_country=$(echo "$country" | sed "s/'/''/g")
+    sqlite3 "$db" "INSERT INTO asn_cache(ip, asn, owner, country, cached_at) VALUES('$ip','$esc_asn','$esc_owner','$esc_country',$now) ON CONFLICT(ip) DO UPDATE SET asn='$esc_asn', owner='$esc_owner', country='$esc_country', cached_at=$now" 2>/dev/null
+}
+
+asn_lookup_remote() {
+    # Запрашиваем ipinfo.io/<IP> (JSON, 1 запрос даёт всё). Таймаут 2 сек.
+    # Free tier: 50k req/month — c кэшем 7d вполне хватает.
+    # Возвращает "asn|owner|country" или пустую строку.
+    local ip="$1"
+    local resp
+    resp=$(curl -fsSL --max-time 2 "https://ipinfo.io/${ip}" 2>/dev/null) || return 1
+    [ -z "$resp" ] && return 1
+    # Парсим без jq (минимизация зависимостей):
+    #   "org": "AS12958 T2 Mobile LLC"
+    #   "country": "RU"
+    local org country asn owner
+    org=$(echo "$resp"     | grep -oE '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/')
+    country=$(echo "$resp" | grep -oE '"country"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/')
+    if [ -n "$org" ]; then
+        asn=$(echo "$org"   | awk '{print $1}')
+        owner=$(echo "$org" | cut -d' ' -f2-)
+    fi
+    echo "${asn:-?}|${owner:-?}|${country:-?}"
+}
+
+# Lookup IP → "owner (country)" string (для отображения).
+# Использует кэш + если miss/expired → один запрос к ipinfo.io.
+asn_owner_string() {
+    local ip="$1"
+    local cached; cached=$(asn_cache_get "$ip")
+    if [ -n "$cached" ]; then
+        local owner country
+        IFS='|' read -r _asn owner country <<< "$cached"
+        if [ -n "$owner" ] && [ "$owner" != "?" ]; then
+            echo "${owner} (${country})"
+        else
+            echo "?"
+        fi
+        return 0
+    fi
+    # Cache miss
+    local fresh; fresh=$(asn_lookup_remote "$ip" 2>/dev/null)
+    if [ -n "$fresh" ]; then
+        local asn owner country
+        IFS='|' read -r asn owner country <<< "$fresh"
+        asn_cache_put "$ip" "$asn" "$owner" "$country"
+        if [ -n "$owner" ] && [ "$owner" != "?" ]; then
+            echo "${owner} (${country})"
+        else
+            echo "?"
+        fi
+        return 0
+    fi
+    echo "?"
+}
+
+# Top-N attackers из events.db за последние 24 часа.
+# Печатает строки "ip<TAB>hits" (наибольшие сверху).
+top_attackers_24h() {
+    local n="${1:-20}" db="/var/lib/shieldnode/events.db"
+    [ -r "$db" ] || return 1
+    command -v sqlite3 >/dev/null 2>&1 || return 1
+    local since=$(( $(date +%s) - 86400 ))
+    sqlite3 -separator $'\t' "$db" \
+        "SELECT ip, SUM(count) as hits FROM events WHERE last_seen >= $since GROUP BY ip ORDER BY hits DESC LIMIT $n" 2>/dev/null
+}
+
 # === ВЫВОД ===
 draw_snapshot() {
     local now=$(date '+%Y-%m-%d %H:%M:%S')
     local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     local hn=$(hostname -s 2>/dev/null)
+    local uptime_str
+    uptime_str=$(uptime -p 2>/dev/null | sed 's/^up //')
 
-    # ===== HERO HEADER =====
-    # v3.2: убран эмодзи 🛡 — занимает 2 cells, ломает выравнивание правой ║
+    # ===== HEADER (v3.12.0) =====
     echo ""
-    echo -e "${C}╔══════════════════════════════════════════════════════════════════╗${N}"
-    printf "${C}║${N}  ${B}SHIELDNODE${N} ${DIM}·${N} ${C}%-15s${N} ${DIM}·${N} %s ${DIM}·${N} %s    ${C}║${N}\n" "$ip" "$hn" "$now"
-    echo -e "${C}╚══════════════════════════════════════════════════════════════════╝${N}"
+    echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
+    printf  "  ${B}shieldnode v3.13.1${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
+    echo ""
 
-    # ===== HERO STATS (3 колонки) =====
-    local total_alltime=$((ALLTIME_SCANNERS + ALLTIME_DDOS + CS_ALLTIME_BANS))
-    local active_threats=$((CS_BANS + CONFIRMED_COUNT))
+    # ===== ACTIVE THREATS (right now) =====
     local active_color="${G}"
-    [ "$active_threats" -gt 0 ] && active_color="${R}"
-
-    echo ""
-    echo -e "  ${DIM}┌──────────────────────┬──────────────────────┬────────────────────┐${N}"
-    printf  "  ${DIM}│${N} ${DIM}Blocklist coverage${N}   ${DIM}│${N} ${DIM}All-time blocked${N}     ${DIM}│${N} ${DIM}Active threats${N}     ${DIM}│${N}\n"
-    printf  "  ${DIM}│${N} ${C}${B}%-20s${N} ${DIM}│${N} ${M}${B}%-20s${N} ${DIM}│${N} ${active_color}${B}%-18s${N} ${DIM}│${N}\n" \
-        "$(human_num "$BL_V4") IPs" "$(human_num "$total_alltime") IPs" "$active_threats now"
-    echo -e "  ${DIM}└──────────────────────┴──────────────────────┴────────────────────┘${N}"
+    [ "$((CS_BANS + CONFIRMED_COUNT))" -gt 0 ] && active_color="${R}"
+    echo -e "  ${B}Active threats (right now)${N}"
+    printf  "  ├─ ${active_color}confirmed attack${N}    %s IP banned 15min\n"          "$(human_num "$CONFIRMED_COUNT")"
+    printf  "  ├─ ${active_color}suspect (watched)${N}   %s IP under 30min observation\n" "$(human_num "$SUSPECT_COUNT")"
+    printf  "  ├─ ${active_color}crowdsec bans${N}       %s IPs\n"                       "$(human_num "$CS_BANS")"
+    local bl_summary="scanner=$(human_num "$BL_V4")"
+    [ "$THREAT_SET_SIZE" -gt 0 ] && bl_summary+=", threat=$(human_num "$THREAT_SET_SIZE")"
+    [ "$TOR_SET_SIZE"    -gt 0 ] && bl_summary+=", tor=$(human_num "$TOR_SET_SIZE")"
+    [ "$CUSTOM_SET_SIZE" -gt 0 ] && bl_summary+=", custom=$(human_num "$CUSTOM_SET_SIZE")"
+    printf  "  ├─ ${DIM}blocklists${N}          %s\n" "$bl_summary"
+    # v3.13.0: mobile-RU whitelist line (только если активен и не пустой)
+    if [ "$MOBILE_RU_SET_SIZE" -gt 0 ]; then
+        printf  "  └─ ${G}mobile-RU whitelist${N} %s CIDRs ${DIM}(relaxed: ct=1000, newconn=2000/min, %s passes)${N}\n" \
+            "$(human_num "$MOBILE_RU_SET_SIZE")" "$(human_num "$MOBILE_RU_PASS_PKTS")"
+    else
+        printf  "  └─ ${DIM}mobile-RU whitelist${N} ${DIM}disabled or empty (set MAXMIND_LICENSE_KEY in shieldnode.conf to enable)${N}\n"
+    fi
     echo ""
 
     # ===== SERVICES (compact one-line) =====
@@ -3876,57 +4616,73 @@ draw_snapshot() {
     svc_line+=$(svc_dot "$CS_ACTIVE" "crowdsec")"  "
     svc_line+=$(svc_dot "$BOUNCER_ACTIVE" "bouncer")"  "
     svc_line+=$(svc_dot "$PORTS_PATH_ACTIVE" "ports")
-    echo -e "  ${B}⚙  Services${N}"
-    echo -e "  $svc_line"
+    echo -e "  ${B}Services${N}    $svc_line"
     echo ""
 
     # ===== PROTECTED PORTS =====
-    echo -e "  ${B}🔒 Protected${N}"
+    echo -e "  ${B}Protected${N}"
     printf  "  ├─ ${DIM}TCP:${N}  ${C}%s${N}\n" "$PROTECTED_TCP_LIST"
     printf  "  └─ ${DIM}UDP:${N}  ${C}%s${N}\n" "$PROTECTED_UDP_LIST"
     echo ""
 
-    # ===== ACTIVE NOW =====
-    echo -e "  ${B}🔥 Active blocks${N} ${DIM}(right now, dynamic timeouts)${N}"
-    printf  "  ├─ ${R}confirmed attacks${N}     ${R}${B}%5d${N} IPs ${DIM}(banned 1h)${N}\n"             "$CONFIRMED_COUNT"
-    printf  "  ├─ ${Y}suspect (watched)${N}     ${Y}${B}%5d${N} IPs ${DIM}(observed 30min)${N}\n"        "$SUSPECT_COUNT"
-    printf  "  ├─ ${R}crowdsec bans${N}         ${R}${B}%5d${N} IPs ${DIM}(behavioural detection)${N}\n" "$CS_BANS"
-    printf  "  ├─ ${R}scanner blocklist${N}     ${R}${B}%5d${N} IPs ${DIM}(IPv4)${N}\n"                  "$BL_V4"
-    if [ "$TOR_SET_SIZE" -gt 0 ]; then
-        printf  "  ├─ ${R}tor exit blocklist${N}    ${R}${B}%5d${N} IPs ${DIM}(IPv4)${N}\n" "$TOR_SET_SIZE"
+    # ===== TOP ATTACKERS (v3.12.0, last 24h, with ASN/owner) =====
+    local top_lines
+    top_lines=$(top_attackers_24h 5)
+    if [ -n "$top_lines" ]; then
+        echo -e "  ${B}Top attackers${N} ${DIM}(last 24h)${N}"
+        local fmtd=""
+        local lcount=0
+        while IFS=$'\t' read -r ip hits; do
+            [ -z "$ip" ] && continue
+            lcount=$((lcount+1))
+            local owner; owner=$(asn_owner_string "$ip")
+            local prefix="├─"
+            fmtd+=$(printf "  %s ${R}%-15s${N} ${DIM}%5s hits${N}   %s\n" "$prefix" "$ip" "$(human_num "$hits")" "$owner")
+            fmtd+=$'\n'
+        done <<< "$top_lines"
+        # Меняем последний ├─ на └─
+        if [ -n "$fmtd" ]; then
+            fmtd=$(echo -e "$fmtd" | sed -E '$ s/├─/└─/' )
+            echo -e "$fmtd"
+        fi
+        echo ""
     fi
-    printf  "  └─ ${G}whitelist${N}             ${G}${B}%5d${N} IPs ${DIM}(manual)${N}\n" "$MANUAL_WHITE"
-    echo ""
 
-    # ===== TOTAL BLOCKED (since boot) =====
-    local total_pkts=$((SCANNER_PKTS_V4 + TOR_PKTS_V4 + CONFIRMED_PKTS_V4 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4 + CONN_FLOOD_PKTS_V4 + NEWCONN_FLOOD_PKTS_V4 + TCP_INVALID_PKTS))
-    local total_bytes=$((SCANNER_BYTES_V4 + TOR_BYTES_V4 + CONFIRMED_BYTES_V4 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4 + CONN_FLOOD_BYTES_V4 + NEWCONN_FLOOD_BYTES_V4 + TCP_INVALID_BYTES))
+    # ===== TODAY (drops / bytes) =====
+    local total_pkts=$((SCANNER_PKTS_V4 + TOR_PKTS_V4 + THREAT_PKTS_V4 + CUSTOM_PKTS_V4 + CONFIRMED_PKTS_V4 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4 + CONN_FLOOD_PKTS_V4 + NEWCONN_FLOOD_PKTS_V4 + TCP_INVALID_PKTS))
+    local total_bytes=$((SCANNER_BYTES_V4 + TOR_BYTES_V4 + THREAT_BYTES_V4 + CUSTOM_BYTES_V4 + CONFIRMED_BYTES_V4 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4 + CONN_FLOOD_BYTES_V4 + NEWCONN_FLOOD_BYTES_V4 + TCP_INVALID_BYTES))
 
-    echo -e "  ${B}📊 Since reboot${N} ${DIM}($NFT_SINCE)${N}"
-    printf  "  ├─ ${DIM}scanner drops:${N}        %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SCANNER_PKTS_V4")" "$(human_bytes "$SCANNER_BYTES_V4")"
+    echo -e "  ${B}Drops since reboot${N} ${DIM}($NFT_SINCE)${N}"
+    printf  "  ├─ ${DIM}scanner${N}             %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$SCANNER_PKTS_V4")" "$(human_bytes "$SCANNER_BYTES_V4")"
+    if [ "$THREAT_SET_SIZE" -gt 0 ] || [ "$THREAT_PKTS_V4" -gt 0 ]; then
+        printf  "  ├─ ${DIM}threat${N}              %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$THREAT_PKTS_V4")" "$(human_bytes "$THREAT_BYTES_V4")"
+    fi
+    if [ "$CUSTOM_SET_SIZE" -gt 0 ] || [ "$CUSTOM_PKTS_V4" -gt 0 ]; then
+        printf  "  ├─ ${DIM}custom${N}              %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$CUSTOM_PKTS_V4")" "$(human_bytes "$CUSTOM_BYTES_V4")"
+    fi
     if [ "$TOR_SET_SIZE" -gt 0 ] || [ "$TOR_PKTS_V4" -gt 0 ]; then
-        printf  "  ├─ ${DIM}tor exit drops:${N}       %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$TOR_PKTS_V4")" "$(human_bytes "$TOR_BYTES_V4")"
+        printf  "  ├─ ${DIM}tor exit${N}            %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$TOR_PKTS_V4")" "$(human_bytes "$TOR_BYTES_V4")"
     fi
-    printf  "  ├─ ${DIM}attack drops:${N}         %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONFIRMED_PKTS_V4")" "$(human_bytes "$CONFIRMED_BYTES_V4")"
-    printf  "  ├─ ${DIM}rate-limit (syn):${N}     %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
-    printf  "  ├─ ${DIM}rate-limit (udp):${N}     %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
-    printf  "  ├─ ${DIM}conn-flood (ct>150):${N}  %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONN_FLOOD_PKTS_V4")" "$(human_bytes "$CONN_FLOOD_BYTES_V4")"
-    printf  "  ├─ ${DIM}new-conn flood:${N}       %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$NEWCONN_FLOOD_BYTES_V4")"
-    printf  "  ├─ ${DIM}TCP flag invalid:${N}     %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$TCP_INVALID_PKTS")" "$(human_bytes "$TCP_INVALID_BYTES")"
-    printf  "  └─ ${B}total:${N}                ${B}%12s${N} pkts  ${DIM}/${N} ${B}%s${N}\n" "$(human_num "$total_pkts")" "$(human_bytes "$total_bytes")"
+    printf  "  ├─ ${DIM}confirmed-attack${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONFIRMED_PKTS_V4")" "$(human_bytes "$CONFIRMED_BYTES_V4")"
+    printf  "  ├─ ${DIM}rate-limit (syn)${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
+    printf  "  ├─ ${DIM}rate-limit (udp)${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
+    printf  "  ├─ ${DIM}conn-flood (ct>400)${N} %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONN_FLOOD_PKTS_V4")" "$(human_bytes "$CONN_FLOOD_BYTES_V4")"
+    printf  "  ├─ ${DIM}new-conn flood${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$NEWCONN_FLOOD_BYTES_V4")"
+    printf  "  ├─ ${DIM}TCP flag invalid${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$TCP_INVALID_PKTS")" "$(human_bytes "$TCP_INVALID_BYTES")"
+    printf  "  └─ ${B}total${N}               ${B}%12s${N} pkts  ${DIM}/${N} ${B}%s${N}\n" "$(human_num "$total_pkts")" "$(human_bytes "$total_bytes")"
     echo ""
 
     # ===== ALL-TIME (persistent) =====
-    echo -e "  ${B}📈 All-time history${N} ${DIM}(since $DB_SINCE, persistent in sqlite)${N}"
-    printf  "  ├─ ${M}🤖 scanners blocked:${N}    %12s unique IPs ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_SCANNERS")"   "$(human_num "$ALLTIME_SCANNER_PKTS")"
-    printf  "  ├─ ${M}💥 ddos blocked:${N}        %12s unique IPs ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_DDOS")"       "$(human_num "$ALLTIME_DDOS_PKTS")"
-    printf  "  └─ ${M}🔑 ssh brute attempts:${N}  %12s unique IPs ${DIM}(crowdsec)${N}\n" "$(human_num "$CS_ALLTIME_BANS")"
+    echo -e "  ${B}All-time history${N} ${DIM}(since $DB_SINCE)${N}"
+    printf  "  ├─ ${M}scanners blocked:${N}    %12s unique IPs ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_SCANNERS")"   "$(human_num "$ALLTIME_SCANNER_PKTS")"
+    printf  "  ├─ ${M}ddos blocked:${N}        %12s unique IPs ${DIM}(%s hits)${N}\n" "$(human_num "$ALLTIME_DDOS")"       "$(human_num "$ALLTIME_DDOS_PKTS")"
+    printf  "  └─ ${M}ssh brute attempts:${N}  %12s unique IPs ${DIM}(crowdsec)${N}\n" "$(human_num "$CS_ALLTIME_BANS")"
     echo ""
 
     # ===== RECENT EVENTS (v3.5) =====
     local events_log="/var/log/shieldnode/events.log"
     if [ -r "$events_log" ]; then
-        echo -e "  ${B}🕒 Recent events${N} ${DIM}(last 5 from $events_log — [9] for full log)${N}"
+        echo -e "  ${B}Recent events${N} ${DIM}(last 5 — [9] for full log)${N}"
         local last_lines
         last_lines=$(tail -5 "$events_log" 2>/dev/null)
         if [ -z "$last_lines" ]; then
@@ -3937,7 +4693,7 @@ draw_snapshot() {
         echo ""
     fi
 
-    printf "  ${DIM}🔄 Scanner blocklist updated: %s${N}\n" "$LAST_UPDATE"
+    printf "  ${DIM}Blocklist updated: %s${N}\n" "$LAST_UPDATE"
 }
 
 # Helper: status dot для compact services line
@@ -4435,22 +5191,22 @@ fi
 # 14. v3.11: Tor blocklist загружен если BLOCK_TOR=1
 if [ "$BLOCK_TOR" = "1" ]; then
     TOR_SET_COUNT=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | \
-        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+        tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
     if [ "$TOR_SET_COUNT" -ge 100 ]; then
         print_ok "Smoke: Tor blocklist загружен ($TOR_SET_COUNT exit nodes)"
     elif [ "$TOR_SET_COUNT" -gt 0 ]; then
         print_warn "WARN: Tor blocklist подозрительно мал ($TOR_SET_COUNT IPs, ожидается 1000+)"
-        print_info "       Проверь: journalctl -u tor-blocklist-update -n 30"
+        print_info "       Проверь: journalctl -u shieldnode-update@tor -n 30"
     else
         print_error "FAIL: BLOCK_TOR=1 включён, но Tor blocklist пустой"
-        print_info "       Проверь: journalctl -u tor-blocklist-update -n 30"
+        print_info "       Проверь: journalctl -u shieldnode-update@tor -n 30"
         SMOKE_FAIL=1
     fi
-    # Timer должен быть active
-    if systemctl is-active --quiet tor-blocklist-update.timer; then
-        print_ok "Smoke: tor-blocklist-update.timer активен (hourly refresh)"
+    # Timer должен быть active (v3.12.0: templated unit)
+    if systemctl is-active --quiet shieldnode-update@tor.timer; then
+        print_ok "Smoke: shieldnode-update@tor.timer активен (hourly refresh)"
     else
-        print_warn "WARN: tor-blocklist-update.timer не active"
+        print_warn "WARN: shieldnode-update@tor.timer не active"
     fi
 fi
 
@@ -4492,156 +5248,65 @@ BL_V4=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | grep -
 if [ "$BL_V4" -gt 0 ]; then
     print_ok "Scanner blocklist: $BL_V4 IPv4 подсетей"
 else
-    print_warn "Scanner blocklist пуст — проверь journalctl -u scanner-blocklist-update"
+    print_warn "Scanner blocklist пуст — проверь journalctl -u shieldnode-update@scanner"
 fi
 
 # ==============================================================================
-# ШАГ 14: ИТОГИ
+# ШАГ 14: ИТОГИ (v3.12.0 — компактно)
 # ==============================================================================
 
-print_header "ГОТОВО"
-
-echo -e "  ${BOLD}Что настроено:${NC}"
-echo -e "  ├─ ${GREEN}✔${NC} nft rate-limit: 300 SYN/sec TCP, 600 packets/sec UDP (CGNAT-friendly, ban-once)"
-echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}HTTP/conn-flood защита (v3.10.2):${NC} ct count 150 + new-conn 200/min + TCP flag sanity"
-if [ "${ENABLE_FIB_ANTISPOOF:-0}" = "1" ]; then
-    echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Anti-spoofing (v3.8):${NC} fib reverse-path check (single-homed VPS)"
-fi
-echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}TCP MSS clamping (v3.8):${NC} устраняет фрагментацию в VPN-туннеле (faster, не slower)"
-echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Scanner blocklist:${NC} pre-emptive drop российских госсканеров"
-echo -e "  │   ├─ traffic-guard-lists (общие сканеры, Shodan, Censys)"
-echo -e "  │   ├─ ${BOLD}tread-lightly/CyberOK_Skipa_ips${NC} (SKIPA scan-XX, ГРЧЦ, НКЦКИ)"
-echo -e "  │   ├─ ${BOLD}MISP/CIRCL${NC} (honeypot-verified scanner IPs)"
-echo -e "  │   └─ обновление каждые 6 часов из 3 источников"
-if [ "$BLOCK_TOR" = "1" ]; then
-    TOR_NUM=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
-    echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Tor exit blocklist (v3.11):${NC} ${TOR_NUM:-0} exit nodes, обновление ежечасно"
-fi
-echo -e "  ├─ ${GREEN}✔${NC} Защищённые TCP-порты: ${CYAN}$XRAY_PORTS_TCP${NC}"
-[ -n "$XRAY_PORTS_UDP" ] && echo -e "  ├─ ${GREEN}✔${NC} Защищённые UDP-порты: ${CYAN}$XRAY_PORTS_UDP${NC}"
-echo -e "  ├─ ${GREEN}✔${NC} ${BOLD}Auto-sync портов с фаерволом:${NC} мгновенно через inotify + 60с safety"
-echo -e "  │   └─ Открыл порт в UFW → защита подхватит за < 1 секунды"
-if [ "$SSH_PORTS" = "$SSH_PORT" ]; then
-    echo -e "  ├─ ${GREEN}✔${NC} SSH порт ${CYAN}$SSH_PORT${NC} исключён из rate-limit"
-else
-    echo -e "  ├─ ${GREEN}✔${NC} SSH порты ${CYAN}$SSH_PORTS${NC} исключены из rate-limit"
-fi
-echo -e "  ├─ ${GREEN}✔${NC} CrowdSec collections: linux + sshd"
-echo -e "  ├─ ${GREEN}✔${NC} ssh-cve-2024-6387 (regreSSHion) активен"
-echo -e "  ├─ ${GREEN}✔${NC} Ban duration: 4h (user-friendly)"
-echo -e "  ├─ ${GREEN}✔${NC} Community blocklist: автообновление каждые 2 часа"
-echo -e "  ├─ ${GREEN}✔${NC} nftables bouncer применяет CrowdSec decisions"
-echo -e "  └─ ${GREEN}✔${NC} ${BOLD}Команда ${CYAN}guard${NC} ${BOLD}— дашборд защиты в реальном времени${NC}"
-echo ""
-
-# v1.6: главное приглашение посмотреть статистику
-echo -e "  ${BOLD}${MAGENTA}🛡  Посмотреть статистику защиты:${NC}"
-echo -e "     ${CYAN}sudo guard${NC}    # снимок состояния защиты"
-echo -e "     ${CYAN}sudo guard --json${NC}    # JSON для скриптов"
-echo -e "     ${CYAN}sudo watch -n 5 guard${NC}    # live-режим (через watch)"
-echo ""
-
-# v1.5: уровень защиты в зависимости от SSH-конфига
-if [ "${SSHD_PASSWORD_AUTH_ENABLED:-0}" = "1" ]; then
-    echo -e "  ${BOLD}${YELLOW}⚠ Уровень защиты: ХОРОШИЙ${NC} (90% максимума)"
-    echo -e "  Сервер защищён от:"
-    echo -e "  ${GREEN}✔${NC} DDoS / SYN-flood / port-scan атак"
-    echo -e "  ${GREEN}✔${NC} Известных сканеров (Shodan/Censys/gov)"
-    echo -e "  ${GREEN}✔${NC} SSH brute-force через CrowdSec"
-    echo -e "  ${GREEN}✔${NC} regreSSHion (CVE-2024-6387)"
-    echo ""
-    echo -e "  ${BOLD}${YELLOW}Чтобы получить МАКСИМАЛЬНУЮ защиту:${NC}"
-    echo -e "  ${BOLD}1.${NC} На локальной машине сгенерируй SSH-ключ:"
-    echo -e "     ${CYAN}ssh-keygen -t ed25519 -f ~/.ssh/vpn_admin${NC}"
-    echo -e "  ${BOLD}2.${NC} Скопируй публичный ключ на сервер:"
-    echo -e "     ${CYAN}ssh-copy-id -i ~/.ssh/vpn_admin.pub root@$(hostname -I | awk '{print $1}')${NC}"
-    echo -e "  ${BOLD}3.${NC} Проверь что заходит без пароля:"
-    echo -e "     ${CYAN}ssh -i ~/.ssh/vpn_admin root@$(hostname -I | awk '{print $1}')${NC}"
-    echo -e "  ${BOLD}4.${NC} ${BOLD}Только после успешной проверки${NC} — отключи пароль:"
-    echo -e "     ${CYAN}sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config${NC}"
-    echo -e "     ${CYAN}sed -i 's/^[#[:space:]]*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config${NC}"
-    echo -e "     ${CYAN}sshd -t && systemctl reload ssh${NC}"
-    echo ""
-else
-    echo -e "  ${BOLD}${GREEN}✔ Уровень защиты: МАКСИМАЛЬНЫЙ${NC}"
-    echo -e "  Password-auth выключен, защита SSH работает на полную"
-    echo ""
-fi
-
-echo -e "  ${BOLD}Многоуровневая защита (по приоритету):${NC}"
-echo -e "  1. ${CYAN}Manual whitelist${NC}      → доверенные IP (management из UFW + manual)"
-echo -e "  2. ${CYAN}SSH (порт $SSH_PORT)${NC}      → пропуск (защищает CrowdSec)"
-if [ "${ENABLE_FIB_ANTISPOOF:-0}" = "1" ]; then
-    echo -e "  3. ${CYAN}Anti-spoofing${NC}         → drop пакетов с нерутабельным src (fib check)"
-fi
-echo -e "  4. ${CYAN}Scanner blocklist${NC}     → drop ${BOLD}~3000${NC} известных сканеров"
-echo -e "      ├─ shadow-netlab/traffic-guard-lists (общие: Shodan, Censys, gov)"
-echo -e "      ├─ tread-lightly/CyberOK_Skipa_ips (SKIPA, ГРЧЦ, НКЦКИ)"
-echo -e "      └─ MISP/CIRCL warninglists (honeypot-verified)"
-echo -e "  5. ${CYAN}Confirmed attack${NC}      → drop IP подтверждённых атакующих (1 час)"
-echo -e "  6. ${CYAN}Rate-limit ban-once${NC}   → 1й удар = suspect (5 мин), 2й = бан"
-echo -e "      ├─ TCP SYN: ${BOLD}300/sec burst 500${NC} (CGNAT-friendly)"
-echo -e "      ├─ UDP:     ${BOLD}600/sec burst 1000${NC}"
-echo -e "      ├─ ct count: ${BOLD}50 concurrent${NC} на src IP (slowloris/conn-flood)"
-echo -e "      ├─ new-conn: ${BOLD}50/min burst 100${NC} (HTTP-flood через TLS)"
-echo -e "      └─ TCP flags: drop XMAS/NULL/SYN+FIN/SYN+RST/FIN+RST"
-echo -e "  7. ${CYAN}CrowdSec bouncer${NC}      → бан по поведению (SSH brute, regreSSHion)"
-echo -e "  8. ${CYAN}MSS clamping (forward)${NC} → ускорение VPN-трафика, устранение фрагментации"
-echo ""
-echo -e "  ${BOLD}${GREEN}User-friendly defaults:${NC}"
-echo -e "  ${GREEN}✔${NC} CGNAT юзеры (МТС/Билайн/МегаФон) не банятся — лимит 300/sec на IP"
-echo -e "  ${GREEN}✔${NC} Ban-once архитектура: случайный всплеск ≠ бан, два подряд = бан"
-echo -e "  ${GREEN}✔${NC} Профили с несколькими Xray-портами не банятся как 'port-scan'"
-echo -e "  ${GREEN}✔${NC} Ложные баны от CrowdSec живут 4h вместо 24h"
-echo -e "  ${GREEN}✔${NC} Юзеры из подсетей в blocklist — реально госсканеры, не домашние"
-echo ""
-echo -e "  ${BOLD}Как работает manual whitelist (v3.5):${NC}"
-echo -e "  1. Открой свой management-IP в UFW: ${CYAN}sudo ufw allow from <IP>${NC}"
-echo -e "  2. Path-watcher (${CYAN}protected-ports-update.path${NC}) подхватит изменение"
-echo -e "  3. IP попадёт в ${CYAN}nft set manual_whitelist_v4${NC} (обходит scanner+rate-limit+ct count)"
-echo -e "  4. CrowdSec-баны для этого IP переписать вручную: ${CYAN}cscli decisions delete --ip <IP>${NC}"
-echo -e "  ${MAGENTA}ℹ${NC} v3.5: SSH-key auto-whitelist удалён (вызывал баны админов на shared IP)."
-echo -e "     SSH защищён через CrowdSec sshd-bf + ssh-cve коллекции."
-echo ""
-echo -e "  ${BOLD}История блокировок (v2.9+):${NC}"
-echo -e "  ├─ ${CYAN}/var/lib/shieldnode/events.db${NC} — sqlite БД с историей всех IP"
-echo -e "  ├─ ${CYAN}/var/log/shieldnode/events.log${NC} — человекочитаемый лог (v3.5)"
-echo -e "  ├─ Агрегатор парсит journald раз в минуту, бесплатно по CPU"
-echo -e "  ├─ В guard: [6] history, [7] top attackers, [9] view full log (v3.5)"
-echo -e "  └─ Smetka: \`sqlite3 /var/lib/shieldnode/events.db 'SELECT * FROM events'\`"
-echo ""
-echo -e "  ${BOLD}Полезные команды:${NC}"
-echo -e "  ${CYAN}sudo guard${NC}                                          # дашборд"
-echo -e "  ${CYAN}tail -f /var/log/shieldnode/events.log${NC}              # human-readable события"
-echo -e "  ${CYAN}less /var/log/shieldnode/install.log${NC}                # лог установки (v3.5)"
-echo -e "  ${CYAN}cscli decisions list --type ban${NC}                     # активные CrowdSec-баны"
-echo -e "  ${CYAN}journalctl -u scanner-blocklist-update${NC}              # логи blocklist updater"
-echo -e "  ${CYAN}journalctl -t shieldnode-agg${NC}                        # логи агрегатора"
-echo -e "  ${CYAN}systemctl list-timers${NC}                               # когда след. обновления"
-echo -e "  ${CYAN}cscli metrics${NC}                                       # статистика парсеров"
-echo -e "  ${CYAN}nft list set inet ddos_protect confirmed_attack_v4${NC}  # подтверждённые баны"
-echo -e "  ${CYAN}nft list set inet ddos_protect scanner_blocklist_v4 | wc -l${NC}  # размер blocklist"
-echo ""
-echo -e "  ${BOLD}Принудительное обновление:${NC}"
-echo -e "  ${CYAN}systemctl start scanner-blocklist-update.service${NC}    # обновить blocklist сейчас"
-echo -e "  ${CYAN}systemctl start shieldnode-aggregator.service${NC}       # обновить историю сейчас"
-echo ""
-echo -e "  ${BOLD}Если потерял доступ и забанен:${NC}"
-echo -e "  Зайти через консоль провайдера (KVM/VNC) и:"
-echo -e "  ${CYAN}cscli decisions delete --ip <твой_IP>${NC}"
-echo -e "  ${CYAN}nft delete element inet ddos_protect confirmed_attack_v4 { <IP> }${NC}"
-echo -e "  ${CYAN}nft add element inet ddos_protect manual_whitelist_v4 { <IP> }${NC}"
-echo ""
-echo -e "  ${BOLD}Бэкап:${NC} ${CYAN}$BACKUP_DIR${NC}"
-echo ""
-# v1.5 fix: при запуске через pipe (curl ... | bash) или process substitution
-# $0 может быть /dev/fd/63 — некрасиво в выводе. Используем generic-команду.
+# v1.5 fix: $0 на pipe-mode = /dev/fd/63
 SCRIPT_NAME="$0"
 case "$SCRIPT_NAME" in
-    /dev/fd/*|/proc/*|bash|-bash|sh|-sh)
-        SCRIPT_NAME="shieldnode.sh"
-        ;;
+    /dev/fd/*|/proc/*|bash|-bash|sh|-sh) SCRIPT_NAME="shieldnode.sh" ;;
 esac
-echo -e "  ${BOLD}Удалить всё:${NC} ${CYAN}sudo bash $SCRIPT_NAME --uninstall${NC}"
-echo -e "  ${DIM}или: bash <(curl -sL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode.sh) --uninstall${NC}"
+
+# Метрики для summary
+SCANNER_NUM=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+THREAT_NUM=$(nft list set inet ddos_protect threat_blocklist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+CUSTOM_NUM=$(nft list set inet ddos_protect custom_blocklist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+TOR_NUM=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
+MOBILE_RU_NUM=$(nft list set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+CS_NUM=0
+if [ -r /var/lib/crowdsec/data/crowdsec.db ] && command -v sqlite3 >/dev/null 2>&1; then
+    CS_NUM=$(sqlite3 /var/lib/crowdsec/data/crowdsec.db "SELECT COUNT(*) FROM decisions WHERE type='ban' AND until > datetime('now')" 2>/dev/null)
+fi
+CS_NUM="${CS_NUM:-0}"
+TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
+
+echo ""
+echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.13.1 установлен${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
+echo ""
+echo -e "  ${BOLD}Защита активна:${NC}"
+echo -e "   • TCP-порты:     ${CYAN}${XRAY_PORTS_TCP}${NC} (${TCP_PORTS_COUNT} шт.)"
+[ -n "$XRAY_PORTS_UDP" ] && echo -e "   • UDP-порты:     ${CYAN}${XRAY_PORTS_UDP}${NC}"
+echo -e "   • CrowdSec:      $(printf "%'d" "$CS_NUM") IPs (community CAPI)"
+BL_LINE="scanner=$(printf "%'d" "${SCANNER_NUM:-0}"), threat=$(printf "%'d" "${THREAT_NUM:-0}"), custom=$(printf "%'d" "${CUSTOM_NUM:-0}")"
+[ "${TOR_NUM:-0}" -gt 0 ] && BL_LINE="$BL_LINE, tor=$(printf "%'d" "$TOR_NUM")"
+echo -e "   • Blocklists:    ${BL_LINE}"
+if [ "${MOBILE_RU_NUM:-0}" -gt 0 ]; then
+    echo -e "   • Mobile-RU:     $(printf "%'d" "$MOBILE_RU_NUM") CIDRs (relaxed: ct=1000, newconn=2000/min)"
+elif [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" = "1" ] && [ -z "${MAXMIND_LICENSE_KEY:-}" ]; then
+    echo -e "   • Mobile-RU:     ${YELLOW}отключён${NC} ${DIM}(нет MAXMIND_LICENSE_KEY в shieldnode.conf)${NC}"
+fi
+echo -e "   • Лимиты:        ct=400, new-conn=500/min ${DIM}(CGNAT-friendly)${NC}"
+echo ""
+echo -e "  ${BOLD}Команды:${NC}"
+echo -e "   ${CYAN}sudo guard${NC}                — дашборд защиты"
+echo -e "   ${CYAN}sudo guard --once${NC}         — снимок без меню"
+echo -e "   ${CYAN}sudo bash $SCRIPT_NAME --uninstall${NC}  — удалить"
+echo ""
+if [ "${SSHD_PASSWORD_AUTH_ENABLED:-0}" = "1" ]; then
+    echo -e "  ${YELLOW}⚠${NC} SSH password-auth ВКЛЮЧЁН. Для максимальной защиты:"
+    echo -e "    ${DIM}1) ssh-keygen → ssh-copy-id → проверь логин по ключу${NC}"
+    echo -e "    ${DIM}2) sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config${NC}"
+    echo -e "    ${DIM}3) sshd -t && systemctl reload ssh${NC}"
+    echo ""
+fi
+if [ -d "$BACKUP_DIR" ]; then
+    echo -e "  ${DIM}Бэкап: $BACKUP_DIR${NC}"
+fi
+echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
