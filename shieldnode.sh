@@ -1,7 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.18.2 (Commercial Edition) — PANEL AUTO-DETECT
+#  VPN NODE DDoS PROTECTION v3.18.3 (Commercial Edition) — NON-INTERACTIVE FIX
+#  v3.18.3: исправлен критичный BUG в non-interactive mode:
+#           - panel auto-detect ВСЕГДА выполняется (раньше работал только в TTY)
+#           - conf-файл сохраняется ДО опросника (ловит auto-detect для CI/CD)
+#           - валидация BRIDGE_IPS на формат IP/CIDR перед записью в whitelist
+#           Раньше CI/CD-деплой на ноду с Remnawave получал PANEL_TYPE="" →
+#           standalone priorities (-100) → конфликт с Remnawave dstnat (-100).
+#
 #  v3.18.2: убран вопрос про VPN-панель из pre-install. Compatible режим
 #           включается:
 #           - автоматически если docker ps detect'ит remnawave/marzban/3x-ui
@@ -1078,8 +1085,8 @@ cscli_collection_installed() {
 # Можно переопределить через env (для тестинга на форке).
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
-# v3.18.2: версия для self-check
-SHIELDNODE_VERSION="3.18.2"
+# v3.18.3: версия для self-check
+SHIELDNODE_VERSION="3.18.3"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1405,18 +1412,49 @@ if [ -r "$PREINSTALL_CONF" ]; then
     . "$PREINSTALL_CONF" 2>/dev/null || true
 fi
 
-# Не интерактивный режим — пропускаем опрос
-if [ "${SHIELDNODE_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
-    PREINSTALL_SKIP=1
-    print_info "Non-interactive mode — pre-install опрос пропущен"
+# v3.18.3: Panel auto-detect ВСЕГДА выполняется (даже в non-interactive),
+# независимо от того, есть ли conf-файл. Это предотвращает баг когда
+# в CI/CD деплое на ноду с Remnawave устанавливался standalone-режим
+# и возникал конфликт priorities.
+if [ -z "${PANEL_TYPE:-}" ]; then
+    if docker ps 2>/dev/null | grep -qi "remnanode\|remnawave"; then
+        PANEL_TYPE="remnawave"
+    elif docker ps 2>/dev/null | grep -qi "marzban"; then
+        PANEL_TYPE="marzban"
+    elif docker ps 2>/dev/null | grep -qi "3x-ui\|x-ui"; then
+        PANEL_TYPE="3x-ui"
+    else
+        # Safe default — коммерческий продукт обычно ставится с панелью
+        PANEL_TYPE="remnawave"
+    fi
 fi
 
-# Если все настройки уже есть в conf — пропускаем опрос
-if [ -n "${BRIDGE_IPS:-}" ] && [ -n "${PANEL_TYPE:-}" ]; then
+# Не интерактивный режим — пропускаем опрос (но auto-detect выше уже отработал)
+if [ "${SHIELDNODE_NONINTERACTIVE:-0}" = "1" ] || [ ! -t 0 ]; then
+    PREINSTALL_SKIP=1
+    print_info "Non-interactive mode — pre-install опрос пропущен (PANEL_TYPE=$PANEL_TYPE)"
+fi
+
+# Если bridge IPs уже есть в conf — пропускаем интерактивный опрос
+if [ -n "${BRIDGE_IPS:-}" ]; then
     PREINSTALL_SKIP=1
     print_status "Используем существующие настройки из $PREINSTALL_CONF:"
     print_info "  Bridge IPs: ${BRIDGE_IPS:-(нет)}"
     print_info "  Panel type: ${PANEL_TYPE:-none}"
+fi
+
+# v3.18.3: всегда сохраняем conf после auto-detect (даже в non-interactive),
+# чтобы при следующих запусках использовался кэшированный PANEL_TYPE.
+if [ ! -e "$PREINSTALL_CONF" ] || ! grep -q "^PANEL_TYPE=" "$PREINSTALL_CONF" 2>/dev/null; then
+    cat > "$PREINSTALL_CONF" <<CONF_EOF
+# shieldnode pre-install configuration
+# Сгенерирован: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+# При reinstall эти значения переиспользуются автоматически.
+
+BRIDGE_IPS="${BRIDGE_IPS:-}"
+PANEL_TYPE="$PANEL_TYPE"
+CONF_EOF
+    chmod 0644 "$PREINSTALL_CONF"
 fi
 
 if [ -z "${PREINSTALL_SKIP:-}" ]; then
@@ -1461,36 +1499,20 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
     fi
     echo ""
 
-    # === Panel detection — БЕЗ вопроса ===
-    # v3.18.2: панель определяется автоматически через docker ps.
-    # Если auto-detect нашёл что-то — compatible режим.
-    # Если ничего не нашлось — всё равно compatible (default), потому что
-    # коммерческий продукт shieldnode в 99% случаев ставится на ноды
-    # с панелью (Remnawave/Marzban/3x-ui).
-    # При желании оператор может вручную поставить PANEL_TYPE="none" в
-    # /etc/shieldnode/shieldnode.conf и сделать reinstall.
-    AUTO_PANEL=""
-    if docker ps 2>/dev/null | grep -qi "remnanode\|remnawave"; then
-        AUTO_PANEL="remnawave"
-    elif docker ps 2>/dev/null | grep -qi "marzban"; then
-        AUTO_PANEL="marzban"
-    elif docker ps 2>/dev/null | grep -qi "3x-ui\|x-ui"; then
-        AUTO_PANEL="3x-ui"
-    fi
-
-    if [ -n "$AUTO_PANEL" ]; then
-        PANEL_TYPE="$AUTO_PANEL"
-        print_ok "Panel auto-detected: $PANEL_TYPE — compatible nft priorities"
-    else
-        # Нет detect — всё равно compat (safe default для коммерческого VPN-продукта)
-        PANEL_TYPE="remnawave"
-        print_info "Panel не определён — compat-режим по умолчанию (panel-friendly)"
-        print_info "Если на ноде НЕТ панели и хочешь стандартные priorities,"
-        print_info "  отредактируй /etc/shieldnode/shieldnode.conf: PANEL_TYPE=\"none\""
+    # v3.18.3: Panel auto-detect уже выполнен ВЫШЕ (вне интерактивного блока).
+    # Просто показываем результат оператору.
+    if [ "$PANEL_TYPE" = "remnawave" ] || [ "$PANEL_TYPE" = "marzban" ] || [ "$PANEL_TYPE" = "3x-ui" ]; then
+        if docker ps 2>/dev/null | grep -qiE "remnanode|remnawave|marzban|3x-ui|x-ui"; then
+            print_ok "Panel auto-detected: $PANEL_TYPE — compatible nft priorities"
+        else
+            print_info "Panel: $PANEL_TYPE (default compat-режим — panel-friendly)"
+            print_info "Если на ноде НЕТ панели — отредактируй $PREINSTALL_CONF:"
+            print_info "  PANEL_TYPE=\"none\" и сделай reinstall"
+        fi
     fi
     echo ""
 
-    # Сохраняем настройки
+    # Обновляем conf с актуальными BRIDGE_IPS (PANEL_TYPE уже сохранён выше)
     cat > "$PREINSTALL_CONF" <<CONF_EOF
 # shieldnode pre-install configuration
 # Сгенерирован: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
@@ -1506,6 +1528,7 @@ fi
 
 # Если bridge IPs заданы — добавляем их в whitelist-local.txt сразу
 # (до того как shieldnode-nftables.service загрузит правила)
+# v3.18.3: добавлена валидация формата IP/CIDR
 if [ -n "${BRIDGE_IPS:-}" ]; then
     WL_LOCAL="/etc/shieldnode/lists/whitelist-local.txt"
     mkdir -p /etc/shieldnode/lists
@@ -1514,6 +1537,12 @@ if [ -n "${BRIDGE_IPS:-}" ]; then
     fi
     IFS=',' read -ra BR_ARR <<< "$BRIDGE_IPS"
     for ip in "${BR_ARR[@]}"; do
+        # v3.18.3: жёсткая валидация — отбрасываем мусор
+        ip=$(echo "$ip" | tr -d ' ')
+        if ! echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
+            print_warn "Пропускаю невалидный bridge IP: '$ip'"
+            continue
+        fi
         if ! grep -qxF "$ip" "$WL_LOCAL" 2>/dev/null; then
             echo "$ip" >> "$WL_LOCAL"
             print_ok "Добавлен в whitelist: $ip"
@@ -3321,7 +3350,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.18.2 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.18.3 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3580,7 +3609,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.18.2 — github sync для lists/custom.txt
+# shieldnode v3.18.3 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3640,7 +3669,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.18.2 — version check
+# shieldnode v3.18.3 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -5442,7 +5471,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.18.2${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.18.3${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -6441,7 +6470,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.2 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.3 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
