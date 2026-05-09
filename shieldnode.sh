@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.18.3 (Commercial Edition) — NON-INTERACTIVE FIX
+#  VPN NODE DDoS PROTECTION v3.18.4 (Commercial Edition) — NON-INTERACTIVE FIX
 #  v3.18.3: исправлен критичный BUG в non-interactive mode:
 #           - panel auto-detect ВСЕГДА выполняется (раньше работал только в TTY)
 #           - conf-файл сохраняется ДО опросника (ловит auto-detect для CI/CD)
@@ -1086,7 +1086,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.18.3"
+SHIELDNODE_VERSION="3.18.4"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1443,18 +1443,35 @@ if [ -n "${BRIDGE_IPS:-}" ]; then
     print_info "  Panel type: ${PANEL_TYPE:-none}"
 fi
 
-# v3.18.3: всегда сохраняем conf после auto-detect (даже в non-interactive),
+# v3.18.4: merge-aware write — сохраняем все настройки оператора (BLOCK_TOR,
+# ENABLE_GITHUB_SYNC, ENABLE_VERSION_CHECK, ENABLE_RU_MOBILE_WHITELIST,
+# MAXMIND_LICENSE_KEY и пр., выставленные через `guard settings`), переписываем
+# только BRIDGE_IPS / PANEL_TYPE.
+write_preinstall_conf() {
+    local tmp
+    tmp=$(mktemp "${PREINSTALL_CONF}.XXXXXX") || return 1
+    {
+        echo "# shieldnode pre-install configuration"
+        echo "# Обновлено: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        echo "# При reinstall эти значения переиспользуются автоматически."
+        echo "# Настройки оператора (BLOCK_TOR, ENABLE_*, MAXMIND_LICENSE_KEY) сохраняются."
+        echo ""
+        echo "BRIDGE_IPS=\"${BRIDGE_IPS:-}\""
+        echo "PANEL_TYPE=\"${PANEL_TYPE:-none}\""
+        # Переносим все остальные строки из старого conf (кроме перезаписываемых
+        # и кроме комментариев/пустых строк с шапки)
+        if [ -f "$PREINSTALL_CONF" ]; then
+            grep -vE '^[[:space:]]*(#|$|BRIDGE_IPS=|PANEL_TYPE=)' "$PREINSTALL_CONF" 2>/dev/null || true
+        fi
+    } > "$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$PREINSTALL_CONF"   # atomic — same FS
+}
+
+# v3.18.3/3.18.4: всегда сохраняем conf после auto-detect (даже в non-interactive),
 # чтобы при следующих запусках использовался кэшированный PANEL_TYPE.
 if [ ! -e "$PREINSTALL_CONF" ] || ! grep -q "^PANEL_TYPE=" "$PREINSTALL_CONF" 2>/dev/null; then
-    cat > "$PREINSTALL_CONF" <<CONF_EOF
-# shieldnode pre-install configuration
-# Сгенерирован: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
-# При reinstall эти значения переиспользуются автоматически.
-
-BRIDGE_IPS="${BRIDGE_IPS:-}"
-PANEL_TYPE="$PANEL_TYPE"
-CONF_EOF
-    chmod 0644 "$PREINSTALL_CONF"
+    write_preinstall_conf
 fi
 
 if [ -z "${PREINSTALL_SKIP:-}" ]; then
@@ -1513,15 +1530,8 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
     echo ""
 
     # Обновляем conf с актуальными BRIDGE_IPS (PANEL_TYPE уже сохранён выше)
-    cat > "$PREINSTALL_CONF" <<CONF_EOF
-# shieldnode pre-install configuration
-# Сгенерирован: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
-# При reinstall эти значения переиспользуются автоматически.
-
-BRIDGE_IPS="$BRIDGE_IPS"
-PANEL_TYPE="$PANEL_TYPE"
-CONF_EOF
-    chmod 0644 "$PREINSTALL_CONF"
+    # v3.18.4: используем merge-aware write — сохраняем настройки оператора.
+    write_preinstall_conf
     print_ok "Сохранено: $PREINSTALL_CONF"
     echo ""
 fi
@@ -1561,6 +1571,31 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 print_ok "Запущен от root"
+
+# v3.18.4: проверка свободного места ДО любых установок и записей.
+# Без этого на full disk: apt падает посреди dpkg, sqlite events.db не создаётся
+# (но 2>/dev/null глушит ошибку), aggregator уходит в restart-loop, защита
+# выглядит "успешно установленной" но events не пишутся.
+check_disk_space() {
+    local mp need_mb avail
+    # Минимумы подобраны под: crowdsec ~120MB + bouncer ~30MB + lists/db ~50MB + запас.
+    for mp_need in "/var:500" "/etc:50" "/tmp:50"; do
+        mp="${mp_need%%:*}"
+        need_mb="${mp_need##*:}"
+        # df -BM выдаёт колонку Available с суффиксом 'M'
+        avail=$(df -BM "$mp" 2>/dev/null | awk 'NR==2 {gsub("M","",$4); print $4+0}')
+        if [ -z "$avail" ] || [ "$avail" -lt "$need_mb" ]; then
+            print_error "FATAL: $mp имеет ${avail:-0} MB свободно, нужно >= ${need_mb} MB"
+            print_info "Очисти: sudo journalctl --vacuum-size=100M"
+            print_info "       sudo apt-get clean && sudo apt-get autoremove -y"
+            print_info "       sudo find /var/log -type f -name '*.gz' -delete"
+            return 1
+        fi
+    done
+    print_ok "Disk space: /var=$(df -BM /var 2>/dev/null | awk 'NR==2{print $4}'), /etc=$(df -BM /etc 2>/dev/null | awk 'NR==2{print $4}'), /tmp=$(df -BM /tmp 2>/dev/null | awk 'NR==2{print $4}')"
+    return 0
+}
+check_disk_space || exit 1
 
 # v2.8: ждём пока apt освободится (unattended-upgrades на свежих VPS)
 wait_for_apt_lock() {
@@ -3632,7 +3667,7 @@ if [ "\${ENABLE_GITHUB_SYNC:-1}" != "1" ]; then
     exit 0
 fi
 
-TMP=\$(mktemp)
+TMP=\$(mktemp /etc/shieldnode/lists/.custom.txt.XXXXXX 2>/dev/null) || TMP=\$(mktemp)
 trap 'rm -f "\$TMP"' EXIT
 
 if ! curl -fsSL --max-time 30 --retry 2 "\$URL" -o "\$TMP" 2>/dev/null; then
@@ -3656,9 +3691,12 @@ if [ -f "\$TARGET" ] && cmp -s "\$TARGET" "\$TMP"; then
     exit 0
 fi
 
-# Атомарная замена
-mv "\$TMP" "\$TARGET"
-chmod 0644 "\$TARGET"
+# v3.18.4: атомарная замена. mktemp в той же директории что и TARGET → mv
+# не пересекает FS-границу (раньше /tmp могло быть tmpfs → mv = cp+unlink,
+# path-watcher ловил partial-файл).
+chmod 0644 "\$TMP"
+mv "\$TMP" "\$TARGET"   # atomic — same FS
+trap - EXIT             # файл уже на месте, cleanup отменяем
 logger -t "\$LOG_TAG" "sync OK: \$TARGET обновлён (\$NEW_LINES lines). path-watcher триггерит nft update."
 exit 0
 GITHUB_SYNC_EOF
@@ -3882,26 +3920,47 @@ chmod 0755 "$SHIELD_LISTS_DIR"
 
 prepare_seed_list() {
     local name="$1" target="$SHIELD_LISTS_DIR/${1}.txt"
-    # Если уже есть (от прошлой установки) — оставляем как есть
-    if [ -s "$target" ]; then
+    # v3.18.4: считаем blocklist "достаточным" ТОЛЬКО если в нём есть >= 1
+    # IP-подобная строка. Раньше [ -s "$target" ] возвращал true для файла
+    # с одним header-комментарием → пустые stub'ы навсегда оставались пустыми
+    # → scanner/threat blocklists фактически отключены.
+    if [ -f "$target" ] && grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$target"; then
         return 0
     fi
+    # Whitelist'ы и mobile_ru сидов в репо нет — для них допустим header-only.
     if [ "$SHIELD_PIPE_MODE" = "1" ]; then
-        # Pipe-mode: качаем дефолтный seed с github
-        if curl -fsSL --max-time 15 "$SHIELD_REPO_URL/lists/${name}.txt" -o "$target.tmp" 2>/dev/null; then
-            mv "$target.tmp" "$target"
+        # Pipe-mode: качаем дефолтный seed с github (с retry'ями)
+        local try ok=0
+        for try in 1 2 3; do
+            if curl -fsSL --max-time 15 --retry 1 "$SHIELD_REPO_URL/lists/${name}.txt" -o "$target.tmp" 2>/dev/null \
+               && [ -s "$target.tmp" ]; then
+                # Проверяем что это не HTML (404-страница) и есть IP-подобные записи
+                if ! head -1 "$target.tmp" | grep -qiE '<html|<!doctype' \
+                   && grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$target.tmp"; then
+                    mv "$target.tmp" "$target"
+                    ok=1
+                    break
+                fi
+            fi
+            sleep 2
+        done
+        rm -f "$target.tmp"
+        if [ "$ok" = "1" ]; then
             return 0
         fi
-        rm -f "$target.tmp"
+        print_warn "Не смог скачать lists/${name}.txt с github после 3 попыток"
+        print_info "Создан пустой stub. Запусти 'sudo guard sync' когда сеть восстановится."
     elif [ -n "$SHIELD_SCRIPT_DIR" ] && [ -f "$SHIELD_SCRIPT_DIR/lists/${name}.txt" ]; then
         cp "$SHIELD_SCRIPT_DIR/lists/${name}.txt" "$target"
         return 0
     fi
-    # Fallback: пустой файл с заголовком
-    cat > "$target" <<HDR_EOF
+    # Fallback: пустой файл с заголовком (только если ничего нет)
+    if [ ! -f "$target" ]; then
+        cat > "$target" <<HDR_EOF
 # shieldnode $name blocklist (one IP or CIDR per line, # = comment)
 # Auto-merged with URL sources при наличии конфига.
 HDR_EOF
+    fi
 }
 for n in scanner threat tor custom; do
     prepare_seed_list "$n"
@@ -4112,6 +4171,13 @@ print_ok "Blocklists активны: $(
 
 print_header "ШАГ 7: УСТАНОВКА CROWDSEC"
 
+# v3.18.4: marker-файл указывает что CrowdSec ставился/управляется shieldnode'ом.
+# Без marker'а пред-установленный (foreign) CrowdSec НЕ патчится:
+# не трогаем profiles.yaml, acquis.d/sshd.yaml, не делаем nft delete table ip crowdsec.
+# Это защищает кастомные конфиги оператора от silent-modification.
+CROWDSEC_MARKER="/etc/shieldnode/.crowdsec_managed"
+SHIELDNODE_CROWDSEC_MANAGED=0
+
 if ! command -v cscli >/dev/null 2>&1; then
     wait_for_apt_lock
     print_status "Подключаю репозиторий CrowdSec..."
@@ -4129,8 +4195,40 @@ if ! command -v cscli >/dev/null 2>&1; then
         print_info "Или проверь: sudo apt-cache policy crowdsec"
         exit 1
     fi
+    # Мы поставили — мы и управляем
+    mkdir -p /etc/shieldnode
+    touch "$CROWDSEC_MARKER"
+    SHIELDNODE_CROWDSEC_MANAGED=1
+else
+    # CrowdSec уже стоял
+    if [ -f "$CROWDSEC_MARKER" ]; then
+        SHIELDNODE_CROWDSEC_MANAGED=1
+    elif [ -d /var/lib/shieldnode ] || [ -f /etc/shieldnode/lists/scanner.txt ]; then
+        # Migration: shieldnode на ноде явно был раньше (есть его state) — значит
+        # это мы и ставили CrowdSec в прошлый раз, marker'а просто не было до v3.18.4.
+        mkdir -p /etc/shieldnode
+        touch "$CROWDSEC_MARKER"
+        SHIELDNODE_CROWDSEC_MANAGED=1
+        print_info "Migration: создан $CROWDSEC_MARKER (shieldnode уже стоял)"
+    else
+        # Foreign CrowdSec — оператор ставил сам, не трогаем его конфиг
+        SHIELDNODE_CROWDSEC_MANAGED=0
+        print_warn "Обнаружен ранее установленный CrowdSec (НЕ через shieldnode)."
+        print_warn "По умолчанию НЕ модифицируем его конфиги:"
+        print_warn "  • /etc/crowdsec/profiles.yaml"
+        print_warn "  • /etc/crowdsec/acquis.d/sshd.yaml"
+        print_warn "  • /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
+        print_warn "  • table ip crowdsec в nftables"
+        print_info "Чтобы разрешить shieldnode'у управлять CrowdSec:"
+        print_info "  sudo touch $CROWDSEC_MARKER && sudo guard upgrade"
+    fi
 fi
 print_ok "CrowdSec: $(cscli version 2>&1 | head -1 || echo установлен)"
+if [ "$SHIELDNODE_CROWDSEC_MANAGED" = "1" ]; then
+    print_ok "CrowdSec management: shieldnode-managed"
+else
+    print_info "CrowdSec management: foreign (read-only mode)"
+fi
 
 # Коллекции
 # v1.4: убрана crowdsecurity/iptables — она порождает сценарий
@@ -4179,7 +4277,9 @@ print_header "ШАГ 8: BAN DURATION"
 
 PROFILES_FILE="/etc/crowdsec/profiles.yaml"
 
-if [ -f "$PROFILES_FILE" ]; then
+if [ "${SHIELDNODE_CROWDSEC_MANAGED:-0}" != "1" ]; then
+    print_info "profiles.yaml: пропускаю (foreign CrowdSec — не трогаем)"
+elif [ -f "$PROFILES_FILE" ]; then
     if [ ! -f "$BACKUP_DIR/profiles.yaml.before" ]; then
         cp -a "$PROFILES_FILE" "$BACKUP_DIR/profiles.yaml.before"
     fi
@@ -4209,6 +4309,11 @@ fi
 # ==============================================================================
 
 print_header "ШАГ 9: ACQUISITION"
+
+# v3.18.4: foreign CrowdSec — не трогаем acquisition оператора
+if [ "${SHIELDNODE_CROWDSEC_MANAGED:-0}" != "1" ]; then
+    print_info "ШАГ 9 пропущен (foreign CrowdSec — оператор управляет acquis.d сам)"
+else
 
 # v1.4: убрана UFW/iptables acquisition. В v1.1-1.3 она питала сценарий
 # crowdsecurity/iptables-scan-multi_ports который ложно срабатывал на
@@ -4385,6 +4490,8 @@ if [ -n "$MGMT_IPV4" ]; then
     print_ok "Postoverflow whitelist mgmt IPs (BUG-17)"
 fi
 
+fi  # /SHIELDNODE_CROWDSEC_MANAGED guard for ШАГ 9
+
 # ==============================================================================
 # ШАГ 10: NFTABLES BOUNCER
 # ==============================================================================
@@ -4407,8 +4514,39 @@ if ! cscli bouncers list 2>/dev/null | grep -q "cs-firewall-bouncer"; then
     print_status "Регистрирую bouncer в LAPI..."
     BOUNCER_KEY=$(cscli bouncers add cs-firewall-bouncer-nftables -o raw 2>/dev/null)
     if [ -n "$BOUNCER_KEY" ]; then
-        sed -i "s|^api_key:.*|api_key: $BOUNCER_KEY|" /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
-        print_ok "Bouncer зарегистрирован"
+        # v3.18.4: validate формат ДО sed-замены. cscli всегда возвращает
+        # [a-zA-Z0-9_-]+ длиной 32-64 символа, но если CrowdSec в будущем
+        # поменяет формат (например JSON или base64-with-pipes), наша
+        # `sed s|...|key|` корраптила бы yaml. Дополнительно — заменяем
+        # через awk вместо sed чтобы избежать экранирования спецсимволов.
+        if ! [[ "$BOUNCER_KEY" =~ ^[a-zA-Z0-9_-]{16,128}$ ]]; then
+            print_error "cscli вернул bouncer key в неожиданном формате"
+            print_info "Длина: ${#BOUNCER_KEY}. Возможно, CrowdSec изменил output."
+            print_info "Ручное вмешательство:"
+            print_info "  1) sudo cscli bouncers delete cs-firewall-bouncer-nftables"
+            print_info "  2) sudo cscli bouncers add cs-firewall-bouncer-nftables"
+            print_info "  3) sudo nano /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
+            print_info "     → вписать api_key: <значение>"
+        else
+            BOUNCER_YAML="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
+            if [ -f "$BOUNCER_YAML" ]; then
+                BOUNCER_TMP=$(mktemp "${BOUNCER_YAML}.XXXXXX")
+                # awk-replace — никакого sed-разделителя который мог бы
+                # столкнуться со спецсимволом в key
+                awk -v key="$BOUNCER_KEY" '
+                    /^api_key:/ && !done { print "api_key: " key; done=1; next }
+                    { print }
+                ' "$BOUNCER_YAML" > "$BOUNCER_TMP"
+                if [ -s "$BOUNCER_TMP" ] && grep -q "^api_key: $BOUNCER_KEY" "$BOUNCER_TMP"; then
+                    chmod --reference="$BOUNCER_YAML" "$BOUNCER_TMP" 2>/dev/null || chmod 0600 "$BOUNCER_TMP"
+                    mv "$BOUNCER_TMP" "$BOUNCER_YAML"
+                    print_ok "Bouncer зарегистрирован"
+                else
+                    rm -f "$BOUNCER_TMP"
+                    print_error "Не удалось записать api_key в $BOUNCER_YAML"
+                fi
+            fi
+        fi
     fi
 fi
 
@@ -4426,7 +4564,9 @@ fi
 # в лог 8640 ошибок/сутки. FIX: если в системе IPv6 отключён — disable в
 # bouncer config.
 BOUNCER_CFG="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
-if [ -f "$BOUNCER_CFG" ]; then
+if [ "${SHIELDNODE_CROWDSEC_MANAGED:-0}" != "1" ]; then
+    print_info "Bouncer config: пропускаю патчинг hook/priority (foreign CrowdSec)"
+elif [ -f "$BOUNCER_CFG" ]; then
     BOUNCER_CHANGED=0
 
     # Backup before patching
@@ -5146,6 +5286,7 @@ Usage:
   sudo guard --once     snapshot only, no menu (for cron / monitoring)
   sudo guard --json     JSON output (for integrations)
   sudo guard upgrade    re-run installer from github (apply latest version)
+  sudo guard rollback   restore state from before last 'guard upgrade'
   sudo guard sync       force github sync of custom.txt now
   sudo guard check      force version check now
 
@@ -5161,10 +5302,156 @@ HELP
         ;;
     upgrade)
         # v3.14.0: re-run установщика с github
+        # v3.18.4: качаем во временный файл с -fsSL + sanity-check ПЕРЕД exec.
+        #          Без этого 404/MITM/empty body превращался в `bash <(<html>)` и
+        #          мог снести работающую установку.
         if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard upgrade"; exit 1; fi
         REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
-        echo "Re-installing from $REPO_URL/shieldnode.sh ..."
-        exec bash <(curl -sL "$REPO_URL/shieldnode.sh")
+        TMP_INSTALLER=$(mktemp /tmp/shieldnode-upgrade.XXXXXX.sh) || { echo "FATAL: mktemp failed"; exit 1; }
+        # Удалим временный файл при выходе если до exec не дойдём
+        trap 'rm -f "$TMP_INSTALLER"' EXIT
+        echo "Downloading installer from $REPO_URL/shieldnode.sh ..."
+        if ! curl -fsSL --max-time 60 --retry 2 "$REPO_URL/shieldnode.sh" -o "$TMP_INSTALLER"; then
+            echo "FATAL: download failed (network/404/TLS). Aborting upgrade — старая версия не тронута."
+            exit 1
+        fi
+        if [ ! -s "$TMP_INSTALLER" ]; then
+            echo "FATAL: downloaded file is empty. Aborting upgrade."
+            exit 1
+        fi
+        if ! head -3 "$TMP_INSTALLER" | grep -q '^#!/bin/bash'; then
+            echo "FATAL: downloaded file is not a bash script (нет shebang). Aborting upgrade."
+            echo "Проверь: head -5 $TMP_INSTALLER"
+            exit 1
+        fi
+        if ! grep -qE 'VPN NODE DDoS PROTECTION v[0-9]+\.[0-9]+\.[0-9]+' "$TMP_INSTALLER"; then
+            echo "FATAL: downloaded file missing version marker. Aborting upgrade."
+            exit 1
+        fi
+        if ! bash -n "$TMP_INSTALLER" 2>/dev/null; then
+            echo "FATAL: downloaded installer has syntax errors. Aborting upgrade."
+            echo "Проверь: bash -n $TMP_INSTALLER"
+            exit 1
+        fi
+        echo "Sanity checks passed."
+
+        # v3.18.4: snapshot critical state ПЕРЕД exec — для `guard rollback`.
+        # Если новый installer наглухо ломает ноду (regression в nft template,
+        # battered conf и т.п.), оператор делает `sudo guard rollback` и
+        # возвращается к рабочей версии без пересоздания ноды.
+        SNAPSHOT_ROOT="/var/lib/shieldnode/snapshots"
+        SNAPSHOT_DIR="$SNAPSHOT_ROOT/upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
+        mkdir -p "$SNAPSHOT_DIR"
+        # Конфиг и lists
+        cp -a /etc/shieldnode "$SNAPSHOT_DIR/etc-shieldnode" 2>/dev/null || true
+        # nft templates
+        if [ -d /etc/nftables.d ]; then
+            cp -a /etc/nftables.d "$SNAPSHOT_DIR/etc-nftables.d" 2>/dev/null || true
+        fi
+        # Текущий live-ruleset (для прямого восстановления через nft -f)
+        nft list ruleset > "$SNAPSHOT_DIR/nft-ruleset.snapshot" 2>/dev/null || true
+        # Бинарники которые скрипт перезаписывает
+        for f in /usr/local/bin/guard \
+                 /usr/local/sbin/shieldnode-aggregator.sh \
+                 /usr/local/sbin/shieldnode-update-blocklist.sh \
+                 /usr/local/sbin/shieldnode-github-sync.sh \
+                 /usr/local/sbin/shieldnode-version-check.sh \
+                 /usr/local/sbin/shieldnode-whitelist-updater.sh \
+                 /usr/local/sbin/shieldnode-defaults.sh; do
+            [ -f "$f" ] && cp -a "$f" "$SNAPSHOT_DIR/$(basename "$f").previous" 2>/dev/null || true
+        done
+        # Запоминаем версию-источник для проверки совместимости при rollback
+        echo "${SHIELDNODE_VERSION:-unknown}" > "$SNAPSHOT_DIR/.from_version"
+        # Указатель на последний snapshot
+        echo "$SNAPSHOT_DIR" > /var/lib/shieldnode/.last_upgrade_snapshot
+        # Чистим старые snapshots — оставляем последние 3
+        ls -1dt "$SNAPSHOT_ROOT"/upgrade-* 2>/dev/null | tail -n +4 | xargs -r rm -rf
+
+        echo "Snapshot: $SNAPSHOT_DIR"
+        echo "Rollback (если что-то пойдёт не так): sudo guard rollback"
+        echo "Re-installing..."
+        # Снимаем trap чтобы файл не удалился до exec'нувшегося bash
+        trap - EXIT
+        exec bash "$TMP_INSTALLER"
+        ;;
+    rollback)
+        # v3.18.4: возврат к состоянию ПЕРЕД последним `guard upgrade`.
+        # Восстанавливает /etc/shieldnode, /etc/nftables.d, скрипты в /usr/local
+        # и live nft ruleset. Перезапускает все shieldnode-юниты.
+        if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard rollback"; exit 1; fi
+        SNAP_PTR="/var/lib/shieldnode/.last_upgrade_snapshot"
+        if [ ! -f "$SNAP_PTR" ]; then
+            echo "Нет snapshot'а — `guard upgrade` ещё не запускался на этой версии."
+            exit 1
+        fi
+        SNAP=$(cat "$SNAP_PTR" 2>/dev/null)
+        if [ -z "$SNAP" ] || [ ! -d "$SNAP" ]; then
+            echo "FATAL: snapshot директория не найдена ($SNAP)"
+            exit 1
+        fi
+        FROM_VER=$(cat "$SNAP/.from_version" 2>/dev/null || echo "?")
+        echo "Rolling back to version $FROM_VER (snapshot: $SNAP)"
+        echo -n "Подтвердить rollback? [y/N]: "
+        read -r CONFIRM
+        case "$CONFIRM" in
+            y|Y|yes|YES) ;;
+            *) echo "Отменено."; exit 0 ;;
+        esac
+
+        # Останавливаем юниты ПЕРЕД восстановлением файлов чтобы избежать race
+        systemctl stop shieldnode-aggregator shieldnode-watcher \
+                       shieldnode-nftables shieldnode-whitelist-watcher \
+                       shieldnode-whitelist-updater 2>/dev/null || true
+
+        # Восстанавливаем /etc/shieldnode
+        if [ -d "$SNAP/etc-shieldnode" ]; then
+            rm -rf /etc/shieldnode
+            cp -a "$SNAP/etc-shieldnode" /etc/shieldnode
+            echo "  ✔ /etc/shieldnode восстановлен"
+        fi
+        # /etc/nftables.d
+        if [ -d "$SNAP/etc-nftables.d" ]; then
+            rm -rf /etc/nftables.d
+            cp -a "$SNAP/etc-nftables.d" /etc/nftables.d
+            echo "  ✔ /etc/nftables.d восстановлен"
+        fi
+        # Бинарники
+        for prev in "$SNAP"/*.previous; do
+            [ -f "$prev" ] || continue
+            base=$(basename "$prev" .previous)
+            case "$base" in
+                guard) dst="/usr/local/bin/$base" ;;
+                shieldnode-*) dst="/usr/local/sbin/$base" ;;
+                *) continue ;;
+            esac
+            cp -a "$prev" "$dst"
+            chmod +x "$dst"
+            echo "  ✔ $dst восстановлен"
+        done
+
+        # Восстанавливаем nft ruleset напрямую — flush и применяем snapshot
+        if [ -s "$SNAP/nft-ruleset.snapshot" ]; then
+            # Flush наших таблиц чтоб не было дублей
+            nft delete table inet ddos_protect 2>/dev/null || true
+            if nft -f "$SNAP/nft-ruleset.snapshot" 2>/tmp/.nft-rollback.err; then
+                echo "  ✔ nft ruleset восстановлен"
+            else
+                echo "  ⚠ nft -f частично failed — детали: cat /tmp/.nft-rollback.err"
+                echo "    Юниты shieldnode-nftables всё равно перезагружают template'ы при старте."
+            fi
+        fi
+
+        # Перезапускаем юниты
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl restart shieldnode-nftables 2>/dev/null || true
+        systemctl restart shieldnode-aggregator 2>/dev/null || true
+        systemctl restart shieldnode-watcher 2>/dev/null || true
+        systemctl restart shieldnode-whitelist-watcher 2>/dev/null || true
+
+        echo ""
+        echo "Rollback complete. Версия: $FROM_VER"
+        echo "Проверь: sudo guard"
+        exit 0
         ;;
     sync)
         if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard sync"; exit 1; fi
