@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.18.6 (Commercial Edition) — NON-INTERACTIVE FIX
+#  VPN NODE DDoS PROTECTION v3.18.8 (Commercial Edition) — NON-INTERACTIVE FIX
 #  v3.18.3: исправлен критичный BUG в non-interactive mode:
 #           - panel auto-detect ВСЕГДА выполняется (раньше работал только в TTY)
 #           - conf-файл сохраняется ДО опросника (ловит auto-detect для CI/CD)
@@ -1086,7 +1086,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.18.6"
+SHIELDNODE_VERSION="3.18.8"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1186,8 +1186,20 @@ shield_nft_set_name() {
 # v3.14.1: эти переменные тоже подхватятся из shieldnode.conf если оператор
 # изменил их через guard CLI settings menu (загружен выше до этого блока).
 ENABLE_RU_MOBILE_WHITELIST="${ENABLE_RU_MOBILE_WHITELIST:-1}"
-# v3.18.6: MAXMIND_LICENSE_KEY полностью удалён (с v3.15.0 не использовался,
+# v3.18.8: MAXMIND_LICENSE_KEY полностью удалён (с v3.15.0 не использовался,
 # с v3.18.3 mobile-RU работает через github sync из RIPEstat — без ключей).
+
+# v3.18.8: TRUSTED_IPS — comma-separated список доверенных IP'шников твоей
+# инфраструктуры (другие ноды, панель, мониторинг). Для каждого IP при установке
+# применяется полный trust-stack:
+#   1. shieldnode: добавляется в whitelist-local.txt → nft manual_whitelist_v4
+#   2. UFW: ufw allow from <ip> comment 'Trusted (TRUSTED_IPS)'
+#   3. CrowdSec: cscli decisions add --type whitelist на 1 год
+# Применяется в ШАГ 12.5 после установки всех трёх слоёв защиты.
+# Пример в shieldnode.conf:
+#   TRUSTED_IPS="77.239.107.190,213.165.55.166,138.124.88.15"
+# Управление через 'sudo guard' → [s] settings → [t] Trusted IPs.
+TRUSTED_IPS="${TRUSTED_IPS:-}"
 
 DEFAULT_MIN_ENTRIES_MOBILE_RU=100   # ниже — что-то сломалось у RIPEstat в github actions
 
@@ -1441,7 +1453,7 @@ if [ -n "${BRIDGE_IPS:-}" ]; then
     print_info "  Panel type: ${PANEL_TYPE:-none}"
 fi
 
-# v3.18.6: merge-aware write — сохраняем все настройки оператора (BLOCK_TOR,
+# v3.18.8: merge-aware write — сохраняем все настройки оператора (BLOCK_TOR,
 # ENABLE_GITHUB_SYNC, ENABLE_VERSION_CHECK, ENABLE_RU_MOBILE_WHITELIST и пр.,
 # выставленные через `guard settings`), переписываем только BRIDGE_IPS / PANEL_TYPE.
 write_preinstall_conf() {
@@ -1465,7 +1477,7 @@ write_preinstall_conf() {
     mv "$tmp" "$PREINSTALL_CONF"   # atomic — same FS
 }
 
-# v3.18.3/3.18.6: всегда сохраняем conf после auto-detect (даже в non-interactive),
+# v3.18.3/3.18.7: всегда сохраняем conf после auto-detect (даже в non-interactive),
 # чтобы при следующих запусках использовался кэшированный PANEL_TYPE.
 if [ ! -e "$PREINSTALL_CONF" ] || ! grep -q "^PANEL_TYPE=" "$PREINSTALL_CONF" 2>/dev/null; then
     write_preinstall_conf
@@ -1527,7 +1539,7 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
     echo ""
 
     # Обновляем conf с актуальными BRIDGE_IPS (PANEL_TYPE уже сохранён выше)
-    # v3.18.6: используем merge-aware write — сохраняем настройки оператора.
+    # v3.18.8: используем merge-aware write — сохраняем настройки оператора.
     write_preinstall_conf
     print_ok "Сохранено: $PREINSTALL_CONF"
     echo ""
@@ -1569,7 +1581,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 print_ok "Запущен от root"
 
-# v3.18.6: проверка свободного места ДО любых установок и записей.
+# v3.18.8: проверка свободного места ДО любых установок и записей.
 # Без этого на full disk: apt падает посреди dpkg, sqlite events.db не создаётся
 # (но 2>/dev/null глушит ошибку), aggregator уходит в restart-loop, защита
 # выглядит "успешно установленной" но events не пишутся.
@@ -1638,6 +1650,17 @@ if ! command -v nft >/dev/null 2>&1; then
         print_error "Не удалось установить nftables"
         exit 1
     fi
+    # v3.18.8 UFW-FIX: пакет nftables кладёт /etc/nftables.conf с `flush ruleset`.
+    # Если nftables.service запустится (ребут / unattended-upgrades / другой пакет
+    # с try-restart) — он выполнит flush ruleset и снесёт UFW цепочки в kernel
+    # (на Ubuntu 24 UFW работает через iptables-nft → таблицы видны в nftables).
+    # Симптом: после ребута `ufw status` → inactive, хотя ENABLED=yes в ufw.conf.
+    # FIX: stop/disable/mask. У нас свой shieldnode-nftables.service который
+    # загружает только наши таблицы БЕЗ flush.
+    systemctl stop nftables.service >/dev/null 2>&1 || true
+    systemctl disable nftables.service >/dev/null 2>&1 || true
+    systemctl mask nftables.service >/dev/null 2>&1 || true
+    print_ok "nftables.service masked (защита UFW от flush ruleset при ребуте)"
 fi
 print_ok "nftables: $(nft --version 2>&1 | head -1)"
 
@@ -2914,6 +2937,7 @@ Wants=network-pre.target
 After=nftables.service
 # Запускаемся ПОСЛЕ ufw чтобы наши правила не пересекались
 After=ufw.service
+Wants=ufw.service
 
 [Service]
 Type=oneshot
@@ -2921,8 +2945,11 @@ RemainAfterExit=yes
 # Загружаем ТОЛЬКО нашу таблицу БЕЗ flush ruleset
 # Это сохраняет UFW и любые другие nft-правила
 ExecStart=/usr/sbin/nft -f $NFT_DDOS_CONF
-# При остановке/restart удаляем только нашу таблицу
-ExecStop=/usr/sbin/nft delete table inet ddos_protect
+# При остановке/restart удаляем только нашу таблицу.
+# v3.18.8: префикс "-" → systemd игнорирует exit code. Если таблицу уже
+# флушнул внешний процесс (bouncer post-inst regression и т.п.), unit
+# не уйдёт в failed → restart cycle отработает чисто.
+ExecStop=-/usr/sbin/nft delete table inet ddos_protect
 ExecReload=/usr/sbin/nft -f $NFT_DDOS_CONF
 
 [Install]
@@ -2940,7 +2967,11 @@ else
     print_warn "shieldnode-nftables не стартанул — проверь: journalctl -u shieldnode-nftables -n 30"
 fi
 
-systemctl enable nftables >/dev/null 2>&1 || true
+# v3.18.8 UFW-FIX: УДАЛЕНО `systemctl enable nftables`.
+# Прежняя строка реактивировала nftables.service → при ребуте он выполнял
+# /etc/nftables.conf с `flush ruleset` → UFW цепочки в kernel удалялись →
+# `ufw status` показывал inactive. Свой shieldnode-nftables.service нам
+# достаточно (он enabled выше).
 
 # ==============================================================================
 # ШАГ 5: PROTECTED PORTS WATCHER (auto-sync с фаерволом)
@@ -3382,7 +3413,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.18.6 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.18.8 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3641,7 +3672,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.18.6 — github sync для lists/custom.txt
+# shieldnode v3.18.8 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3688,7 +3719,7 @@ if [ -f "\$TARGET" ] && cmp -s "\$TARGET" "\$TMP"; then
     exit 0
 fi
 
-# v3.18.6: атомарная замена. mktemp в той же директории что и TARGET → mv
+# v3.18.8: атомарная замена. mktemp в той же директории что и TARGET → mv
 # не пересекает FS-границу (раньше /tmp могло быть tmpfs → mv = cp+unlink,
 # path-watcher ловил partial-файл).
 chmod 0644 "\$TMP"
@@ -3704,7 +3735,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.18.6 — version check
+# shieldnode v3.18.8 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -3917,7 +3948,7 @@ chmod 0755 "$SHIELD_LISTS_DIR"
 
 prepare_seed_list() {
     local name="$1" target="$SHIELD_LISTS_DIR/${1}.txt"
-    # v3.18.6: определяем что seed уже есть И валиден:
+    # v3.18.8: определяем что seed уже есть И валиден:
     #   (a) содержит IP-подобную строку → точно валиден, или
     #   (b) НЕ помечен как локальный stub-fallback (отсутствует маркер
     #       "Auto-merged with URL sources" из fallback heredoc'а ниже —
@@ -4015,7 +4046,7 @@ if [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" = "1" ]; then
 fi
 
 declare -A LIST_SIZES
-# v3.18.6: ждём пока nft table inet ddos_protect станет доступна.
+# v3.18.8: ждём пока nft table inet ddos_protect станет доступна.
 # systemctl restart shieldnode-nftables (выше в ШАГ 4) делает stop+start —
 # между ExecStop (nft delete) и ExecStart (nft -f) есть короткое окно
 # когда table не существует. Если updater отрабатывает в этот момент —
@@ -4198,7 +4229,7 @@ print_ok "Blocklists активны: $(
 
 print_header "ШАГ 7: УСТАНОВКА CROWDSEC"
 
-# v3.18.6: marker-файл указывает что CrowdSec ставился/управляется shieldnode'ом.
+# v3.18.8: marker-файл указывает что CrowdSec ставился/управляется shieldnode'ом.
 # Без marker'а пред-установленный (foreign) CrowdSec НЕ патчится:
 # не трогаем profiles.yaml, acquis.d/sshd.yaml, не делаем nft delete table ip crowdsec.
 # Это защищает кастомные конфиги оператора от silent-modification.
@@ -4214,7 +4245,7 @@ if ! command -v cscli >/dev/null 2>&1; then
         exit 1
     fi
 
-    # v3.18.6: ОТКЛЮЧАЕМ cscli unattended setup в post-inst hook'е CrowdSec.
+    # v3.18.8: ОТКЛЮЧАЕМ cscli unattended setup в post-inst hook'е CrowdSec.
     # По умолчанию post-inst запускает `cscli setup unattended` который качает
     # GeoLite2-City.mmdb (~80 MB) с hub-data.crowdsec.net БЕЗ timeout'а.
     # На VPS с медленной/блокирующей связью apt висит 10-30 минут и не реагирует
@@ -4226,7 +4257,7 @@ if ! command -v cscli >/dev/null 2>&1; then
     # отработают через timeout на самом apt-get.
     mkdir -p /etc/crowdsec
     cat > /etc/crowdsec/.shieldnode-skip-unattended <<'SKIP_EOF'
-# Создан установщиком shieldnode v3.18.6
+# Создан установщиком shieldnode v3.18.8
 # Сигнал для cscli setup unattended что shieldnode сделает hub upgrade сам.
 SKIP_EOF
     # На многих версиях CrowdSec post-inst читает эту env var
@@ -4238,7 +4269,7 @@ SKIP_EOF
     # timeout оборачивает apt-get; если post-inst всё-таки полезет качать MMDB
     # и зависнет — apt будет убит по timeout, а dpkg --configure -a починит
     # состояние ниже.
-    # v3.18.6: stdin перенаправлен в /dev/null чтобы cscli setup / post-inst
+    # v3.18.8: stdin перенаправлен в /dev/null чтобы cscli setup / post-inst
     # никогда не уходил в SIGTTIN (T-state) пытаясь читать с tty.
     # На CrowdSec 1.7.7 env-переменные SKIP не работают, post-inst всё равно
     # запускает cscli setup unattended, который в конце ждёт ENTER на баннере.
@@ -4258,7 +4289,7 @@ SKIP_EOF
         pkill -9 -f "cscli setup unattended" 2>/dev/null || true
         sleep 2
         # Иногда post-inst сам зависает — отключаем его на время configure.
-        # v3.18.6: trap гарантирует возврат hook'а даже если скрипт упадёт
+        # v3.18.8: trap гарантирует возврат hook'а даже если скрипт упадёт
         # между rename'ами (kernel panic, OOM, оператор Ctrl+C).
         if [ -f /var/lib/dpkg/info/crowdsec.postinst ]; then
             POSTINST_ORIG="/var/lib/dpkg/info/crowdsec.postinst"
@@ -4306,7 +4337,7 @@ else
         SHIELDNODE_CROWDSEC_MANAGED=1
     elif [ -d /var/lib/shieldnode ] || [ -f /etc/shieldnode/lists/scanner.txt ]; then
         # Migration: shieldnode на ноде явно был раньше (есть его state) — значит
-        # это мы и ставили CrowdSec в прошлый раз, marker'а просто не было до v3.18.6.
+        # это мы и ставили CrowdSec в прошлый раз, marker'а просто не было до v3.18.8.
         mkdir -p /etc/shieldnode
         touch "$CROWDSEC_MARKER"
         SHIELDNODE_CROWDSEC_MANAGED=1
@@ -4411,7 +4442,7 @@ fi
 
 print_header "ШАГ 9: ACQUISITION"
 
-# v3.18.6: foreign CrowdSec — не трогаем acquisition оператора
+# v3.18.8: foreign CrowdSec — не трогаем acquisition оператора
 if [ "${SHIELDNODE_CROWDSEC_MANAGED:-0}" != "1" ]; then
     print_info "ШАГ 9 пропущен (foreign CrowdSec — оператор управляет acquis.d сам)"
 else
@@ -4604,8 +4635,8 @@ if dpkg -l crowdsec-firewall-bouncer-nftables &>/dev/null; then
 else
     wait_for_apt_lock
     print_status "Устанавливаю crowdsec-firewall-bouncer-nftables (timeout 3 мин)..."
-    # v3.18.6: timeout — bouncer post-inst иногда тоже дёргает hub.
-    # v3.18.6: stdin → /dev/null против SIGTTIN.
+    # v3.18.8: timeout — bouncer post-inst иногда тоже дёргает hub.
+    # v3.18.8: stdin → /dev/null против SIGTTIN.
     if ! timeout --kill-after=30s 180s \
          env DEBIAN_FRONTEND=noninteractive \
          apt-get install -y crowdsec-firewall-bouncer-nftables </dev/null; then
@@ -4632,7 +4663,7 @@ if ! cscli bouncers list 2>/dev/null | grep -q "cs-firewall-bouncer"; then
     print_status "Регистрирую bouncer в LAPI..."
     BOUNCER_KEY=$(cscli bouncers add cs-firewall-bouncer-nftables -o raw 2>/dev/null)
     if [ -n "$BOUNCER_KEY" ]; then
-        # v3.18.6: validate формат ДО sed-замены. cscli всегда возвращает
+        # v3.18.8: validate формат ДО sed-замены. cscli всегда возвращает
         # [a-zA-Z0-9_-]+ длиной 32-64 символа, но если CrowdSec в будущем
         # поменяет формат (например JSON или base64-with-pipes), наша
         # `sed s|...|key|` корраптила бы yaml. Дополнительно — заменяем
@@ -5420,7 +5451,7 @@ HELP
         ;;
     upgrade)
         # v3.14.0: re-run установщика с github
-        # v3.18.6: качаем во временный файл с -fsSL + sanity-check ПЕРЕД exec.
+        # v3.18.8: качаем во временный файл с -fsSL + sanity-check ПЕРЕД exec.
         #          Без этого 404/MITM/empty body превращался в `bash <(<html>)` и
         #          мог снести работающую установку.
         if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard upgrade"; exit 1; fi
@@ -5453,7 +5484,7 @@ HELP
         fi
         echo "Sanity checks passed."
 
-        # v3.18.6: snapshot critical state ПЕРЕД exec — для `guard rollback`.
+        # v3.18.8: snapshot critical state ПЕРЕД exec — для `guard rollback`.
         # Если новый installer наглухо ломает ноду (regression в nft template,
         # battered conf и т.п.), оператор делает `sudo guard rollback` и
         # возвращается к рабочей версии без пересоздания ноды.
@@ -5493,7 +5524,7 @@ HELP
         exec bash "$TMP_INSTALLER"
         ;;
     rollback)
-        # v3.18.6: возврат к состоянию ПЕРЕД последним `guard upgrade`.
+        # v3.18.8: возврат к состоянию ПЕРЕД последним `guard upgrade`.
         # Восстанавливает /etc/shieldnode, /etc/nftables.d, скрипты в /usr/local
         # и live nft ruleset. Перезапускает все shieldnode-юниты.
         if [[ $EUID -ne 0 ]]; then echo "Run as root: sudo guard rollback"; exit 1; fi
@@ -5876,7 +5907,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.18.6${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.18.8${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -6343,7 +6374,7 @@ show_full_log() {
 }
 
 # v3.14.0: settings menu — toggle ENABLE_* flags
-# v3.18.6: убран MAXMIND_LICENSE_KEY (deprecated с v3.15.0)
+# v3.18.8: убран MAXMIND_LICENSE_KEY (deprecated с v3.15.0)
 show_settings_menu() {
     local CONF="/etc/shieldnode/shieldnode.conf"
     mkdir -p /etc/shieldnode
@@ -6412,6 +6443,15 @@ show_settings_menu() {
         echo -e "  [${B}f${N}] Force github sync now"
         echo -e "  [${B}m${N}] Force mobile-RU update now"
         echo -e "  [${B}v${N}] Force version check now"
+        echo ""
+        # v3.18.8: Trusted IPs counter
+        local trusted_count=0
+        local trusted_csv
+        trusted_csv=$(_read_setting "TRUSTED_IPS" "")
+        if [ -n "$trusted_csv" ]; then
+            trusted_count=$(echo "$trusted_csv" | tr ',' '\n' | grep -c '[0-9]')
+        fi
+        echo -e "  [${B}t${N}] Trusted IPs ${DIM}(infrastructure whitelist: ${trusted_count} IPs)${N}"
         echo ""
         echo -e "  [${B}q${N}] Back to main menu"
         echo ""
@@ -6501,6 +6541,162 @@ show_settings_menu() {
                     sed 's/^/  /' /var/lib/shieldnode/.upstream_version
                 fi
                 sleep 1
+                ;;
+            t|T)
+                # v3.18.8: Trusted IPs management — full whitelist (shieldnode + UFW + CrowdSec)
+                while true; do
+                    clear 2>/dev/null
+                    local trusted_csv current_list
+                    trusted_csv=$(_read_setting "TRUSTED_IPS" "")
+                    echo ""
+                    echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
+                    echo -e "  ${B}Trusted IPs${N} ${DIM}(infrastructure whitelist)${N}"
+                    echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
+                    echo ""
+                    echo -e "  Каждый IP получает ${B}полный whitelist${N}:"
+                    echo -e "    • shieldnode rate-limit обходится"
+                    echo -e "    • UFW allow from <ip> (любой порт)"
+                    echo -e "    • CrowdSec whitelist на 1 год"
+                    echo ""
+                    echo -e "  ${B}Текущий список:${N}"
+                    if [ -z "$trusted_csv" ]; then
+                        echo -e "    ${DIM}(пусто)${N}"
+                    else
+                        local idx=1
+                        IFS=',' read -ra TRUSTED_ARR <<< "$trusted_csv"
+                        for ip in "${TRUSTED_ARR[@]}"; do
+                            ip=$(echo "$ip" | tr -d ' ')
+                            [ -z "$ip" ] && continue
+                            echo -e "    ${idx}. ${G}$ip${N}"
+                            idx=$((idx + 1))
+                        done
+                    fi
+                    echo ""
+                    echo -e "  [${B}a${N}] Add IP"
+                    echo -e "  [${B}d${N}] Delete IP"
+                    echo -e "  [${B}r${N}] Re-apply all (shieldnode + UFW + CrowdSec)"
+                    echo -e "  [${B}q${N}] Back"
+                    echo ""
+                    echo -ne "  ${B}>${N} "
+                    read -r TC
+                    case "$TC" in
+                        a|A)
+                            echo -ne "  Enter IP (e.g. 1.2.3.4): "
+                            read -r NEW_IP
+                            NEW_IP=$(echo "$NEW_IP" | tr -d ' ')
+                            if ! echo "$NEW_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+                                echo -e "  ${R}Невалидный IP${N}"
+                                sleep 1
+                                continue
+                            fi
+                            # Проверяем что не дубль
+                            if echo ",$trusted_csv," | grep -qE ",[[:space:]]*$NEW_IP[[:space:]]*,"; then
+                                echo -e "  ${Y}Уже в списке${N}"
+                                sleep 1
+                                continue
+                            fi
+                            # Append в conf
+                            local new_csv
+                            if [ -z "$trusted_csv" ]; then
+                                new_csv="$NEW_IP"
+                            else
+                                new_csv="$trusted_csv,$NEW_IP"
+                            fi
+                            _write_setting "TRUSTED_IPS" "$new_csv"
+                            # Применяем сразу через все три слоя
+                            echo ""
+                            local WL=/etc/shieldnode/lists/whitelist-local.txt
+                            mkdir -p "$(dirname "$WL")"
+                            [ -f "$WL" ] || echo "# shieldnode trusted IPs" > "$WL"
+                            grep -qxF "$NEW_IP" "$WL" 2>/dev/null || echo "$NEW_IP" >> "$WL"
+                            echo -e "    ${G}✓${N} shieldnode whitelist"
+                            if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+                                ufw allow from "$NEW_IP" comment "Trusted (TRUSTED_IPS)" >/dev/null 2>&1 || true
+                                ufw reload >/dev/null 2>&1 || true
+                                echo -e "    ${G}✓${N} UFW allow"
+                            fi
+                            if command -v cscli >/dev/null 2>&1; then
+                                cscli decisions add --ip "$NEW_IP" --duration 8760h --type whitelist --reason "Trusted (TRUSTED_IPS)" >/dev/null 2>&1 || true
+                                echo -e "    ${G}✓${N} CrowdSec whitelist"
+                            fi
+                            # Очистить старые events
+                            sqlite3 /var/lib/shieldnode/events.db "DELETE FROM events WHERE ip='$NEW_IP';" 2>/dev/null || true
+                            echo -e "  ${G}Done.${N}"
+                            sleep 2
+                            ;;
+                        d|D)
+                            if [ -z "$trusted_csv" ]; then
+                                echo -e "  ${Y}Список пуст${N}"
+                                sleep 1
+                                continue
+                            fi
+                            echo -ne "  Enter IP to remove: "
+                            read -r DEL_IP
+                            DEL_IP=$(echo "$DEL_IP" | tr -d ' ')
+                            # Удалить из CSV
+                            local cleaned
+                            cleaned=$(echo "$trusted_csv" | tr ',' '\n' | grep -vxF "$DEL_IP" | paste -sd',' -)
+                            _write_setting "TRUSTED_IPS" "$cleaned"
+                            # shieldnode whitelist
+                            sed -i "/^${DEL_IP//./\\.}\$/d" /etc/shieldnode/lists/whitelist-local.txt 2>/dev/null || true
+                            echo -e "    ${G}✓${N} shieldnode whitelist"
+                            # UFW
+                            if command -v ufw >/dev/null 2>&1; then
+                                # Найти rule number и удалить (ufw нумерует rules)
+                                while ufw status numbered 2>/dev/null | grep -E "^\\[[0-9]+\\] +Anywhere.* $DEL_IP" >/dev/null 2>&1; do
+                                    local rule_num
+                                    rule_num=$(ufw status numbered 2>/dev/null | grep -E "^\\[[0-9]+\\] +Anywhere.* $DEL_IP" | head -1 | grep -oE '\[[0-9]+\]' | tr -d '[]')
+                                    [ -z "$rule_num" ] && break
+                                    yes | ufw delete "$rule_num" >/dev/null 2>&1 || break
+                                done
+                                ufw reload >/dev/null 2>&1 || true
+                                echo -e "    ${G}✓${N} UFW rule removed"
+                            fi
+                            # CrowdSec
+                            if command -v cscli >/dev/null 2>&1; then
+                                cscli decisions delete --ip "$DEL_IP" >/dev/null 2>&1 || true
+                                echo -e "    ${G}✓${N} CrowdSec decision removed"
+                            fi
+                            echo -e "  ${G}Done.${N}"
+                            sleep 2
+                            ;;
+                        r|R)
+                            if [ -z "$trusted_csv" ]; then
+                                echo -e "  ${Y}Список пуст — нечего применять${N}"
+                                sleep 1
+                                continue
+                            fi
+                            echo ""
+                            echo -e "  ${DIM}Re-applying TRUSTED_IPS across all layers...${N}"
+                            IFS=',' read -ra TRUSTED_ARR <<< "$trusted_csv"
+                            for ip in "${TRUSTED_ARR[@]}"; do
+                                ip=$(echo "$ip" | tr -d ' ')
+                                [ -z "$ip" ] && continue
+                                local WL=/etc/shieldnode/lists/whitelist-local.txt
+                                grep -qxF "$ip" "$WL" 2>/dev/null || echo "$ip" >> "$WL"
+                                if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+                                    ufw status 2>/dev/null | grep -qE "(^|[[:space:]])$ip([[:space:]]|$)" || \
+                                        ufw allow from "$ip" comment "Trusted (TRUSTED_IPS)" >/dev/null 2>&1
+                                fi
+                                if command -v cscli >/dev/null 2>&1; then
+                                    cscli decisions list --ip "$ip" 2>/dev/null | grep -q whitelist || \
+                                        cscli decisions add --ip "$ip" --duration 8760h --type whitelist --reason "Trusted (TRUSTED_IPS)" >/dev/null 2>&1
+                                fi
+                                echo -e "    ${G}✓${N} $ip"
+                            done
+                            command -v ufw >/dev/null 2>&1 && ufw reload >/dev/null 2>&1 || true
+                            echo -e "  ${G}Done.${N}"
+                            sleep 2
+                            ;;
+                        q|Q|"")
+                            break
+                            ;;
+                        *)
+                            echo -e "  ${Y}Unknown: $TC${N}"
+                            sleep 1
+                            ;;
+                    esac
+                done
                 ;;
             q|Q|"")
                 return
@@ -6613,6 +6809,73 @@ print_ok "Команда установлена: $GUARD_BIN"
 print_info "Снимок состояния: ${BOLD}sudo guard${NC}  (или ${BOLD}sudo guard --json${NC})"
 
 # ==============================================================================
+# ШАГ 12.5: TRUSTED_IPS (v3.18.8) — полный whitelist через все три слоя защиты
+# ==============================================================================
+# Применяет TRUSTED_IPS из shieldnode.conf к: shieldnode whitelist + UFW +
+# CrowdSec. Идемпотентно: повторный запуск не дублирует записи.
+# Если TRUSTED_IPS пуст — шаг тихо пропускается.
+
+apply_trusted_ip() {
+    local ip="$1"
+    local comment="${2:-Trusted infrastructure (TRUSTED_IPS)}"
+
+    # Validation
+    if ! echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        print_warn "  Пропускаю невалидный IP: '$ip'"
+        return 1
+    fi
+
+    local layer_count=0
+
+    # 1. shieldnode whitelist-local
+    local WL=/etc/shieldnode/lists/whitelist-local.txt
+    if [ -f "$WL" ] && grep -qxF "$ip" "$WL"; then
+        :
+    else
+        echo "$ip" >> "$WL"
+        layer_count=$((layer_count + 1))
+    fi
+
+    # 2. UFW
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ! ufw status 2>/dev/null | grep -qE "(^|[[:space:]])$ip([[:space:]]|$)"; then
+            ufw allow from "$ip" comment "$comment" >/dev/null 2>&1 || true
+            layer_count=$((layer_count + 1))
+        fi
+    fi
+
+    # 3. CrowdSec
+    if command -v cscli >/dev/null 2>&1; then
+        if ! cscli decisions list --ip "$ip" 2>/dev/null | grep -q whitelist; then
+            cscli decisions add --ip "$ip" --duration 8760h --type whitelist --reason "$comment" >/dev/null 2>&1 || true
+            layer_count=$((layer_count + 1))
+        fi
+    fi
+
+    if [ "$layer_count" -gt 0 ]; then
+        print_ok "  $ip — применено в $layer_count слое(в)"
+    else
+        print_info "  $ip — уже whitelisted во всех слоях"
+    fi
+    return 0
+}
+
+if [ -n "${TRUSTED_IPS:-}" ]; then
+    print_header "ШАГ 12.5: TRUSTED_IPS"
+    print_status "Применяю trust-stack для IP'шников из TRUSTED_IPS..."
+    IFS=',' read -ra TRUSTED_ARR <<< "$TRUSTED_IPS"
+    for raw_ip in "${TRUSTED_ARR[@]}"; do
+        ip=$(echo "$raw_ip" | tr -d ' ')
+        [ -z "$ip" ] && continue
+        apply_trusted_ip "$ip"
+    done
+    # UFW reload один раз в конце (а не на каждый IP)
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw reload >/dev/null 2>&1 || true
+    fi
+fi
+
+# ==============================================================================
 # ШАГ 13: HEALTHCHECK
 # ==============================================================================
 
@@ -6623,6 +6886,30 @@ print_header "ШАГ 13: HEALTHCHECK"
 print_status "Smoke-test: проверяю что защита реально активна..."
 
 SMOKE_FAIL=0
+
+# v3.18.8 UFW-FIX: восстановление UFW kernel state.
+# `ufw status` определяет active/inactive по наличию kernel chain
+# `ufw-user-input` (через iptables-nft на Ubuntu 24). Если что-то в процессе
+# установки флушнуло ruleset (bouncer post-inst regression / external race),
+# config-файл /etc/ufw/ufw.conf остаётся ENABLED=yes, но `ufw status` →
+# inactive. Восстанавливаем через disable→enable: ufw перечитает rules.* и
+# заново создаст цепочки в kernel.
+if [ "${FIREWALL_TYPE:-}" = "ufw" ]; then
+    if ! LANG=C LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+        print_warn "UFW потерял kernel state в процессе установки — восстанавливаю"
+        ufw --force disable >/dev/null 2>&1 || true
+        if ufw --force enable >/dev/null 2>&1 && \
+           LANG=C LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+            print_ok "UFW восстановлен"
+            # Наша таблица могла улететь вместе с UFW — рестартуем сервис
+            systemctl restart shieldnode-nftables.service >/dev/null 2>&1 || true
+            # Bouncer тоже мог потерять свои таблицы
+            systemctl restart crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+        else
+            print_error "UFW не восстановился — manual fix: sudo ufw --force enable"
+        fi
+    fi
+fi
 
 # 1. Таблица создана?
 # v3.16.3: если нет — пробуем re-load один раз (например bouncer pre-inst flushed)
@@ -6818,7 +7105,7 @@ if [ "$SMOKE_FAIL" -eq 1 ]; then
 else
     print_ok "Smoke-test пройден"
 
-    # v3.18.6: гарантированный finalize-trigger всех blocklists после smoke-test.
+    # v3.18.8: гарантированный finalize-trigger всех blocklists после smoke-test.
     # Защита от race condition в ШАГ 6: если первый запуск updater'а попал в
     # окно между ExecStop/ExecStart shieldnode-nftables.service — set остался
     # пустой. Сейчас nft table 100% активна (smoke-test это проверил),
@@ -6909,7 +7196,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.6 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.8 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
