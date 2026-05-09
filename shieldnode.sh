@@ -1,7 +1,21 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.18.0 (Commercial Edition) — PRE-INSTALL CONFIG
+#  VPN NODE DDoS PROTECTION v3.18.2 (Commercial Edition) — PANEL AUTO-DETECT
+#  v3.18.2: убран вопрос про VPN-панель из pre-install. Compatible режим
+#           включается:
+#           - автоматически если docker ps detect'ит remnawave/marzban/3x-ui
+#           - по умолчанию если ничего не detect'нулось (safe default —
+#             коммерческий продукт всегда ставится с панелью).
+#           Оператор может вручную поставить PANEL_TYPE="none" в
+#           /etc/shieldnode/shieldnode.conf если нода действительно standalone.
+#
+#  v3.18.1: nft priorities теперь зависят от наличия VPN-панели:
+#           - PANEL_TYPE=none      → prerouting -100, forward filter (default)
+#           - PANEL_TYPE=remnawave → prerouting -150, forward -50 (compat)
+#           Раньше priorities были hardcoded -150/-50 что было overhead на
+#           нодах БЕЗ панели (нет конфликта = нет нужды в compat).
+#
 #  v3.18.0: интерактивный pre-install опросник для критичных настроек:
 #           - BRIDGE_IPS: IP моста/upstream-ноды (auto-whitelist'ятся)
 #           - PANEL_TYPE: detection Remnawave/Marzban/3x-ui (auto-detect via docker)
@@ -1064,8 +1078,8 @@ cscli_collection_installed() {
 # Можно переопределить через env (для тестинга на форке).
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
-# v3.18.0: версия для self-check
-SHIELDNODE_VERSION="3.18.0"
+# v3.18.2: версия для self-check
+SHIELDNODE_VERSION="3.18.2"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1447,16 +1461,14 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
     fi
     echo ""
 
-    # === Вопрос 2: Panel detection ===
-    echo "─── VPN Panel ───"
-    echo ""
-    echo "  Если на ноде установлена VPN-панель (Remnawave, Marzban, 3x-ui),"
-    echo "  shieldnode переключится в compatible-режим:"
-    echo "    - prerouting priority -150 (не конфликтует с panel DSTNAT)"
-    echo "    - forward priority -50 (не конфликтует с panel banlist'ами)"
-    echo ""
-
-    # Auto-detect
+    # === Panel detection — БЕЗ вопроса ===
+    # v3.18.2: панель определяется автоматически через docker ps.
+    # Если auto-detect нашёл что-то — compatible режим.
+    # Если ничего не нашлось — всё равно compatible (default), потому что
+    # коммерческий продукт shieldnode в 99% случаев ставится на ноды
+    # с панелью (Remnawave/Marzban/3x-ui).
+    # При желании оператор может вручную поставить PANEL_TYPE="none" в
+    # /etc/shieldnode/shieldnode.conf и сделать reinstall.
     AUTO_PANEL=""
     if docker ps 2>/dev/null | grep -qi "remnanode\|remnawave"; then
         AUTO_PANEL="remnawave"
@@ -1467,34 +1479,14 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
     fi
 
     if [ -n "$AUTO_PANEL" ]; then
-        print_info "Auto-detected: $AUTO_PANEL"
-        echo -n "  Использовать compatible-режим? (Y/n) [Y]: "
-    else
-        echo -n "  Установлена ли VPN-панель? (none/remnawave/marzban/3x-ui) [none]: "
-    fi
-    read -r PANEL_INPUT
-    PANEL_INPUT=$(echo "$PANEL_INPUT" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
-
-    if [ -n "$AUTO_PANEL" ] && [ -z "$PANEL_INPUT" -o "$PANEL_INPUT" = "y" -o "$PANEL_INPUT" = "yes" ]; then
         PANEL_TYPE="$AUTO_PANEL"
-    elif [ "$PANEL_INPUT" = "n" ] || [ "$PANEL_INPUT" = "no" ] || [ "$PANEL_INPUT" = "none" ] || [ -z "$PANEL_INPUT" ]; then
-        PANEL_TYPE="none"
+        print_ok "Panel auto-detected: $PANEL_TYPE — compatible nft priorities"
     else
-        case "$PANEL_INPUT" in
-            remnawave|marzban|3x-ui|x-ui)
-                PANEL_TYPE="$PANEL_INPUT"
-                ;;
-            *)
-                print_warn "Неизвестный тип '$PANEL_INPUT', выбран 'none'"
-                PANEL_TYPE="none"
-                ;;
-        esac
-    fi
-
-    if [ "$PANEL_TYPE" = "none" ]; then
-        print_info "Panel: none (стандартные nft priorities)"
-    else
-        print_ok "Panel: $PANEL_TYPE (compatible nft priorities активированы)"
+        # Нет detect — всё равно compat (safe default для коммерческого VPN-продукта)
+        PANEL_TYPE="remnawave"
+        print_info "Panel не определён — compat-режим по умолчанию (panel-friendly)"
+        print_info "Если на ноде НЕТ панели и хочешь стандартные priorities,"
+        print_info "  отредактируй /etc/shieldnode/shieldnode.conf: PANEL_TYPE=\"none\""
     fi
     echo ""
 
@@ -2362,6 +2354,20 @@ else
     FIB_ANTISPOOF_RULE="        # fib anti-spoofing отключён (multi-homed VPS — может дать false-positive)"
 fi
 
+# v3.18.1: panel-aware nft priorities
+# Если на ноде установлена VPN-панель (Remnawave/Marzban/3x-ui) — используем
+# compatible priorities чтобы не конфликтовать с её плагинами. Иначе —
+# стандартные (более эффективные, наш hook выполняется первым).
+if [ "${PANEL_TYPE:-none}" != "none" ]; then
+    SHIELD_PREROUTING_PRIO="-150"
+    SHIELD_FORWARD_PRIO="-50"
+    print_info "Panel detected ($PANEL_TYPE) — compatible nft priorities (-150 / -50)"
+else
+    SHIELD_PREROUTING_PRIO="-100"
+    SHIELD_FORWARD_PRIO="filter"
+    print_info "Standalone-режим — стандартные nft priorities (-100 / filter)"
+fi
+
 cat > "$NFT_DDOS_CONF" <<EOF
 #!/usr/sbin/nft -f
 # Generated by vpn-node-ddos-protect.sh v1.4
@@ -2561,14 +2567,11 @@ $MANUAL_WHITELIST_V4_INIT
     counter tcp_invalid { }       # invalid TCP flag combos
 
     chain prerouting {
-        # v3.17.1: priority -150 (было -100). Remnawave plugin использует
-        # `priority dstnat` (=-100) в своей table `ip remnanode` для DSTNAT
-        # маршрутизации клиентов VLESS → upstream мост. Когда shieldnode
-        # сидел на том же -100, kernel выполнял chains в неопределённом
-        # порядке (по порядку регистрации) — пакеты могли попасть в shieldnode
-        # ДО DSTNAT или ПОСЛЕ. -150 ставит нас МЕЖДУ crowdsec bouncer (-200)
-        # и Remnawave dstnat (-100), без конфликта priority.
-        type filter hook prerouting priority -150; policy accept;
+        # v3.18.1: priority динамический ($SHIELD_PREROUTING_PRIO).
+        # Если есть VPN-панель (Remnawave/Marzban/3x-ui) — используем -150
+        # чтобы не конфликтовать с её 'priority dstnat' (=-100) для DSTNAT
+        # маршрутизации клиентов VLESS. Если панели нет — -100 (стандарт).
+        type filter hook prerouting priority $SHIELD_PREROUTING_PRIO; policy accept;
 
         # Established/related — пропускаем без проверок.
         ct state established,related accept
@@ -2807,12 +2810,10 @@ $FIB_ANTISPOOF_RULE
     # priority: filter (после rate-limit'а в prerouting, перед NAT).
     # Применяется ТОЛЬКО к forwarded трафику (не локальному SSH/control plane).
     chain forward {
-        # v3.17.2: priority -50 (было filter=0). Remnawave plugin
-        # ingress-filter-ip + torrent-blocker сидят в их forward на
-        # priority filter (=0). Чтобы избежать race condition и
-        # гарантированно делать MSS clamping ДО их banlist'а — ставим
-        # на -50 (между shieldnode prerouting -150 и Remnawave forward 0).
-        type filter hook forward priority -50; policy accept;
+        # v3.18.1: priority динамический ($SHIELD_FORWARD_PRIO).
+        # Если есть VPN-панель (Remnawave) — используем -50 чтобы делать
+        # MSS clamping ДО panel banlist'а. Если панели нет — filter (=0).
+        type filter hook forward priority $SHIELD_FORWARD_PRIO; policy accept;
         tcp flags syn tcp option maxseg size set rt mtu
     }
 }
@@ -3320,7 +3321,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.18.0 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.18.2 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3579,7 +3580,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.18.0 — github sync для lists/custom.txt
+# shieldnode v3.18.2 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3639,7 +3640,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.18.0 — version check
+# shieldnode v3.18.2 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -5441,7 +5442,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.18.0${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.18.2${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -6440,7 +6441,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.0 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.2 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
