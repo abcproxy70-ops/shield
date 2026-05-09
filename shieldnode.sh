@@ -3917,23 +3917,30 @@ chmod 0755 "$SHIELD_LISTS_DIR"
 
 prepare_seed_list() {
     local name="$1" target="$SHIELD_LISTS_DIR/${1}.txt"
-    # v3.18.4: считаем blocklist "достаточным" ТОЛЬКО если в нём есть >= 1
-    # IP-подобная строка. Раньше [ -s "$target" ] возвращал true для файла
-    # с одним header-комментарием → пустые stub'ы навсегда оставались пустыми
-    # → scanner/threat blocklists фактически отключены.
-    if [ -f "$target" ] && grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$target"; then
-        return 0
+    # v3.18.4: определяем что seed уже есть И валиден:
+    #   (a) содержит IP-подобную строку → точно валиден, или
+    #   (b) НЕ помечен как локальный stub-fallback (отсутствует маркер
+    #       "Auto-merged with URL sources" из fallback heredoc'а ниже —
+    #       значит файл скачан с github и легитимен даже если только
+    #       комментарии, как tor.txt seed).
+    if [ -f "$target" ]; then
+        if grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$target"; then
+            return 0   # есть IP — однозначно ок
+        fi
+        if ! grep -qF "Auto-merged with URL sources при наличии конфига" "$target" 2>/dev/null; then
+            return 0   # github seed (header-only валиден)
+        fi
+        # Иначе это наш локальный stub-fallback — пробуем перекачать
     fi
-    # Whitelist'ы и mobile_ru сидов в репо нет — для них допустим header-only.
     if [ "$SHIELD_PIPE_MODE" = "1" ]; then
         # Pipe-mode: качаем дефолтный seed с github (с retry'ями)
         local try ok=0
         for try in 1 2 3; do
             if curl -fsSL --max-time 15 --retry 1 "$SHIELD_REPO_URL/lists/${name}.txt" -o "$target.tmp" 2>/dev/null \
                && [ -s "$target.tmp" ]; then
-                # Проверяем что это не HTML (404-страница) и есть IP-подобные записи
-                if ! head -1 "$target.tmp" | grep -qiE '<html|<!doctype' \
-                   && grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "$target.tmp"; then
+                # Принимаем если не HTML 404-страница (любой текстовый файл —
+                # включая header-only комментариями — валидный seed).
+                if ! head -1 "$target.tmp" | grep -qiE '<html|<!doctype'; then
                     mv "$target.tmp" "$target"
                     ok=1
                     break
