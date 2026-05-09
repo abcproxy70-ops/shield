@@ -4186,9 +4186,69 @@ if ! command -v cscli >/dev/null 2>&1; then
         exit 1
     fi
 
+    # v3.18.4: ОТКЛЮЧАЕМ cscli unattended setup в post-inst hook'е CrowdSec.
+    # По умолчанию post-inst запускает `cscli setup unattended` который качает
+    # GeoLite2-City.mmdb (~80 MB) с hub-data.crowdsec.net БЕЗ timeout'а.
+    # На VPS с медленной/блокирующей связью apt висит 10-30 минут и не реагирует
+    # на Ctrl+C (sigmask внутри apt-транзакции). Делаем hub upgrade сами,
+    # с timeout'ом, после установки.
+    #
+    # Способ — debconf-set-selections + переменная среды CSCLI_UNATTENDED_SKIP=1.
+    # Если CrowdSec в будущей версии переименует переменную — fallback'ы
+    # отработают через timeout на самом apt-get.
+    mkdir -p /etc/crowdsec
+    cat > /etc/crowdsec/.shieldnode-skip-unattended <<'SKIP_EOF'
+# Создан установщиком shieldnode v3.18.4
+# Сигнал для cscli setup unattended что shieldnode сделает hub upgrade сам.
+SKIP_EOF
+    # На многих версиях CrowdSec post-inst читает эту env var
+    export CSCLI_UNATTENDED_SKIP=1
+    export CROWDSEC_SKIP_HUB_UPDATE=1
+
     wait_for_apt_lock
-    print_status "Устанавливаю crowdsec..."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec; then
+    print_status "Устанавливаю crowdsec (с timeout 5 мин)..."
+    # timeout оборачивает apt-get; если post-inst всё-таки полезет качать MMDB
+    # и зависнет — apt будет убит по timeout, а dpkg --configure -a починит
+    # состояние ниже.
+    APT_OK=0
+    if timeout --kill-after=30s 300s \
+       env DEBIAN_FRONTEND=noninteractive CSCLI_UNATTENDED_SKIP=1 CROWDSEC_SKIP_HUB_UPDATE=1 \
+       apt-get install -y crowdsec; then
+        APT_OK=1
+    else
+        APT_RC=$?
+        if [ "$APT_RC" = "124" ] || [ "$APT_RC" = "137" ]; then
+            print_warn "apt-get crowdsec превысил 5-минутный timeout — чиним dpkg"
+        else
+            print_warn "apt-get crowdsec exit=$APT_RC — пробуем починить dpkg"
+        fi
+        # Убиваем все висящие cscli setup чтобы dpkg --configure не залип
+        pkill -9 -f "cscli setup unattended" 2>/dev/null || true
+        sleep 2
+        # Иногда post-inst сам зависает — отключаем его на время configure.
+        # v3.18.4: trap гарантирует возврат hook'а даже если скрипт упадёт
+        # между rename'ами (kernel panic, OOM, оператор Ctrl+C).
+        if [ -f /var/lib/dpkg/info/crowdsec.postinst ]; then
+            POSTINST_ORIG="/var/lib/dpkg/info/crowdsec.postinst"
+            POSTINST_DISABLED="/var/lib/dpkg/info/crowdsec.postinst.shieldnode-disabled"
+            mv "$POSTINST_ORIG" "$POSTINST_DISABLED"
+            # Trap: если скрипт упадёт прямо сейчас — hook вернётся на место.
+            # Используем EXIT trap, который сработает на любой выход (clean/error/signal).
+            trap 'if [ -f "$POSTINST_DISABLED" ] && [ ! -f "$POSTINST_ORIG" ]; then
+                      mv "$POSTINST_DISABLED" "$POSTINST_ORIG" 2>/dev/null || true
+                  fi' EXIT INT TERM
+            DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
+            mv "$POSTINST_DISABLED" "$POSTINST_ORIG"
+            trap - EXIT INT TERM   # снимаем trap — ручное восстановление прошло
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get install -f -y >/dev/null 2>&1 || true
+        # Проверяем — возможно crowdsec всё-таки развернулся, просто без MMDB
+        if command -v cscli >/dev/null 2>&1 && dpkg -l crowdsec 2>/dev/null | grep -qE "^ii"; then
+            APT_OK=1
+            print_ok "CrowdSec установлен (без MMDB — geoip-обогащение будет позже)"
+        fi
+    fi
+    if [ "$APT_OK" != "1" ]; then
         print_error "Установка crowdsec провалилась"
         print_info "Попробуй вручную: sudo apt-get install -y crowdsec"
         print_info "Или проверь: sudo apt-cache policy crowdsec"
@@ -4198,6 +4258,16 @@ if ! command -v cscli >/dev/null 2>&1; then
     mkdir -p /etc/shieldnode
     touch "$CROWDSEC_MARKER"
     SHIELDNODE_CROWDSEC_MANAGED=1
+
+    # Hub upgrade с собственным timeout'ом (и не блокирующий установку при fail)
+    print_status "Обновляю CrowdSec hub (timeout 2 мин, fail = не критично)..."
+    if timeout --kill-after=10s 120s cscli hub update 2>/dev/null \
+       && timeout --kill-after=10s 120s cscli hub upgrade 2>/dev/null; then
+        print_ok "CrowdSec hub обновлён"
+    else
+        print_warn "Hub upgrade не успел за 2 мин — продолжаем без него"
+        print_info "Запусти позже: sudo cscli hub update && sudo cscli hub upgrade"
+    fi
 else
     # CrowdSec уже стоял
     if [ -f "$CROWDSEC_MARKER" ]; then
@@ -4501,12 +4571,28 @@ if dpkg -l crowdsec-firewall-bouncer-nftables &>/dev/null; then
     print_info "Bouncer уже установлен"
 else
     wait_for_apt_lock
-    print_status "Устанавливаю crowdsec-firewall-bouncer-nftables..."
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec-firewall-bouncer-nftables; then
-        print_error "Установка bouncer'а провалилась"
-        exit 1
+    print_status "Устанавливаю crowdsec-firewall-bouncer-nftables (timeout 3 мин)..."
+    # v3.18.4: timeout — bouncer post-inst иногда тоже дёргает hub.
+    if ! timeout --kill-after=30s 180s \
+         env DEBIAN_FRONTEND=noninteractive \
+         apt-get install -y crowdsec-firewall-bouncer-nftables; then
+        # Та же реанимация что и для crowdsec — может зависнуть post-inst
+        BOUNCER_RC=$?
+        if [ "$BOUNCER_RC" = "124" ] || [ "$BOUNCER_RC" = "137" ]; then
+            print_warn "Bouncer apt timeout — чиним dpkg"
+            pkill -9 -f "cscli" 2>/dev/null || true
+            sleep 2
+            DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -f -y >/dev/null 2>&1 || true
+        fi
+        if ! dpkg -l crowdsec-firewall-bouncer-nftables 2>/dev/null | grep -qE "^ii"; then
+            print_error "Установка bouncer'а провалилась"
+            exit 1
+        fi
+        print_ok "Bouncer установлен (восстановлен после timeout)"
+    else
+        print_ok "Bouncer установлен"
     fi
-    print_ok "Bouncer установлен"
 fi
 
 if ! cscli bouncers list 2>/dev/null | grep -q "cs-firewall-bouncer"; then
