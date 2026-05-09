@@ -171,7 +171,7 @@
 #    [GUARD-SETTINGS] Новый пункт меню [s] settings в guard CLI:
 #        - Auto-sync github custom.txt: ON/OFF
 #        - Check for shieldnode updates: ON/OFF
-#        - Mobile-RU whitelist: ON/OFF (live edit MAXMIND_LICENSE_KEY)
+#        - Mobile-RU whitelist: ON/OFF
 #        - Tor exit blocklist: ON/OFF (live edit BLOCK_TOR)
 #      Изменения пишутся в /etc/shieldnode/shieldnode.conf, при необходимости
 #      рестартуют соответствующие timer'ы / service'ы.
@@ -1186,10 +1186,8 @@ shield_nft_set_name() {
 # v3.14.1: эти переменные тоже подхватятся из shieldnode.conf если оператор
 # изменил их через guard CLI settings menu (загружен выше до этого блока).
 ENABLE_RU_MOBILE_WHITELIST="${ENABLE_RU_MOBILE_WHITELIST:-1}"
-# v3.15.0: MAXMIND_LICENSE_KEY больше не используется (mobile-RU теперь обычный
-# blocklist через github). Переменная остаётся в conf для backward-compat,
-# никаких функций не выполняет — тихо игнорируется.
-MAXMIND_LICENSE_KEY="${MAXMIND_LICENSE_KEY:-}"
+# v3.18.4: MAXMIND_LICENSE_KEY полностью удалён (с v3.15.0 не использовался,
+# с v3.18.3 mobile-RU работает через github sync из RIPEstat — без ключей).
 
 DEFAULT_MIN_ENTRIES_MOBILE_RU=100   # ниже — что-то сломалось у RIPEstat в github actions
 
@@ -1444,9 +1442,8 @@ if [ -n "${BRIDGE_IPS:-}" ]; then
 fi
 
 # v3.18.4: merge-aware write — сохраняем все настройки оператора (BLOCK_TOR,
-# ENABLE_GITHUB_SYNC, ENABLE_VERSION_CHECK, ENABLE_RU_MOBILE_WHITELIST,
-# MAXMIND_LICENSE_KEY и пр., выставленные через `guard settings`), переписываем
-# только BRIDGE_IPS / PANEL_TYPE.
+# ENABLE_GITHUB_SYNC, ENABLE_VERSION_CHECK, ENABLE_RU_MOBILE_WHITELIST и пр.,
+# выставленные через `guard settings`), переписываем только BRIDGE_IPS / PANEL_TYPE.
 write_preinstall_conf() {
     local tmp
     tmp=$(mktemp "${PREINSTALL_CONF}.XXXXXX") || return 1
@@ -1454,7 +1451,7 @@ write_preinstall_conf() {
         echo "# shieldnode pre-install configuration"
         echo "# Обновлено: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
         echo "# При reinstall эти значения переиспользуются автоматически."
-        echo "# Настройки оператора (BLOCK_TOR, ENABLE_*, MAXMIND_LICENSE_KEY) сохраняются."
+        echo "# Настройки оператора (BLOCK_TOR, ENABLE_*) сохраняются."
         echo ""
         echo "BRIDGE_IPS=\"${BRIDGE_IPS:-}\""
         echo "PANEL_TYPE=\"${PANEL_TYPE:-none}\""
@@ -2513,8 +2510,8 @@ $XRAY_PORTS_UDP_INIT
     # --- v3.13.0: Mobile-RU AS whitelist ---
     # Подсети российских мобильных операторов (AS8359 МТС, AS12958 T2, etc).
     # Заполняется /usr/local/sbin/shieldnode-update-blocklist.sh mobile_ru
-    # Источник: MaxMind GeoLite2-ASN-CSV (требует MAXMIND_LICENSE_KEY).
-    # Если key нет — set пустой, никакого whitelist'инга (поведение v3.12.0).
+    # Источник (с v3.18.3): lists/mobile-ru.txt из github, авто-генерируется
+    # раз в неделю через GitHub Actions из публичного RIPEstat API.
     # ВАЖНО: эти IP получают РЕЛАКСИРОВАННЫЕ лимиты (ct=1000, newconn=2000/min)
     # вместо стандартных (ct=400, newconn=500/min) — для CGNAT с 50-200 абонентами.
     # Scanner/threat/custom blocklist'ы НЕ обходятся — реальные атаки всё равно ловятся.
@@ -3996,8 +3993,10 @@ fi
 print_ok "Lists: $SHIELD_LISTS_DIR/{scanner,threat,tor,custom,custom-local}.txt"
 
 # 7) Включаем и запускаем blocklists. Tor — только если BLOCK_TOR=1.
-# v3.13.0: mobile_ru — только если ENABLE_RU_MOBILE_WHITELIST=1 (по умолчанию ON,
-# но без MAXMIND_LICENSE_KEY первый запуск запишет WARN и оставит set пустым).
+# v3.13.0: mobile_ru — только если ENABLE_RU_MOBILE_WHITELIST=1 (по умолчанию ON).
+# v3.18.3: mobile-RU CIDRы качаются с github (lists/mobile-ru.txt) — никакие
+# license key'и не нужны. На первом запуске set может быть пуст пока github-sync
+# не отработает (в течение 6 ч от установки).
 ENABLED_LISTS=(scanner threat custom)
 if [ "$BLOCK_TOR" = "1" ]; then
     ENABLED_LISTS+=(tor)
@@ -6224,7 +6223,8 @@ show_full_log() {
     echo ""
 }
 
-# v3.14.0: settings menu — toggle ENABLE_* flags + edit MAXMIND_LICENSE_KEY
+# v3.14.0: settings menu — toggle ENABLE_* flags
+# v3.18.4: убран MAXMIND_LICENSE_KEY (deprecated с v3.15.0)
 show_settings_menu() {
     local CONF="/etc/shieldnode/shieldnode.conf"
     mkdir -p /etc/shieldnode
