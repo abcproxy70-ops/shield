@@ -1,13 +1,69 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.18.8 (Commercial Edition) — NON-INTERACTIVE FIX
-#  v3.18.3: исправлен критичный BUG в non-interactive mode:
+#  VPN NODE DDoS PROTECTION v3.18.11 (Commercial Edition) — POST-AUDIT HARDENING
+#  v3.18.11: 16 фиксов после полного аудита (8 проходов, 192 находки, само-ревью):
+#    [SECURITY]
+#    SH-NEW-1   shield_safe_source helper — проверка прав conf-файла перед source
+#               (защита от privilege-escalation если /etc/shieldnode/* скомпрометирован).
+#    SH-NEW-10  validate_ipv4_or_cidr helper — отклоняет 0.0.0.0/0, multicast,
+#               broadcast, prefix<8. Предотвращает случайный whitelist всего
+#               интернета (4 места: BRIDGE_IPS pre-install + apply, guard whitelist
+#               Add, guard Trusted IPs Add, apply_trusted_ip).
+#    SH-NEW-82  chmod --reference после awk-replace bouncer config (раньше mv
+#               сбрасывал 0600 → 0644, api_key становился world-readable).
+#    SH-NEW-106 SQL escape `$ip` в asn_cache_get/put + sanitization IP в awk-парсинге
+#               aggregator'а (gsub /[^0-9.:]/ "" ip — защита от rogue logger
+#               injection через journald).
+#    SH-NEW-125 _write_setting через awk (вместо sed | delimiter) + chmod --reference.
+#
+#    [CORRECTNESS]
+#    SH-NEW-25  iptables port-range gsub :->-  (UFW: 4000:5000, nft: 4000-5000;
+#               раньше nft -f падал с syntax error на iptables-firewall нодах).
+#    SH-NEW-37  убран After=ufw.service Wants=ufw.service из shieldnode-nftables
+#               (противоречил Before=network-pre.target — UFW в multi-user.target
+#               стартует ПОСЛЕ network-pre, ordering работал на удачу).
+#    SH-NEW-56  github-sync: проверка first-byte (#|digit) и HTML — раньше
+#               cloudflare-error-page мог перезаписать custom.txt HTML'ом.
+#    SH-NEW-70  trap до mv в crowdsec post-inst (был race window между mv и
+#               trap setup → original hook потерян до следующего apt).
+#    SH-NEW-89  MAX(id) sanity check для CrowdSec decisions (после
+#               apt purge crowdsec; install — id=1, но LAST_ID=50000 → события
+#               пропускались навсегда).
+#    SH-NEW-98  правильные unit-имена в guard rollback (раньше systemctl stop
+#               shieldnode-watcher / shieldnode-whitelist-watcher silently fail —
+#               race с aggregator пишущим в БД).
+#    SH-NEW-114 версия v3.18.8 → v3.18.10 → v3.18.11 во всех runtime местах
+#               (раньше guard CLI показывал старую версию после bump'а).
+#    SH-NEW-141 TimeoutStartSec=120 в shieldnode-update@.service (раньше
+#               timeout-обертка систем-cli убивала только CLI, не сам updater).
+#    SH-NEW-148 фильтр по reason в `cscli decisions delete --type whitelist`
+#               при --uninstall (раньше удалялись ВСЕ whitelist'ы оператора,
+#               включая от других сервисов).
+#    SH-NEW-149 `ls -1dt /root/vpn-ddos-backup-* | head -1` для восстановления
+#               bouncer config (раньше использовался $BACKUP_DIR который
+#               undefined в --uninstall блоке → restore никогда не работал).
+#    SH-NEW-168 systemctl is-active crowdsec ПЕРЕД CAPI/bouncer config (раньше
+#               на 1GB ноде с OOM crowdsec daemon мог упасть, cscli silently
+#               fail'ила, install проходил "успешно" с broken CAPI).
+#
+#  v3.18.10: убраны теги [BUG-NN] из runtime-вывода print_* (14 мест).
+#  v3.18.9: --uninstall теперь явно сбрасывает sysctl-ключи которые писал ТОЛЬКО
+#           shieldnode (UDP conntrack timeout, synack_retries, log_martians,
+#           icmp_ignore_bogus). Раньше rm файла + sysctl --system НЕ сбрасывал
+#           значения которые не дублировались в других /etc/sysctl.d/*.conf —
+#           они оставались в памяти ядра до ребута.
+#           Конкретно влияет на сценарий: оператор удалил vpn-node-setup.sh,
+#           потом shieldnode → UDP timeout 180/300 оставался активен (фикс
+#           v3.16.4 для Hysteria2), вместо kernel default 30/180.
+#
+#  v3.18.8: исправлен критичный BUG в non-interactive mode:
 #           - panel auto-detect ВСЕГДА выполняется (раньше работал только в TTY)
 #           - conf-файл сохраняется ДО опросника (ловит auto-detect для CI/CD)
 #           - валидация BRIDGE_IPS на формат IP/CIDR перед записью в whitelist
 #           Раньше CI/CD-деплой на ноду с Remnawave получал PANEL_TYPE="" →
 #           standalone priorities (-100) → конфликт с Remnawave dstnat (-100).
+#           (Также: TRUSTED_IPS, MAXMIND_LICENSE_KEY полностью удалён.)
 #
 #  v3.18.2: убран вопрос про VPN-панель из pre-install. Compatible режим
 #           включается:
@@ -1086,7 +1142,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.18.8"
+SHIELDNODE_VERSION="3.18.11"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1101,10 +1157,77 @@ SHIELD_STATE_DIR="/var/lib/shieldnode"
 # в /etc/shieldnode/shieldnode.conf. При reinstall (apply новой версии) мы должны
 # уважать его выбор, а не сбрасывать на дефолты. Подгружаем СЕЙЧАС, до объявления
 # дефолтов: env var или conf-значение получает приоритет над встроенным дефолтом.
-if [ -f "$SHIELD_CONF_FILE" ]; then
+#
+# v3.18.11 SH-NEW-1: source выполняется ТОЛЬКО если файл принадлежит root и
+# имеет безопасные права. Защищает от privilege-escalation если /etc/shieldnode/
+# был случайно расшарен (chmod 777), либо если non-root юзер получил запись
+# через bug в другом сервисе.
+shield_safe_source() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    local owner perms
+    owner=$(stat -c "%u:%g" "$f" 2>/dev/null)
+    perms=$(stat -c "%a" "$f" 2>/dev/null)
+    if [ "$owner" != "0:0" ]; then
+        echo "WARN: $f не принадлежит root (owner=$owner) — пропускаю source" >&2
+        return 1
+    fi
+    case "$perms" in
+        600|640|644) ;;
+        *)
+            echo "WARN: $f имеет небезопасные права ($perms) — пропускаю source" >&2
+            return 1
+            ;;
+    esac
     # shellcheck source=/dev/null
-    . "$SHIELD_CONF_FILE" 2>/dev/null || true
+    . "$f" 2>/dev/null || true
+    return 0
+}
+
+if [ -f "$SHIELD_CONF_FILE" ]; then
+    shield_safe_source "$SHIELD_CONF_FILE"
 fi
+
+# v3.18.11 SH-NEW-10: строгая валидация IPv4/CIDR.
+# Отклоняет:
+#   - 0.0.0.0/x  (whitelist всего интернета — частая ошибка оператора)
+#   - 224-255    (multicast/reserved)
+#   - 255.255.255.255 (broadcast)
+#   - оctets > 255
+#   - prefix < 8 или > 32
+# Принимает:
+#   - 1.2.3.4
+#   - 10.0.0.0/8 (RFC1918 ok)
+#   - 127.0.0.0/8 (loopback ok — может быть legitimate в test setups)
+# Возвращает 0 если valid, 1 если нет.
+validate_ipv4_or_cidr() {
+    local input="$1"
+    local ip cidr o1 o2 o3 o4
+    if [[ "$input" == */* ]]; then
+        cidr="${input#*/}"
+        ip="${input%/*}"
+        case "$cidr" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$cidr" -ge 8 ] && [ "$cidr" -le 32 ] || return 1
+    else
+        ip="$input"
+    fi
+    IFS='.' read -r o1 o2 o3 o4 extra <<< "$ip"
+    [ -z "$o4" ] && return 1
+    [ -n "$extra" ] && return 1
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        case "$o" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$o" -ge 0 ] && [ "$o" -le 255 ] || return 1
+    done
+    # Reject 0.0.0.0/x, multicast, broadcast
+    [ "$o1" -eq 0 ] && return 1
+    [ "$o1" -ge 224 ] && return 1
+    [ "$o1" -eq 255 ] && [ "$o2" -eq 255 ] && [ "$o3" -eq 255 ] && [ "$o4" -eq 255 ] && return 1
+    return 0
+}
 
 # v3.14.0: настройки auto-sync (можно переопределить в shieldnode.conf или env).
 # Приоритет: env var → shieldnode.conf → дефолт здесь.
@@ -1298,8 +1421,25 @@ if [ "${1:-}" = "--uninstall" ]; then
         fi
     done
     if [ "$REMOVED_SYSCTL" = "1" ]; then
+        # v3.18.9: sysctl --system НЕ сбрасывает значения которые писал ТОЛЬКО
+        # удалённый файл — они "залипают" в памяти ядра до ребута. Явно сбрасываем
+        # ключи которые shieldnode писал (на kernel defaults). Если оператор
+        # установил vpn-node-setup.sh — он перезапишет своими значениями через
+        # 99-conntrack.conf / 99-xray-tuning.conf при sysctl --system ниже.
+        # Если его нет — сбросим явно.
+        sysctl -w net.ipv4.tcp_synack_retries=5 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.tcp_syn_retries=6 >/dev/null 2>&1 || true
+        sysctl -w net.netfilter.nf_conntrack_udp_timeout=30 >/dev/null 2>&1 || true
+        sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=180 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.icmp_ignore_bogus_error_responses=0 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.conf.all.log_martians=0 >/dev/null 2>&1 || true
+        # Остальные ключи (rp_filter, syncookies, accept_redirects, send_redirects,
+        # accept_source_route, icmp_echo_ignore_broadcasts, tcp_rfc1337) обычно
+        # дублируются vpn-node-setup.sh с теми же значениями — sysctl --system
+        # их применит из 99-xray-tuning.conf. Если setup не установлен — оператор
+        # вернёт defaults вручную или ребутом.
         sysctl --system >/dev/null 2>&1 || true
-        print_ok "Sysctl hardening удалён (применятся defaults)"
+        print_ok "Sysctl hardening удалён (UDP-timeout/synack/martians сброшены на defaults)"
     fi
 
     # CrowdSec parser
@@ -1322,10 +1462,13 @@ if [ "${1:-}" = "--uninstall" ]; then
     fi
     print_ok "nft правила удалены"
 
-    # cscli whitelist decisions (включая v3.10.3 mgmt whitelist)
+    # cscli whitelist decisions (только наши — v3.18.11 SH-NEW-148: фильтр
+    # по reason. Раньше удаляли ВСЕ whitelist'ы оператора (от других сервисов).)
     if command -v cscli >/dev/null 2>&1; then
-        cscli decisions delete --type whitelist >/dev/null 2>&1 || true
-        print_ok "Whitelist decisions очищены"
+        cscli decisions delete --type whitelist --reason "shieldnode mgmt IP whitelist" >/dev/null 2>&1 || true
+        cscli decisions delete --type whitelist --reason "Trusted (TRUSTED_IPS)" >/dev/null 2>&1 || true
+        cscli decisions delete --type whitelist --reason "Trusted infrastructure (TRUSTED_IPS)" >/dev/null 2>&1 || true
+        print_ok "Whitelist decisions shieldnode'а очищены (чужие whitelist'ы сохранены)"
     fi
 
     # v3.10.3: убираем cron-job hub upgrade
@@ -1343,11 +1486,15 @@ if [ "${1:-}" = "--uninstall" ]; then
     systemctl reload crowdsec >/dev/null 2>&1 || true
 
     # v3.10.3: восстанавливаем оригинальный bouncer config если есть бэкап
-    if [ -f "$BACKUP_DIR/crowdsec-firewall-bouncer.yaml.before" ]; then
-        cp -a "$BACKUP_DIR/crowdsec-firewall-bouncer.yaml.before" \
+    # v3.18.11 SH-NEW-149: ищем последний backup автоматически.
+    # Раньше использовался $BACKUP_DIR который undefined в --uninstall блоке
+    # (создаётся в начале install run, не uninstall) → restore никогда не работал.
+    LAST_BACKUP=$(ls -1dt /root/vpn-ddos-backup-* 2>/dev/null | head -1)
+    if [ -n "$LAST_BACKUP" ] && [ -f "$LAST_BACKUP/crowdsec-firewall-bouncer.yaml.before" ]; then
+        cp -a "$LAST_BACKUP/crowdsec-firewall-bouncer.yaml.before" \
               /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
         systemctl restart crowdsec-firewall-bouncer 2>/dev/null || true
-        print_ok "Bouncer config восстановлен из бэкапа"
+        print_ok "Bouncer config восстановлен из бэкапа: $LAST_BACKUP"
     fi
 
     print_header "UNINSTALL ЗАВЕРШЁН"
@@ -1417,9 +1564,9 @@ PREINSTALL_CONF="/etc/shieldnode/shieldnode.conf"
 mkdir -p /etc/shieldnode 2>/dev/null
 
 # Загружаем существующие настройки (если есть)
+# v3.18.11 SH-NEW-1: используем shield_safe_source (определена выше).
 if [ -r "$PREINSTALL_CONF" ]; then
-    # shellcheck source=/dev/null
-    . "$PREINSTALL_CONF" 2>/dev/null || true
+    shield_safe_source "$PREINSTALL_CONF"
 fi
 
 # v3.18.3: Panel auto-detect ВСЕГДА выполняется (даже в non-interactive),
@@ -1510,10 +1657,11 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
         VALID_IPS=""
         IFS=',' read -ra IP_ARR <<< "$BRIDGE_IPS"
         for ip in "${IP_ARR[@]}"; do
-            if echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
+            # v3.18.11 SH-NEW-10: строгая валидация (отклоняет 0.0.0.0/0 etc)
+            if validate_ipv4_or_cidr "$ip"; then
                 VALID_IPS="${VALID_IPS:+$VALID_IPS,}$ip"
             else
-                print_warn "Пропускаю невалидный IP: $ip"
+                print_warn "Пропускаю невалидный IP: $ip (запрещены 0.0.0.0/x, multicast, prefix<8)"
             fi
         done
         BRIDGE_IPS="$VALID_IPS"
@@ -1556,10 +1704,10 @@ if [ -n "${BRIDGE_IPS:-}" ]; then
     fi
     IFS=',' read -ra BR_ARR <<< "$BRIDGE_IPS"
     for ip in "${BR_ARR[@]}"; do
-        # v3.18.3: жёсткая валидация — отбрасываем мусор
+        # v3.18.11 SH-NEW-10: строгая валидация (отклоняет 0.0.0.0/0 etc)
         ip=$(echo "$ip" | tr -d ' ')
-        if ! echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
-            print_warn "Пропускаю невалидный bridge IP: '$ip'"
+        if ! validate_ipv4_or_cidr "$ip"; then
+            print_warn "Пропускаю невалидный bridge IP: '$ip' (запрещены 0.0.0.0/x, multicast, prefix<8)"
             continue
         fi
         if ! grep -qxF "$ip" "$WL_LOCAL" 2>/dev/null; then
@@ -2164,19 +2312,22 @@ detect_firewall_ports() {
 
         iptables)
             # iptables -S INPUT: ищем "-A INPUT -p tcp --dport 443 -j ACCEPT"
+            # v3.18.11 SH-NEW-25: gsub :->-  (UFW: 4000:5000, nft требует 4000-5000)
             tcp_list=$(iptables -S INPUT 2>/dev/null | \
                 awk '/-j ACCEPT/ && /-p tcp/ {
                     for (i=1; i<=NF; i++) {
-                        if ($i == "--dport") print $(i+1)
-                        if ($i == "--dports") print $(i+1)
+                        if ($i == "--dport" || $i == "--dports") {
+                            p=$(i+1); gsub(/:/,"-",p); print p
+                        }
                     }
                 }' | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
 
             udp_list=$(iptables -S INPUT 2>/dev/null | \
                 awk '/-j ACCEPT/ && /-p udp/ {
                     for (i=1; i<=NF; i++) {
-                        if ($i == "--dport") print $(i+1)
-                        if ($i == "--dports") print $(i+1)
+                        if ($i == "--dport" || $i == "--dports") {
+                            p=$(i+1); gsub(/:/,"-",p); print p
+                        }
                     }
                 }' | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
             ;;
@@ -2935,9 +3086,9 @@ DefaultDependencies=no
 Before=network-pre.target
 Wants=network-pre.target
 After=nftables.service
-# Запускаемся ПОСЛЕ ufw чтобы наши правила не пересекались
-After=ufw.service
-Wants=ufw.service
+# v3.18.11 SH-NEW-37: убран After=ufw.service (противоречил Before=network-pre.target —
+# ufw.service в multi-user.target, который ПОСЛЕ network-pre). UFW работает
+# в отдельной таблице (filter chain), наша — inet ddos_protect, не пересекаются.
 
 [Service]
 Type=oneshot
@@ -3086,14 +3237,19 @@ detect_firewall_ports() {
                 grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | sort -u | tr '\n' ',' | sed 's/,$//')
             ;;
         iptables)
+            # v3.18.11 SH-NEW-25: gsub :->- для iptables port-range
             tcp_list=$(iptables -S INPUT 2>/dev/null | awk '/-j ACCEPT/ && /-p tcp/ {
                 for (i=1; i<=NF; i++) {
-                    if ($i == "--dport" || $i == "--dports") print $(i+1)
+                    if ($i == "--dport" || $i == "--dports") {
+                        p=$(i+1); gsub(/:/,"-",p); print p
+                    }
                 }
             }' | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
             udp_list=$(iptables -S INPUT 2>/dev/null | awk '/-j ACCEPT/ && /-p udp/ {
                 for (i=1; i<=NF; i++) {
-                    if ($i == "--dport" || $i == "--dports") print $(i+1)
+                    if ($i == "--dport" || $i == "--dports") {
+                        p=$(i+1); gsub(/:/,"-",p); print p
+                    }
                 }
             }' | tr ',' '\n' | sort -un | tr '\n' ',' | sed 's/,$//')
             # iptables: -s <IP>/-s <IP/CIDR> в ACCEPT-правилах
@@ -3413,7 +3569,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.18.8 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.18.11 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3672,7 +3828,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.18.8 — github sync для lists/custom.txt
+# shieldnode v3.18.11 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3708,6 +3864,24 @@ if [ ! -s "\$TMP" ]; then
     exit 1
 fi
 
+# v3.18.11 SH-NEW-56: проверка что content — plain text, не HTML-error-page.
+# Github raw обычно возвращает 404 (тогда -f выкинет), но cloudflare maintenance
+# / proxy errors могут вернуть 200 OK + HTML body.
+# Plain text custom.txt всегда начинается с '#' (header comment) или digit (IP).
+FIRST_BYTE=\$(head -c 1 "\$TMP")
+case "\$FIRST_BYTE" in
+    \\#|[0-9]) ;; # OK plain-text
+    *)
+        logger -t "\$LOG_TAG" "WARN: github вернул не-text content (first byte: \$(printf '%q' \"\$FIRST_BYTE\")) — оставляю текущий"
+        exit 1
+        ;;
+esac
+# Дополнительно: явно отклоняем HTML
+if head -3 "\$TMP" | grep -qiE '<html|<!doctype'; then
+    logger -t "\$LOG_TAG" "WARN: github вернул HTML — оставляю текущий"
+    exit 1
+fi
+
 # Sanity-check: новый файл должен быть валидным (хотя бы 1 IP-подобная строка
 # или хотя бы заголовок-комментарий — пустые тоже ОК для seed'ов).
 NEW_LINES=\$(wc -l < "\$TMP")
@@ -3735,7 +3909,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.18.8 — version check
+# shieldnode v3.18.11 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -3888,6 +4062,11 @@ StartLimitIntervalSec=60
 [Service]
 Type=oneshot
 ExecStart=$SHIELD_UPDATER_SCRIPT %i
+# v3.18.11 SH-NEW-141: TimeoutStartSec=120s — если updater hangs (slow URL-feed
+# за РКН, hung curl), systemd убьёт его через 2 мин. Раньше FINAL TRIGGER
+# делал timeout-обертку вокруг systemctl start, но timeout убивал только
+# CLI, а не сам updater (который продолжал работать в background).
+TimeoutStartSec=120
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -4257,7 +4436,7 @@ if ! command -v cscli >/dev/null 2>&1; then
     # отработают через timeout на самом apt-get.
     mkdir -p /etc/crowdsec
     cat > /etc/crowdsec/.shieldnode-skip-unattended <<'SKIP_EOF'
-# Создан установщиком shieldnode v3.18.8
+# Создан установщиком shieldnode v3.18.11
 # Сигнал для cscli setup unattended что shieldnode сделает hub upgrade сам.
 SKIP_EOF
     # На многих версиях CrowdSec post-inst читает эту env var
@@ -4289,17 +4468,16 @@ SKIP_EOF
         pkill -9 -f "cscli setup unattended" 2>/dev/null || true
         sleep 2
         # Иногда post-inst сам зависает — отключаем его на время configure.
-        # v3.18.8: trap гарантирует возврат hook'а даже если скрипт упадёт
-        # между rename'ами (kernel panic, OOM, оператор Ctrl+C).
+        # v3.18.11 SH-NEW-70: устанавливаем trap ПЕРЕД mv (раньше был race window:
+        # SIGTERM между mv и trap setup → original hook потерян до следующего apt).
         if [ -f /var/lib/dpkg/info/crowdsec.postinst ]; then
             POSTINST_ORIG="/var/lib/dpkg/info/crowdsec.postinst"
             POSTINST_DISABLED="/var/lib/dpkg/info/crowdsec.postinst.shieldnode-disabled"
-            mv "$POSTINST_ORIG" "$POSTINST_DISABLED"
-            # Trap: если скрипт упадёт прямо сейчас — hook вернётся на место.
-            # Используем EXIT trap, который сработает на любой выход (clean/error/signal).
+            # Trap СНАЧАЛА — если SIGTERM в момент trap'а, condition false (DISABLED ещё нет), no-op
             trap 'if [ -f "$POSTINST_DISABLED" ] && [ ! -f "$POSTINST_ORIG" ]; then
                       mv "$POSTINST_DISABLED" "$POSTINST_ORIG" 2>/dev/null || true
                   fi' EXIT INT TERM
+            mv "$POSTINST_ORIG" "$POSTINST_DISABLED"
             DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
             mv "$POSTINST_DISABLED" "$POSTINST_ORIG"
             trap - EXIT INT TERM   # снимаем trap — ручное восстановление прошло
@@ -4425,7 +4603,7 @@ elif [ -f "$PROFILES_FILE" ]; then
     # → юзер за CGNAT сидел в бане 24h вместо 4h.
     if grep -qE "^[[:space:]]*duration:[[:space:]]*24h[[:space:]]*$" "$PROFILES_FILE"; then
         sed -i 's/^\([[:space:]]*\)duration:[[:space:]]*24h[[:space:]]*$/\1duration: 4h/' "$PROFILES_FILE"
-        print_ok "Ban duration: 24h → 4h во всех профилях (v3.10.3 BUG-12)"
+        print_ok "Ban duration: 24h → 4h во всех профилях"
     elif grep -qE "^[[:space:]]*duration:[[:space:]]*4h[[:space:]]*$" "$PROFILES_FILE"; then
         print_info "Ban duration уже 4h (дефолт CrowdSec)"
     else
@@ -4496,7 +4674,7 @@ done
 
 if [ "$SSH_ACQUIS_FOUND" = "0" ] && cscli_collection_installed "crowdsecurity/sshd"; then
     # Нет SSH acquisition, но коллекция установлена — создаём journalctl
-    print_status "SSH acquisition отсутствует — создаю journalctl-based (BUG-14)"
+    print_status "SSH acquisition отсутствует — создаю journalctl-based"
     cat > "$ACQUIS_DIR/sshd.yaml" <<'SSHD_ACQUIS_EOF'
 # v3.10.4: SSH acquisition через journalctl (BUG-14 fix).
 # Универсально работает на всех Ubuntu/Debian, не зависит от наличия
@@ -4516,7 +4694,7 @@ elif [ "$SSH_FILE_ACQUIS" = "1" ] && [ "$SSH_JOURNALD_ACQUIS" = "1" ]; then
     if [ -f "$ACQUIS_DIR/sshd.yaml" ] && grep -q "v3.10.4" "$ACQUIS_DIR/sshd.yaml"; then
         rm -f "$ACQUIS_DIR/sshd.yaml"
         systemctl reload crowdsec >/dev/null 2>&1
-        print_ok "Удалён дубль journalctl SSH acquisition (BUG-18: file-based уже работает)"
+        print_ok "Удалён дубль journalctl SSH acquisition (file-based уже работает)"
     else
         print_warn "Двойной SSH acquisition (file + journald). leaky bucket будет срабатывать в 2× быстрее."
         print_info "Проверь /etc/crowdsec/acquis.yaml и acquis.d/*.yaml — оставь один источник."
@@ -4537,7 +4715,14 @@ fi
 # v3.10.4 BUG-15 FIX: проверяем что CAPI registration реально прошла.
 # На машинах за corporate proxy/firewall apt postinst может silently fail.
 # Без CAPI нет community blocklist — теряется самая ценная фича.
-print_status "Проверяю CAPI registration (BUG-15)..."
+# v3.18.11 SH-NEW-168: проверяем что crowdsec daemon активен — иначе все
+# cscli команды вернут exit 1 silently, скрипт пройдёт "успешно" но без
+# CAPI/bouncer config'ов. На 1GB ноде с OOM это реальный сценарий.
+if ! systemctl is-active --quiet crowdsec; then
+    print_warn "CrowdSec daemon не активен — пропускаю CAPI/bouncer config (см. journalctl -u crowdsec)"
+    print_info "После починки запусти: sudo cscli capi register; sudo cscli bouncers add cs-firewall-bouncer-nftables"
+else
+print_status "Проверяю CAPI registration..."
 if cscli capi status >/dev/null 2>&1; then
     print_ok "CAPI: registered + работает"
 else
@@ -4558,6 +4743,7 @@ else
         print_warn "cscli capi register failed"
     fi
 fi
+fi  # v3.18.11 SH-NEW-168: end of "if systemctl is-active crowdsec"
 
 # v3.10.4 BUG-17 FIX: postoverflow whitelist для mgmt IPs.
 # `cscli decisions add --type whitelist` не предотвращает scenario trigger
@@ -4619,7 +4805,7 @@ if [ -n "$MGMT_IPV4" ]; then
     } > "$POSTOVERFLOW_WL"
     chmod 644 "$POSTOVERFLOW_WL"
     systemctl reload crowdsec >/dev/null 2>&1 || systemctl restart crowdsec >/dev/null 2>&1
-    print_ok "Postoverflow whitelist mgmt IPs (BUG-17)"
+    print_ok "Postoverflow whitelist mgmt IPs"
 fi
 
 fi  # /SHIELDNODE_CROWDSEC_MANAGED guard for ШАГ 9
@@ -4728,7 +4914,7 @@ elif [ -f "$BOUNCER_CFG" ]; then
         # Меняем оба priority (ipv4 + ipv6 секции, обе по дефолту -10)
         sed -i 's/^\([[:space:]]*\)priority:[[:space:]]*-10[[:space:]]*$/\1priority: -200/g' "$BOUNCER_CFG"
         BOUNCER_CHANGED=1
-        print_ok "Bouncer priority: -10 → -200 (BUG-9: раньше нашего prerouting)"
+        print_ok "Bouncer priority: -10 → -200 (применяется ДО shieldnode prerouting)"
     fi
 
     # nftables_hooks меняем с [input, forward] на [prerouting]
@@ -4742,9 +4928,9 @@ elif [ -f "$BOUNCER_CFG" ]; then
         in_hooks && /^[[:space:]]*-/ { next }   # пропускаем старые элементы списка
         in_hooks && !/^[[:space:]]*-/ { in_hooks = 0 }
         { print }
-        ' "$BOUNCER_CFG" > "$BOUNCER_CFG.new" && mv "$BOUNCER_CFG.new" "$BOUNCER_CFG"
+        ' "$BOUNCER_CFG" > "$BOUNCER_CFG.new" && chmod --reference="$BOUNCER_CFG" "$BOUNCER_CFG.new" 2>/dev/null && mv "$BOUNCER_CFG.new" "$BOUNCER_CFG"
         BOUNCER_CHANGED=1
-        print_ok "Bouncer hooks: input,forward → prerouting (BUG-9)"
+        print_ok "Bouncer hooks: input,forward → prerouting"
     fi
 
     # BUG-10: disable IPv6 если в sysctl отключён
@@ -4765,8 +4951,8 @@ elif [ -f "$BOUNCER_CFG" ]; then
             sub(/enabled:[[:space:]]*true/, "enabled: false"); print; next
         }
         { print }
-        ' "$BOUNCER_CFG" > "$BOUNCER_CFG.new" && mv "$BOUNCER_CFG.new" "$BOUNCER_CFG"
-        print_ok "Bouncer IPv6 отключён (BUG-10: в системе IPv6 disabled)"
+        ' "$BOUNCER_CFG" > "$BOUNCER_CFG.new" && chmod --reference="$BOUNCER_CFG" "$BOUNCER_CFG.new" 2>/dev/null && mv "$BOUNCER_CFG.new" "$BOUNCER_CFG"
+        print_ok "Bouncer IPv6 отключён (в системе IPv6 disabled)"
         BOUNCER_CHANGED=1
     fi
 
@@ -4815,7 +5001,7 @@ fi
 # Наш `manual_whitelist_v4` set здесь не помогает — bouncer работает в
 # отдельной таблице.
 if [ -n "$MGMT_IPV4" ]; then
-    print_status "Добавляю mgmt IPs в CrowdSec whitelist (BUG-11 SECURITY)..."
+    print_status "Добавляю mgmt IPs в CrowdSec whitelist..."
     IFS=',' read -ra MGMT_LIST <<< "$MGMT_IPV4"
     for mgmt_ip in "${MGMT_LIST[@]}"; do
         # Очищаем от пробелов
@@ -4838,7 +5024,7 @@ fi
 # Без этого: сценарии устаревают, новые sshd-bf варианты не подхватываются.
 # CrowdSec >= 1.7.2 имеет встроенный systemd timer (hubupdate.timer), на
 # старых версиях нужен cron.
-print_status "Обновляю CrowdSec hub (BUG-13)..."
+print_status "Обновляю CrowdSec hub..."
 if cscli hub update >/dev/null 2>&1; then
     if cscli hub upgrade >/dev/null 2>&1; then
         print_ok "Hub: коллекции/сценарии обновлены"
@@ -5054,7 +5240,7 @@ while IFS='|' read -r kind ip port proto; do
 done < <(awk '
     /\[shield:scanner\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "scanner|" ip "||"
         }
     }
@@ -5067,61 +5253,61 @@ done < <(awk '
     }
     /\[shield:tor\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "tor|" ip "||"
         }
     }
     /\[shield:threat\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "threat|" ip "||"
         }
     }
     /\[shield:custom\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "custom|" ip "||"
         }
     }
     /\[shield:mobile_ru_drop\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "mobile_ru|" ip "||"
         }
     }
     /\[shield:conn_flood\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "conn_flood|" ip "||"
         }
     }
     /\[shield:newconn_flood\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "newconn_flood|" ip "||"
         }
     }
     /\[shield:tcp_invalid\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "tcp_invalid|" ip "||"
         }
     }
     /\[shield:fib_spoof\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "fib_spoof|" ip "||"
         }
     }
     /\[shield:syn_escalate\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "syn_escalate|" ip "||"
         }
     }
     /\[shield:udp_escalate\]/ {
         if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4)
+            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
             if (ip != "") print "udp_escalate|" ip "||"
         }
     }
@@ -5227,6 +5413,16 @@ LAST_CS_ID_FILE="/var/lib/shieldnode/.last_crowdsec_decision_id"
 if [ -r "$CS_DB" ]; then
     LAST_ID=$(cat "$LAST_CS_ID_FILE" 2>/dev/null || echo 0)
     LAST_ID="${LAST_ID:-0}"
+    # v3.18.11 SH-NEW-89: проверяем что LAST_ID не больше MAX(id) в БД.
+    # Если CrowdSec БД пересоздана (apt purge + install, sqlite recover, etc) —
+    # id начинается с 1, но наш LAST_ID хранит старое (например 50000) →
+    # WHERE id > 50000 ничего не возвращает → события CrowdSec пропускаются навсегда.
+    DB_MAX_ID=$(sqlite3 "$CS_DB" "SELECT COALESCE(MAX(id),0) FROM decisions" 2>/dev/null)
+    DB_MAX_ID="${DB_MAX_ID:-0}"
+    if [ "$LAST_ID" -gt "$DB_MAX_ID" ]; then
+        logger -t "$LOG_TAG" "DB recreated detected (LAST_ID=$LAST_ID > MAX=$DB_MAX_ID), reset cursor"
+        LAST_ID=0
+    fi
     NEW_DECISIONS=$(sqlite3 -separator '|' "$CS_DB" \
         "SELECT id, value, scenario, until FROM decisions WHERE type='ban' AND id > $LAST_ID ORDER BY id" 2>/dev/null)
     if [ -n "$NEW_DECISIONS" ]; then
@@ -5548,9 +5744,16 @@ HELP
         esac
 
         # Останавливаем юниты ПЕРЕД восстановлением файлов чтобы избежать race
-        systemctl stop shieldnode-aggregator shieldnode-watcher \
-                       shieldnode-nftables shieldnode-whitelist-watcher \
-                       shieldnode-whitelist-updater 2>/dev/null || true
+        # v3.18.11 SH-NEW-98: правильные имена unit'ов (раньше были опечатки —
+        # shieldnode-watcher, shieldnode-whitelist-watcher, shieldnode-whitelist-updater
+        # таких юнитов не существует, systemctl stop молча fail'ил → race с aggregator
+        # пишущим в БД во время копирования).
+        systemctl stop shieldnode-aggregator.timer shieldnode-aggregator.service \
+                       protected-ports-update.path protected-ports-update.timer \
+                       protected-ports-update.service \
+                       shieldnode-nftables.service \
+                       shieldnode-whitelist.path shieldnode-whitelist.service \
+                       shieldnode-update@custom.path 2>/dev/null || true
 
         # Восстанавливаем /etc/shieldnode
         if [ -d "$SNAP/etc-shieldnode" ]; then
@@ -5590,12 +5793,14 @@ HELP
             fi
         fi
 
-        # Перезапускаем юниты
+        # Перезапускаем юниты (v3.18.11 SH-NEW-98: правильные имена)
         systemctl daemon-reload 2>/dev/null || true
-        systemctl restart shieldnode-nftables 2>/dev/null || true
-        systemctl restart shieldnode-aggregator 2>/dev/null || true
-        systemctl restart shieldnode-watcher 2>/dev/null || true
-        systemctl restart shieldnode-whitelist-watcher 2>/dev/null || true
+        systemctl restart shieldnode-nftables.service 2>/dev/null || true
+        systemctl start shieldnode-aggregator.timer 2>/dev/null || true
+        systemctl start protected-ports-update.path 2>/dev/null || true
+        systemctl start protected-ports-update.timer 2>/dev/null || true
+        systemctl start shieldnode-whitelist.path 2>/dev/null || true
+        systemctl start shieldnode-update@custom.path 2>/dev/null || true
 
         echo ""
         echo "Rollback complete. Версия: $FROM_VER"
@@ -5817,7 +6022,9 @@ asn_cache_get() {
     [ -r "$db" ] || return 1
     command -v sqlite3 >/dev/null 2>&1 || return 1
     local now; now=$(date +%s)
-    sqlite3 "$db" "SELECT asn || '|' || COALESCE(owner,'') || '|' || COALESCE(country,'') FROM asn_cache WHERE ip = '$ip' AND cached_at + $asn_ttl > $now LIMIT 1" 2>/dev/null
+    # v3.18.11 SH-NEW-106: SQL escape ip — защита от rogue logger-пакетов в journal
+    local esc_ip="${ip//\'/\'\'}"
+    sqlite3 "$db" "SELECT asn || '|' || COALESCE(owner,'') || '|' || COALESCE(country,'') FROM asn_cache WHERE ip = '$esc_ip' AND cached_at + $asn_ttl > $now LIMIT 1" 2>/dev/null
 }
 
 asn_cache_put() {
@@ -5825,12 +6032,13 @@ asn_cache_put() {
     [ -w "$db" ] || return 1
     command -v sqlite3 >/dev/null 2>&1 || return 1
     local now; now=$(date +%s)
-    # SQL-escape одинарных кавычек
-    local esc_asn esc_owner esc_country
+    # SQL-escape одинарных кавычек (v3.18.11 SH-NEW-106: ip также)
+    local esc_ip esc_asn esc_owner esc_country
+    esc_ip="${ip//\'/\'\'}"
     esc_asn=$(echo "$asn"     | sed "s/'/''/g")
     esc_owner=$(echo "$owner" | sed "s/'/''/g")
     esc_country=$(echo "$country" | sed "s/'/''/g")
-    sqlite3 "$db" "INSERT INTO asn_cache(ip, asn, owner, country, cached_at) VALUES('$ip','$esc_asn','$esc_owner','$esc_country',$now) ON CONFLICT(ip) DO UPDATE SET asn='$esc_asn', owner='$esc_owner', country='$esc_country', cached_at=$now" 2>/dev/null
+    sqlite3 "$db" "INSERT INTO asn_cache(ip, asn, owner, country, cached_at) VALUES('$esc_ip','$esc_asn','$esc_owner','$esc_country',$now) ON CONFLICT(ip) DO UPDATE SET asn='$esc_asn', owner='$esc_owner', country='$esc_country', cached_at=$now" 2>/dev/null
 }
 
 asn_lookup_remote() {
@@ -5907,7 +6115,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.18.8${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.18.11${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -6143,8 +6351,12 @@ show_whitelist_ips() {
                 echo -ne "  Enter IP or CIDR to whitelist (e.g. 1.2.3.4 or 10.0.0.0/24): "
                 read -r NEW_IP
                 # Валидация
+                # v3.18.11 SH-NEW-10: явно отклоняем 0.0.0.0/x (whitelist всего интернета)
+                #                     и multicast/broadcast.
                 if ! echo "$NEW_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
                     echo -e "  ${Y}Invalid format. Expected: 1.2.3.4 or 10.0.0.0/24${N}"
+                elif echo "$NEW_IP" | grep -qE '^(0\.|22[4-9]\.|23[0-9]\.|24[0-9]\.|25[0-5]\.|255\.255\.255\.255)'; then
+                    echo -e "  ${R}Refused:${N} $NEW_IP (0.0.0.0/x, multicast и broadcast не разрешены)"
                 else
                     # Проверяем дубликат
                     if grep -qxF "$NEW_IP" "$WL_FILE" 2>/dev/null; then
@@ -6393,14 +6605,23 @@ show_settings_menu() {
     }
 
     # Хелпер: пишет/обновляет настройку в конфиге (idempotent)
+    # v3.18.11 SH-NEW-125: используем awk вместо sed чтобы не сломать config'ом
+    # с символом '|'. Также сохраняем perms через chmod --reference.
     _write_setting() {
         local key="$1" value="$2"
-        if grep -qE "^${key}=" "$CONF" 2>/dev/null; then
-            # Замена существующей строки (sed in-place)
-            sed -i -E "s|^${key}=.*|${key}=\"${value}\"|" "$CONF"
+        local tmp="${CONF}.tmp.$$"
+        if [ -f "$CONF" ] && grep -qE "^${key}=" "$CONF" 2>/dev/null; then
+            awk -v k="$key" -v v="$value" '
+                $0 ~ "^"k"=" { print k"=\""v"\""; next }
+                { print }
+            ' "$CONF" > "$tmp" && {
+                chmod --reference="$CONF" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+                mv "$tmp" "$CONF"
+            }
         else
             echo "${key}=\"${value}\"" >> "$CONF"
         fi
+    }
     }
 
     while true; do
@@ -6586,6 +6807,12 @@ show_settings_menu() {
                             NEW_IP=$(echo "$NEW_IP" | tr -d ' ')
                             if ! echo "$NEW_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
                                 echo -e "  ${R}Невалидный IP${N}"
+                                sleep 1
+                                continue
+                            fi
+                            # v3.18.11 SH-NEW-10: отклоняем 0.0.0.0, multicast, broadcast
+                            if echo "$NEW_IP" | grep -qE '^(0\.|22[4-9]\.|23[0-9]\.|24[0-9]\.|25[0-5]\.|255\.255\.255\.255)'; then
+                                echo -e "  ${R}Refused:${N} $NEW_IP (0.x, multicast и broadcast не разрешены)"
                                 sleep 1
                                 continue
                             fi
@@ -6819,9 +7046,14 @@ apply_trusted_ip() {
     local ip="$1"
     local comment="${2:-Trusted infrastructure (TRUSTED_IPS)}"
 
-    # Validation
-    if ! echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-        print_warn "  Пропускаю невалидный IP: '$ip'"
+    # v3.18.11 SH-NEW-10: строгая валидация (отклоняет 0.0.0.0/x, multicast)
+    if ! validate_ipv4_or_cidr "$ip"; then
+        print_warn "  Пропускаю невалидный IP: '$ip' (запрещены 0.0.0.0/x, multicast, prefix<8)"
+        return 1
+    fi
+    # Trusted IPs ожидаются как single IPs (не CIDR) — для UFW/CrowdSec consistency
+    if [[ "$ip" == */* ]]; then
+        print_warn "  TRUSTED_IPS должны быть single IP (не CIDR): '$ip' — пропускаю"
         return 1
     fi
 
@@ -6939,7 +7171,7 @@ if [ -n "$PROTECTED_TCP" ]; then
         tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+(-[0-9]+)?' | wc -l)
     if [ "$SMOKE_TCP" -eq 0 ]; then
         print_error "FAIL: protected_ports_tcp пуст, ожидается: $PROTECTED_TCP"
-        print_info "Это симптом BUG-1 (port-range в UFW) или BUG-8 (локализация)"
+        print_info "Возможные причины: port-range в UFW или локализованный 'ufw status'"
         print_info "Проверь:  sudo /usr/local/sbin/update-protected-ports.sh"
         print_info "          sudo journalctl -t protected-ports -n 20"
         SMOKE_FAIL=1
@@ -6987,7 +7219,7 @@ case "$FIREWALL_TYPE" in
     ufw)
         if ! LANG=C LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
             print_warn "WARN: FIREWALL_ACTIVE детект мог не сработать"
-            print_info "Если у тебя локализованный 'ufw status' — обновись до v3.10.2 (BUG-8 fix)"
+            print_info "Если у тебя локализованный 'ufw status' — обновись до v3.10.2+"
         fi
         ;;
 esac
@@ -7001,7 +7233,7 @@ if systemctl is-active --quiet crowdsec-firewall-bouncer; then
         BOUNCER_PRIO=$(nft list chain ip crowdsec crowdsec-chain-prerouting 2>/dev/null | grep -oE 'priority [a-z]* ?[+-]?[0-9]+' | head -1)
         print_ok "Smoke: bouncer на prerouting hook ($BOUNCER_PRIO) — раньше нашего"
     elif nft list chain ip crowdsec crowdsec-chain-input >/dev/null 2>&1; then
-        print_warn "WARN: bouncer всё ещё на input hook — BUG-9 fix не сработал"
+        print_warn "WARN: bouncer всё ещё на input hook — fix не сработал"
         print_info "Проверь /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
         print_info "Должно быть: nftables_hooks: - prerouting, priority: -200"
     elif nft list table ip crowdsec >/dev/null 2>&1; then
@@ -7196,7 +7428,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.8 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.11 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
