@@ -1,7 +1,16 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.18.11 (Commercial Edition) — POST-AUDIT HARDENING
+#  VPN NODE DDoS PROTECTION v3.18.12 (Commercial Edition) — HOTFIX FOR v3.18.11
+#  v3.18.12: HOTFIX — исправлена двойная закрывающая `}` в show_settings_menu
+#            (внесена случайно в v3.18.11 SH-NEW-125 patch). Из-за неё
+#            функция show_settings_menu закрывалась раньше времени, _read_setting
+#            и _write_setting становились видимыми только в первом вызове, потом
+#            пропадали. `local` в остальной части функции выпадал в global scope
+#            → "local: can only be used in a function" при открытии меню Settings.
+#            Симптом был только в guard CLI menu [s] Settings; install проходил OK.
+#
+#  v3.18.11 (Commercial Edition) — POST-AUDIT HARDENING
 #  v3.18.11: 16 фиксов после полного аудита (8 проходов, 192 находки, само-ревью):
 #    [SECURITY]
 #    SH-NEW-1   shield_safe_source helper — проверка прав conf-файла перед source
@@ -1142,7 +1151,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.18.11"
+SHIELDNODE_VERSION="3.18.12"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -3569,7 +3578,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.18.11 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.18.12 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3828,7 +3837,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.18.11 — github sync для lists/custom.txt
+# shieldnode v3.18.12 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3909,7 +3918,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.18.11 — version check
+# shieldnode v3.18.12 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -4436,7 +4445,7 @@ if ! command -v cscli >/dev/null 2>&1; then
     # отработают через timeout на самом apt-get.
     mkdir -p /etc/crowdsec
     cat > /etc/crowdsec/.shieldnode-skip-unattended <<'SKIP_EOF'
-# Создан установщиком shieldnode v3.18.11
+# Создан установщиком shieldnode v3.18.12
 # Сигнал для cscli setup unattended что shieldnode сделает hub upgrade сам.
 SKIP_EOF
     # На многих версиях CrowdSec post-inst читает эту env var
@@ -6115,7 +6124,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.18.11${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.18.12${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -6621,7 +6630,6 @@ show_settings_menu() {
         else
             echo "${key}=\"${value}\"" >> "$CONF"
         fi
-    }
     }
 
     while true; do
@@ -7428,7 +7436,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.11 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.12 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
