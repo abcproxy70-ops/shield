@@ -1,6 +1,25 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.20.4 (Commercial Edition) — CRITICAL HOTFIX
+#  v3.20.4: HOTFIX — критический баг в v3.20.3 который вешал установку.
+#
+#           ПРОБЛЕМА:
+#           В nft heredoc (cat > "$NFT_DDOS_CONF" <<EOF — БЕЗ кавычек вокруг EOF)
+#           попал комментарий со строкой:
+#               # ...можно использовать `nft monitor trace`
+#           Backticks ВНУТРИ unquoted heredoc — это command substitution!
+#           Bash при создании файла пытался ВЫПОЛНИТЬ команду `nft monitor trace`
+#           — а это interactive команда которая работает forever.
+#           Результат: установка вешалась после "Panel detected (remnawave)".
+#
+#           Этот баг УЖЕ ловили ранее (см. changelog v3.10.2 — там вылавливали
+#           идентичную проблему с другим backtick'ом). Регрессия в v3.20.3.
+#
+#           FIX: убрал backticks в комментарии (`nft monitor trace` → nft monitor trace).
+#
+#           Всё остальное из v3.20.3 без изменений.
+#
 #  VPN NODE DDoS PROTECTION v3.20.3 (Commercial Edition) — DISK USAGE FIX
 #  v3.20.3: КРИТИЧЕСКИЙ FIX переполнения диска от логов.
 #
@@ -1363,7 +1382,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.20.3"
+SHIELDNODE_VERSION="3.20.4"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -3191,8 +3210,8 @@ $FIB_ANTISPOOF_RULE
         # Counter conn_flood_v4 продолжает считать все drops (видно в guard
         # dashboard, total pkts/bytes). Aggregator теряет per-IP visibility
         # для conn_flood — это приемлемый trade-off за экономию места.
-        # Если нужна детальная аналитика — можно использовать `nft monitor trace`
-        # или временно вернуть log.
+        # Для детальной аналитики можно временно вернуть log или
+        # использовать nft monitor trace вручную.
         tcp dport @protected_ports_tcp ct state new \\
             add @connlimit_v4 { ip saddr ct count over 5000 } \\
             counter name conn_flood_v4 drop
@@ -3804,7 +3823,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.20.3 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.20.4 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -4064,7 +4083,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.20.3 — github sync для lists/custom.txt
+# shieldnode v3.20.4 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -4145,7 +4164,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.20.3 — version check
+# shieldnode v3.20.4 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -4677,7 +4696,7 @@ if ! command -v cscli >/dev/null 2>&1; then
     # отработают через timeout на самом apt-get.
     mkdir -p /etc/crowdsec
     cat > /etc/crowdsec/.shieldnode-skip-unattended <<'SKIP_EOF'
-# Создан установщиком shieldnode v3.20.3
+# Создан установщиком shieldnode v3.20.4
 # Сигнал для cscli setup unattended что shieldnode сделает hub upgrade сам.
 SKIP_EOF
     # На многих версиях CrowdSec post-inst читает эту env var
@@ -6444,7 +6463,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.20.3${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.20.4${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -7720,7 +7739,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.20.3 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.20.4 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
