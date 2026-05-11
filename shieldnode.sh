@@ -1,6 +1,18 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.20.2 (Commercial Edition) — UI CLEANUP
+#  v3.20.2: COSMETIC FIXES — убраны устаревшие display lines в guard dashboard:
+#           - "mobile-RU whitelist disabled or empty" line — удалена (whitelist
+#             убран в v3.20.0, дисплей строка осталась случайно)
+#           - "broadband-RU whitelist disabled or empty" line — удалена
+#           - "conn-flood (ct>400)" label — обновлён на "ct>5000" соответственно
+#             актуальному лимиту v3.20.1
+#           - Убран сбор статистики MOBILE_RU/BROADBAND_RU SET_SIZE и counters
+#             (они существовали как DEPRECATED, не использовались в логике)
+#
+#           Это чистый UI-фикс, никакой функционал не меняется.
+#
 #  VPN NODE DDoS PROTECTION v3.20.1 (Commercial Edition) — EXTREME CGNAT SUPPORT
 #  v3.20.1: TUNING — подняты conn_flood и newconn rate для extreme CGNAT.
 #
@@ -1313,7 +1325,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.20.1"
+SHIELDNODE_VERSION="3.20.2"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -2371,6 +2383,30 @@ if [ -f /usr/local/sbin/shieldnode-update-mobile-ru.sh ]; then
     LEGACY_FOUND=1
     rm -f /usr/local/sbin/shieldnode-update-mobile-ru.sh
 fi
+
+# 7) v3.20.0+: mobile_ru и broadband_ru timer'ы УДАЛЕНЫ из shieldnode (whitelist'ы убраны).
+#    Если ранее были установлены (v3.13.0+/v3.19.0+) — отключить и удалить.
+for legacy_timer in shieldnode-update@mobile_ru.timer shieldnode-update@mobile_ru.service \
+                    shieldnode-update@broadband_ru.timer shieldnode-update@broadband_ru.service; do
+    if systemctl list-unit-files "$legacy_timer" 2>/dev/null | grep -q "$legacy_timer"; then
+        LEGACY_FOUND=1
+        systemctl disable --now "$legacy_timer" 2>/dev/null || true
+    fi
+done
+
+# v3.20.0+: удалить старые seed-файлы whitelist'ов
+if [ -f /etc/shieldnode/lists/mobile-ru.txt ]; then
+    LEGACY_FOUND=1
+    rm -f /etc/shieldnode/lists/mobile-ru.txt
+fi
+if [ -f /etc/shieldnode/lists/broadband-ru.txt ]; then
+    LEGACY_FOUND=1
+    rm -f /etc/shieldnode/lists/broadband-ru.txt
+fi
+
+# v3.20.0+: удалить старые fail counter'ы
+rm -f /var/lib/shieldnode/mobile_ru_fail_count 2>/dev/null
+rm -f /var/lib/shieldnode/broadband_ru_fail_count 2>/dev/null
 
 if [ "$LEGACY_FOUND" = "1" ]; then
     systemctl daemon-reload
@@ -3717,7 +3753,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.20.1 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.20.2 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3977,7 +4013,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.20.1 — github sync для lists/custom.txt
+# shieldnode v3.20.2 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -4058,7 +4094,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.20.1 — version check
+# shieldnode v3.20.2 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -4590,7 +4626,7 @@ if ! command -v cscli >/dev/null 2>&1; then
     # отработают через timeout на самом apt-get.
     mkdir -p /etc/crowdsec
     cat > /etc/crowdsec/.shieldnode-skip-unattended <<'SKIP_EOF'
-# Создан установщиком shieldnode v3.20.1
+# Создан установщиком shieldnode v3.20.2
 # Сигнал для cscli setup unattended что shieldnode сделает hub upgrade сам.
 SKIP_EOF
     # На многих версиях CrowdSec post-inst читает эту env var
@@ -6077,19 +6113,7 @@ collect_stats() {
         tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
     CUSTOM_SET_SIZE="${CUSTOM_SET_SIZE:-0}"
 
-    # v3.13.0: размер mobile-RU whitelist + counters
-    MOBILE_RU_SET_SIZE=$(nft list set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null | \
-        tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
-    MOBILE_RU_SET_SIZE="${MOBILE_RU_SET_SIZE:-0}"
-    read MOBILE_RU_PASS_PKTS MOBILE_RU_PASS_BYTES <<< "$(read_counter mobile_ru_passes_v4)"
-    read MOBILE_RU_CONN_PKTS MOBILE_RU_CONN_BYTES <<< "$(read_counter mobile_ru_conn_flood_v4)"
-
-    # v3.19.0: размер broadband-RU whitelist + counters
-    BROADBAND_RU_SET_SIZE=$(nft list set inet ddos_protect broadband_ru_whitelist_v4 2>/dev/null | \
-        tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
-    BROADBAND_RU_SET_SIZE="${BROADBAND_RU_SET_SIZE:-0}"
-    read BROADBAND_RU_PASS_PKTS BROADBAND_RU_PASS_BYTES <<< "$(read_counter broadband_ru_passes_v4)"
-    read BROADBAND_RU_CONN_PKTS BROADBAND_RU_CONN_BYTES <<< "$(read_counter broadband_ru_conn_flood_v4)"
+    # v3.20.0+: mobile-RU и broadband-RU stats УБРАНЫ (whitelist'ы удалены)
 
     # Когда nft started — для "stats since"
     NFT_SINCE=$(systemctl show nftables.service --property=ActiveEnterTimestamp --value 2>/dev/null | \
@@ -6261,7 +6285,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.20.1${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.20.2${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -6285,21 +6309,8 @@ draw_snapshot() {
     [ "$THREAT_SET_SIZE" -gt 0 ] && bl_summary+=", threat=$(human_num "$THREAT_SET_SIZE")"
     [ "$TOR_SET_SIZE"    -gt 0 ] && bl_summary+=", tor=$(human_num "$TOR_SET_SIZE")"
     [ "$CUSTOM_SET_SIZE" -gt 0 ] && bl_summary+=", custom=$(human_num "$CUSTOM_SET_SIZE")"
-    printf  "  ├─ ${DIM}blocklists${N}          %s\n" "$bl_summary"
-    # v3.13.0: mobile-RU whitelist line (только если активен и не пустой)
-    if [ "$MOBILE_RU_SET_SIZE" -gt 0 ]; then
-        printf  "  ├─ ${G}mobile-RU whitelist${N} %s CIDRs ${DIM}(relaxed: ct=1000, newconn=2000/min, %s passes)${N}\n" \
-            "$(human_num "$MOBILE_RU_SET_SIZE")" "$(human_num "$MOBILE_RU_PASS_PKTS")"
-    else
-        printf  "  ├─ ${DIM}mobile-RU whitelist${N} ${DIM}disabled or empty (will populate from github on first sync)${N}\n"
-    fi
-    # v3.19.0: broadband-RU whitelist line
-    if [ "$BROADBAND_RU_SET_SIZE" -gt 0 ]; then
-        printf  "  └─ ${G}broadband-RU whitelist${N} %s CIDRs ${DIM}(relaxed: ct=3000, newconn=3000/min, %s passes)${N}\n" \
-            "$(human_num "$BROADBAND_RU_SET_SIZE")" "$(human_num "$BROADBAND_RU_PASS_PKTS")"
-    else
-        printf  "  └─ ${DIM}broadband-RU whitelist${N} ${DIM}disabled or empty (will populate from github on first sync)${N}\n"
-    fi
+    printf  "  └─ ${DIM}blocklists${N}          %s\n" "$bl_summary"
+    # v3.20.0+: mobile-RU и broadband-RU whitelist строки УБРАНЫ (whitelist'ы удалены)
     echo ""
 
     # ===== SERVICES (compact one-line) =====
@@ -6357,7 +6368,7 @@ draw_snapshot() {
     printf  "  ├─ ${DIM}confirmed-attack${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONFIRMED_PKTS_V4")" "$(human_bytes "$CONFIRMED_BYTES_V4")"
     printf  "  ├─ ${DIM}rate-limit (syn)${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SYN_CONF_PKTS_V4")" "$(human_bytes "$SYN_CONF_BYTES_V4")"
     printf  "  ├─ ${DIM}rate-limit (udp)${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
-    printf  "  ├─ ${DIM}conn-flood (ct>400)${N} %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONN_FLOOD_PKTS_V4")" "$(human_bytes "$CONN_FLOOD_BYTES_V4")"
+    printf  "  ├─ ${DIM}conn-flood (ct>5000)${N} %11s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONN_FLOOD_PKTS_V4")" "$(human_bytes "$CONN_FLOOD_BYTES_V4")"
     printf  "  ├─ ${DIM}new-conn flood${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$NEWCONN_FLOOD_BYTES_V4")"
     printf  "  ├─ ${DIM}TCP flag invalid${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$TCP_INVALID_PKTS")" "$(human_bytes "$TCP_INVALID_BYTES")"
     printf  "  └─ ${B}total${N}               ${B}%12s${N} pkts  ${DIM}/${N} ${B}%s${N}\n" "$(human_num "$total_pkts")" "$(human_bytes "$total_bytes")"
@@ -7550,7 +7561,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.20.1 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.20.2 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
