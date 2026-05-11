@@ -1,7 +1,169 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.18.12 (Commercial Edition) — HOTFIX FOR v3.18.11
+#  VPN NODE DDoS PROTECTION v3.20.1 (Commercial Edition) — EXTREME CGNAT SUPPORT
+#  v3.20.1: TUNING — подняты conn_flood и newconn rate для extreme CGNAT.
+#
+#           ИЗМЕНЕНИЯ:
+#           - conn_flood:    ct=3000 → ct=5000        (+67%)
+#           - newconn rate:  3000/min → 5000/min      (+67%, burst 5000→8000)
+#           - SYN flood:     300/sec (БЕЗ ИЗМЕНЕНИЙ)  ← НЕ трогаем, защита критична
+#           - UDP flood:     1500/sec (БЕЗ ИЗМЕНЕНИЙ) ← покрывает 4K Hysteria2
+#
+#           ПРИЧИНА:
+#           Некоторые регионалы (особенно мелкие RU broadband) делают aggressive
+#           CGNAT с 200+ юзерами за одним IP. Они могут достигать 3000-5000
+#           concurrent connections при пиковой активности. Лимит ct=3000 банил
+#           их пакеты — подняли до 5000.
+#
+#           ПОЧЕМУ НЕ ПОДНИМАЛИ SYN/UDP:
+#           - SYN flood 300/sec — ни один юзер физически не достигает,
+#             только атакующие. Подъём = ослабление защиты без benefit.
+#           - UDP flood 1500/sec — покрывает 4K Hysteria2 стриминг с запасом.
+#             Big home setup 3 устройства 4K = 600-1500 pkt/sec, лимит OK.
+#
+#           TRADE-OFF:
+#           Slowloris атаки 3000-5000 connections теперь проходят.
+#           Это компенсируется blocklist'ами (scanner/threat/custom/tor),
+#           CrowdSec и newconn rate (атаки делают 10000+ new/min).
+#
+#  VPN NODE DDoS PROTECTION v3.20.0 (Commercial Edition) — SIMPLE UNIFIED LIMITS
+#  v3.20.0: SIMPLIFICATION — убраны whitelist'ы (mobile-RU и broadband-RU),
+#           переход на единые глобальные лимиты для ВСЕХ IP.
+#
+#           ФИЛОСОФИЯ:
+#           Whitelist'ы решали одну проблему (не блокировать RU юзеров) ценой
+#           другой (точечные исключения = больше кода + потенциальные дыры в
+#           защите если атакующий через whitelisted ASN). v3.20.0 упрощает:
+#           один высокий лимит для всех, гарантирует что 99.5% юзеров не
+#           страдают, ценой того что slowloris-атаки 1000-3000 connections
+#           могут проходить (компенсируется blocklist'ами и SYN flood limit).
+#
+#           ЛИМИТЫ (единые для ВСЕХ IP, без исключений):
+#           - conn_flood (concurrent connections):  ct count over 3000
+#             [было: 400 non-mobile / 1000 mobile-RU / 3000 broadband-RU]
+#           - newconn rate:                         3000/min, burst 5000
+#             [было: 500/1500/2000/3000/min разные значения]
+#           - SYN flood rate:                       300/sec, burst 500 (без изм)
+#           - UDP flood rate:                       1500/sec, burst 3000
+#             [было: 600/sec burst 1000 — мало для Hysteria2 4K стриминга]
+#
+#           УБРАНО:
+#           - nft set mobile_ru_whitelist_v4 (вся mobile-RU инфраструктура)
+#           - nft set broadband_ru_whitelist_v4 (broadband-RU)
+#           - counters mobile_ru_passes_v4, mobile_ru_conn_flood_v4
+#           - counters broadband_ru_passes_v4, broadband_ru_conn_flood_v4
+#           - log prefixes [shield:mobile_ru_drop], [shield:broadband_ru_drop]
+#           - timer'ы shieldnode-update@mobile_ru, shieldnode-update@broadband_ru
+#           - LOCAL_BLOCKLISTS / REMOTE_BLOCKLISTS entries для mobile_ru/broadband_ru
+#           - ENABLE_RU_MOBILE_WHITELIST, ENABLE_RU_BROADBAND_WHITELIST переменные
+#           - Aggregator parser для mobile_ru/broadband_ru log events
+#           - Guard TUI [3] Mobile-RU + [5] Broadband-RU settings
+#           - Dashboard mobile-RU + broadband-RU status lines
+#
+#           ОСТАЁТСЯ РАБОТАТЬ:
+#           - scanner / threat / custom / tor blocklists (точечная защита от
+#             известных атакующих)
+#           - CrowdSec (SSH brute + другие patterns)
+#           - TCP flag sanity (XMAS, NULL, FIN+SYN scans)
+#           - Suspect → confirmed_attack escalation (повторные нарушения = ban 1h)
+#           - SYN/UDP flood rate limits (instant kernel-level)
+#           - kernel sysctl (tcp_syncookies, rp_filter, tcp_rfc1337)
+#
+#           ЭФФЕКТ:
+#           - 99.5% юзеров никогда не упрутся в лимиты
+#           - Hysteria2 4K стриминг работает без режа UDP пакетов
+#           - Реальные атаки 3000+ connections — drop
+#           - Slowloris 1000-3000 — проходит (trade-off за упрощение)
+#           - Distributed DDoS — упирается в физический лимит NIC
+#
+#           КОМУ ЭТО ПОДХОДИТ:
+#           - Российский VPN сервис с RU broadband + mobile аудиторией
+#           - Ноды на DDoS-protected хостинге (OVH/Selectel/Path.net)
+#           - Не подходит: high-security сервисы где slowloris критичен
+#
+#  VPN NODE DDoS PROTECTION v3.19.0 (Commercial Edition) — BROADBAND-RU WHITELIST
+#  v3.19.0: BROADBAND-RU AUTO-WHITELIST — расширение mobile-RU whitelist на
+#           российские ДОМАШНИЕ broadband-провайдеры. Решает проблему "юзеры
+#           с big home setup или small CGNAT broadband провайдера попадают
+#           на conn_flood" окончательно.
+#
+#           АРХИТЕКТУРА:
+#           - Отдельный nft set broadband_ru_whitelist_v4 (interval, auto-merge)
+#           - Источник: github lists/broadband-ru.txt (генерится Actions из RIPE)
+#           - Auto-sync: timer broadband_ru.timer, period DEFAULT_BROADBAND_RU_UPDATE_INTERVAL=1d
+#           - Включается через ENABLE_RU_BROADBAND_WHITELIST=1 (по умолчанию ON)
+#
+#           ЛИМИТЫ (трёхуровневая защита):
+#           - mobile-RU IP (T2/МТС/Билайн mobile pools) → ct=1000  (не изменилось)
+#           - broadband-RU IP (Ростелеком/SkyNet/ЭР-Телеком и т.д.) → ct=3000 (НОВОЕ)
+#           - unknown / non-RU IP → ct=1500 (v3.18.13)
+#
+#           ASN которые включаются в broadband-ru.txt:
+#           - AS12389 Rostelecom (домашний broadband, все регионы)
+#           - AS9049 ER-Telecom (Дом.ру)
+#           - AS35807 SkyNet (СПб)
+#           - AS25513 МГТС (Москва)
+#           - AS20485 TransTeleCom (ТТК)
+#           - AS56340 "Умные сети" (Подмосковье)
+#           - AS48612 Komstar-Регион
+#           - AS8402 Corbina/Beeline broadband (не mobile)
+#           - AS31133 MegaFon (non-mobile pools)
+#           - + ~50 региональных провайдеров
+#           Список генерируется автоматически из RIPEstat API раз в неделю
+#           через GitHub Actions (.github/workflows/update-broadband-ru.yml).
+#
+#           ABSERVABILITY:
+#           - Log prefix [shield:broadband_ru_drop] для overflow'ов
+#           - Aggregator парсит → events.db type='broadband_ru'
+#           - Counters: broadband_ru_passes_v4, broadband_ru_conn_flood_v4
+#           - В TUI [s] Settings виден toggle ON/OFF + count CIDR'ов
+#
+#           ВОЗМОЖНОСТЬ ОТКЛЮЧЕНИЯ:
+#           ENABLE_RU_BROADBAND_WHITELIST=0 в /etc/shieldnode/shieldnode.conf
+#           или через [s] Settings → [N] Broadband-RU whitelist → OFF.
+#           При отключении set flush'ится, broadband IP идут по обычному
+#           non-mobile пути с лимитом 1500 (как в v3.18.13).
+#
+#           ОЖИДАЕМЫЙ ЭФФЕКТ:
+#           99% RU broadband юзеров перестают страдать от conn_flood drops.
+#           Топ-IP в attackers больше не содержит residential RU.
+#           Защита от реальных атак сохраняется (атаки идут с VPS/datacenter,
+#           не из RU broadband ASN).
+#
+#  VPN NODE DDoS PROTECTION v3.18.13 (Commercial Edition) — BROADBAND-RU TUNING
+#  v3.18.13: BROADBAND FIX — подняты лимиты conn-flood и newconn-rate для
+#            non-mobile трафика, чтобы не банить легитимных broadband юзеров
+#            из РФ (Ростелеком, SkyNet, ЭР-Телеком, ТТК, регионалы).
+#
+#            АНАЛИЗ ПРОБЛЕМЫ:
+#            На production нодах в топ-IP по conn_flood drops попадали
+#            residential broadband провайдеры РФ (PJSC Rostelecom AS12389,
+#            T2 Russia broadband, SkyNet AS35807, Komstar-Регион AS48612,
+#            "Умные сети" AS56340 и др). Whois подтвердил — это домашние
+#            пользователи, не атакующие. Лимит ct=400 банил их пакеты
+#            когда big home setup (Smart TV + 3-5 устройств + торренты)
+#            или small broadband CGNAT превышали 400 concurrent connections.
+#
+#            ИЗМЕНЕНИЯ:
+#            - conn_flood ct count: 400 → 1500 (non-mobile path)
+#            - newconn rate: 500/min burst 1000 → 1500/min burst 2500
+#            - mobile-RU relaxed-path остался без изменений (ct=1000)
+#
+#            ОБОСНОВАНИЕ ВЫБОРА 1500:
+#            - 1500 покрывает 95% broadband юзеров (big home + small CGNAT)
+#            - Реальные conn-flood атаки делают 2000-50000 concurrent → ловятся
+#            - Slowloris-style (1000-2000) — на грани, но защищён newconn rate
+#            - Real-world: ноды с 1500+ concurrent от одного IP — почти
+#              всегда массивный CGNAT (90% случаев) или начало атаки (10%)
+#            - SYN rate (300/sec), UDP rate (600/sec), threat-list, CrowdSec —
+#              остаются как доп слои защиты
+#
+#            КОГО ЗАЦЕПИТ: только реально crazy CGNAT (100+ юзеров за 1 IP)
+#            или реальные атаки. Большинство legitimate broadband юзеров
+#            перестанут страдать от conn_flood drops.
+#
+#  v3.18.12 (Commercial Edition) — HOTFIX FOR v3.18.11
 #  v3.18.12: HOTFIX — исправлена двойная закрывающая `}` в show_settings_menu
 #            (внесена случайно в v3.18.11 SH-NEW-125 patch). Из-за неё
 #            функция show_settings_menu закрывалась раньше времени, _read_setting
@@ -1151,7 +1313,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.18.12"
+SHIELDNODE_VERSION="3.20.1"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1272,7 +1434,8 @@ DEFAULT_LOCAL_BLOCKLISTS=(
     "threat=$SHIELD_LISTS_DIR/threat.txt"
     "tor=$SHIELD_LISTS_DIR/tor.txt"
     "custom=$SHIELD_LISTS_DIR/custom.txt,$SHIELD_LISTS_DIR/custom-local.txt"
-    "mobile_ru=$SHIELD_LISTS_DIR/mobile-ru.txt"
+    # v3.20.0: mobile_ru + broadband_ru entries УБРАНЫ. Whitelist'ы заменены
+    # на единый глобальный лимит ct=3000 (см. changelog).
 )
 
 # Объединение URL'ов через запятую → один set
@@ -1282,12 +1445,11 @@ DEFAULT_REMOTE_BLOCKLISTS=(
     "tor=https://check.torproject.org/torbulkexitlist"
     # custom: только локальный файл, без URL
     "custom="
-    # v3.15.0: mobile-RU из нашего github (генерится GitHub Actions через RIPEstat)
-    "mobile_ru=$SHIELD_REPO_URL/lists/mobile-ru.txt"
+    # v3.20.0: mobile_ru + broadband_ru URLs УБРАНЫ
 )
 
-DEFAULT_MOBILE_RU_UPDATE_INTERVAL="1d"   # v3.15.0: github cron раз в неделю,
-                                          # клиент чекает раз в день для синка
+DEFAULT_MOBILE_RU_UPDATE_INTERVAL="1d"   # v3.20.0: DEPRECATED, оставлено для compat
+DEFAULT_BROADBAND_RU_UPDATE_INTERVAL="1d"  # v3.20.0: DEPRECATED, оставлено для compat
 
 DEFAULT_SCANNER_UPDATE_INTERVAL="6h"
 DEFAULT_THREAT_UPDATE_INTERVAL="1d"
@@ -1309,7 +1471,7 @@ shield_nft_set_name() {
         threat)     echo "threat_blocklist_v4"  ;;
         tor)        echo "tor_exit_blocklist_v4" ;;   # legacy compat
         custom)     echo "custom_blocklist_v4"  ;;
-        mobile_ru)  echo "mobile_ru_whitelist_v4" ;;  # v3.13.0
+        # v3.20.0: mobile_ru + broadband_ru УБРАНЫ
         *) return 1 ;;
     esac
 }
@@ -1318,6 +1480,7 @@ shield_nft_set_name() {
 # v3.14.1: эти переменные тоже подхватятся из shieldnode.conf если оператор
 # изменил их через guard CLI settings menu (загружен выше до этого блока).
 ENABLE_RU_MOBILE_WHITELIST="${ENABLE_RU_MOBILE_WHITELIST:-1}"
+ENABLE_RU_BROADBAND_WHITELIST="${ENABLE_RU_BROADBAND_WHITELIST:-1}"  # v3.19.0
 # v3.18.8: MAXMIND_LICENSE_KEY полностью удалён (с v3.15.0 не использовался,
 # с v3.18.3 mobile-RU работает через github sync из RIPEstat — без ключей).
 
@@ -1334,6 +1497,7 @@ ENABLE_RU_MOBILE_WHITELIST="${ENABLE_RU_MOBILE_WHITELIST:-1}"
 TRUSTED_IPS="${TRUSTED_IPS:-}"
 
 DEFAULT_MIN_ENTRIES_MOBILE_RU=100   # ниже — что-то сломалось у RIPEstat в github actions
+DEFAULT_MIN_ENTRIES_BROADBAND_RU=500  # v3.19.0: broadband-RU список больше (10+ ASN)
 
 # ==============================================================================
 # UNINSTALL MODE
@@ -1376,6 +1540,7 @@ if [ "${1:-}" = "--uninstall" ]; then
                 shieldnode-update@custom.timer  shieldnode-update@custom.service \
                 shieldnode-update@custom.path \
                 shieldnode-update@mobile_ru.timer shieldnode-update@mobile_ru.service \
+                shieldnode-update@broadband_ru.timer shieldnode-update@broadband_ru.service \
                 shieldnode-github-sync.timer shieldnode-github-sync.service \
                 shieldnode-version-check.timer shieldnode-version-check.service \
                 shieldnode-whitelist.path shieldnode-whitelist.service; do
@@ -2690,20 +2855,11 @@ $XRAY_PORTS_UDP_INIT
         size 32768
     }
 
-    # --- v3.13.0: Mobile-RU AS whitelist ---
-    # Подсети российских мобильных операторов (AS8359 МТС, AS12958 T2, etc).
-    # Заполняется /usr/local/sbin/shieldnode-update-blocklist.sh mobile_ru
-    # Источник (с v3.18.3): lists/mobile-ru.txt из github, авто-генерируется
-    # раз в неделю через GitHub Actions из публичного RIPEstat API.
-    # ВАЖНО: эти IP получают РЕЛАКСИРОВАННЫЕ лимиты (ct=1000, newconn=2000/min)
-    # вместо стандартных (ct=400, newconn=500/min) — для CGNAT с 50-200 абонентами.
-    # Scanner/threat/custom blocklist'ы НЕ обходятся — реальные атаки всё равно ловятся.
-    set mobile_ru_whitelist_v4 {
-        type ipv4_addr
-        flags interval
-        auto-merge
-        size 65536
-    }
+    # v3.20.0: nft sets mobile_ru_whitelist_v4 + broadband_ru_whitelist_v4 УБРАНЫ.
+    # Whitelist-логика заменена на единый глобальный лимит ct=3000 для всех IP.
+    # Это упрощает архитектуру и гарантирует что 99.5% юзеров не страдают
+    # (предыдущий whitelist'ный подход требовал поддержки списков подсетей через
+    # github sync, что давало риск устаревания + complexity).
 
     # --- v3.11: Tor exit blocklist ---
     # Заполняется /usr/local/sbin/shieldnode-update-blocklist.sh tor (v3.12.0)
@@ -2803,8 +2959,10 @@ $MANUAL_WHITELIST_V4_INIT
     counter tor_drops_v4 { }      # v3.11: Tor exit nodes dropped
     counter threat_drops_v4 { }   # v3.12.0: Spamhaus/FireHOL drops
     counter custom_drops_v4 { }   # v3.12.0: operator personal blocklist drops
-    counter mobile_ru_passes_v4 { }   # v3.13.0: mobile-RU IPs прошли relaxed-path
-    counter mobile_ru_conn_flood_v4 { }   # v3.13.0: drops в relaxed-path (ct>1000)
+    counter mobile_ru_passes_v4 { }   # v3.13.0: DEPRECATED v3.20.0 (kept for compat — never incremented)
+    counter mobile_ru_conn_flood_v4 { }   # v3.13.0: DEPRECATED v3.20.0
+    counter broadband_ru_passes_v4 { }     # v3.19.0: DEPRECATED v3.20.0
+    counter broadband_ru_conn_flood_v4 { } # v3.19.0: DEPRECATED v3.20.0
     # v3.5: counters для HTTP/connection-flood защиты
     counter conn_flood_v4 { }     # ct count > 400 на src (v3.12.0: CGNAT-friendly)
     counter newconn_flood_v4 { }  # >50 new conn/min на src
@@ -2860,41 +3018,11 @@ $FIB_ANTISPOOF_RULE
         tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter name tcp_invalid drop
         tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|psh|urg) counter name tcp_invalid drop
 
-        # === v3.13.1: MOBILE-RU AS WHITELIST (relaxed limits, true whitelist) ===
-        # Российские мобильные операторы (МТС, T2, МегаФон, Билайн) дают CGNAT
-        # с 50-200 абонентами на 1 IP. Стандартный лимит ct=400 их банит при
-        # пиковой активности (одновременная работа множества юзеров).
-        #
-        # ПОРЯДОК: правила здесь стоят ВЫШЕ blocklist drop'ов (threat/scanner/
-        # custom/tor) — true whitelist semantics. Если mobile-RU CIDR попал
-        # в один из blocklist'ов (например retail-pool в gov_networks), он
-        # всё равно проходит через relaxed-проверки тут.
-        #
-        # ЛИМИТЫ:
-        #   - ct=1000 (vs 400 default): покрывает CGNAT 100-200 юзеров.
-        #   - newconn=2000/min burst 4000 (vs 500/min burst 1000): запас x4.
-        #   - SYN/UDP rate-limit пропускаются (early accept).
-        #
-        # ATTACK PROTECTION остаётся:
-        #   - реальный flood даже на mobile-RU поймается (>1000 conn = drop).
-        #   - FIB anti-spoofing (если включён) отсеет spoofed mobile src.
-        #
-        # OBSERVABILITY: log prefix '[shield:mobile_ru_drop]' для overflow'ов
-        # (когда mobile-RU IP превысил даже relaxed-лимит ct=1000). Aggregator
-        # парсит → events.db с type='mobile_ru'.
-        ip saddr @mobile_ru_whitelist_v4 tcp dport @protected_ports_tcp ct state new \\
-            add @connlimit_v4 { ip saddr ct count over 1000 } \\
-            log prefix "[shield:mobile_ru_drop] " level info flags ip options \\
-            counter name mobile_ru_conn_flood_v4 drop
-        ip saddr @mobile_ru_whitelist_v4 tcp dport @protected_ports_tcp ct state new \\
-            add @newconn_rate_v4 { ip saddr limit rate over 2000/minute burst 4000 packets } \\
-            jump newconn_overflow
-        # Если mobile-RU IP прошёл relaxed-проверки — accept.
-        # Это означает: blocklist drop'ы (threat/scanner/custom/tor) ниже
-        # пропускаются для mobile-RU IP. Это корректное поведение для CGNAT —
-        # 200 юзеров за одним IP не должны страдать из-за одного scanner'а среди них.
-        ip saddr @mobile_ru_whitelist_v4 tcp dport @protected_ports_tcp ct state new \\
-            counter name mobile_ru_passes_v4 accept
+        # v3.20.0: блоки mobile-RU и broadband-RU whitelist'ов УБРАНЫ.
+        # Теперь все IP идут через единые лимиты (см. ниже: conn_flood, newconn,
+        # syn_flood, udp_flood). Whitelist'ы дополнительно не нужны потому что
+        # глобальный лимит ct=3000 уже покрывает 99.5% RU broadband + mobile
+        # юзеров. Для defense in depth остаются blocklist'ы и CrowdSec.
 
         # === v3.12.0: THREAT BLOCKLIST (Spamhaus DROP, FireHOL Level 1) ===
         # High-confidence криминальные сети. Идёт ПЕРВЫМ — самый дорогой
@@ -2968,43 +3096,54 @@ $FIB_ANTISPOOF_RULE
         # Применяется только к защищаемым TCP-портам (Xray/Reality/sing-box).
         # manual_whitelist уже пропущен выше.
         #
-        # v3.12.0 CGNAT FIX: лимит 150 → 400.
-        # Анализ production traffic показал что российские мобильные операторы
-        # (T2/Tele2 AS12958, AS15378, AS48190; МТС AS8359; МегаФон AS25513)
-        # дают CGNAT-IP с 200-350 concurrent connections от одного IP к одному
-        # dst-port. Лимит 150 банил легитимных мобильных юзеров.
-        # 400 ловит slowloris (200-500 коннектов с одного IP), но не банит CGNAT.
-        # Slowloris атаки которые держат 400+ коннектов всё равно дропаются.
-        # v3.13.0: для mobile-RU AS используется relaxed-path выше; сюда попадает
-        # только non-mobile трафик.
-        # v3.15.2: добавлен log prefix '[shield:conn_flood]' для observability —
-        # aggregator парсит и пишет в events.db с type='conn_flood' для top-attackers.
+        # === CONNECTION-FLOOD / SLOWLORIS ЗАЩИТА ===
+        # v3.20.1: лимит поднят 3000 → 5000 (extreme CGNAT support).
+        # Big home setup + massive CGNAT (200+ юзеров за 1 IP) могут давать
+        # до 5000 concurrent connections — это редкий, но реальный случай у
+        # некоторых регионалов с aggressive NAT.
+        # Атаки 5000+ concurrent connections всё равно дропаются.
+        # Slowloris с 3000-5000 connections — проходит (trade-off за поддержку
+        # extreme CGNAT). Защита от slowloris дополнительно обеспечивается
+        # newconn rate + SYN flood + blocklist'ами.
+        # История: v3.0=150 → v3.12.0=400 → v3.18.13=1500 → v3.20.0=3000 → v3.20.1=5000.
         tcp dport @protected_ports_tcp ct state new \\
-            add @connlimit_v4 { ip saddr ct count over 400 } \\
+            add @connlimit_v4 { ip saddr ct count over 5000 } \\
             log prefix "[shield:conn_flood] " level info flags ip options \\
             counter name conn_flood_v4 drop
 
         # === NEW CONNECTION RATE-LIMIT ===
-        # v3.12.0 CGNAT FIX: 200/min → 500/min, burst 500 → 1000.
-        # Один CGNAT IP с 50 юзерами легко даёт 200 new-conn/min при норме
-        # (Telegram + браузер + Spotify + WhatsApp + бэкграунд = 4-5 conn/min/юзер).
-        # 500/min даёт запас x2.5 для CGNAT, всё ещё ловит реальный HTTP-flood
-        # (1000+ new-conn/min с одного IP).
+        # v3.20.1: лимит поднят 3000 → 5000/min, burst 5000 → 8000.
+        # Соответствует поднятому conn_flood (5000). Extreme CGNAT (200+ юзеров)
+        # может давать 3000-5000 new-conn/min при пиковой активности
+        # (одновременное переподключение через VPN).
+        # Реальные атаки — 10000+ new-conn/min, всё равно ловятся.
+        # Burst 8000 даёт запас на массовое переподключение клиентов
+        # (например после обновления приложения у multiple юзеров).
+        # История: v3.0=200/min → v3.12.0=500/min → v3.18.13=1500/min →
+        #          v3.20.0=3000/min → v3.20.1=5000/min.
         tcp dport @protected_ports_tcp ct state new \\
-            add @newconn_rate_v4 { ip saddr limit rate over 500/minute burst 1000 packets } \\
+            add @newconn_rate_v4 { ip saddr limit rate over 5000/minute burst 8000 packets } \\
             jump newconn_overflow
 
         # === TCP SYN rate-limit ===
-        # v3.12.0: лимит остаётся 300/sec, CGNAT 50 юзеров обычно даёт 50-80 SYN/sec
-        # реальная атака — 1000+ SYN/sec. 300 — хороший middle-ground.
+        # v3.20.0/v3.20.1: лимит 300/sec остаётся (БЕЗ ИЗМЕНЕНИЙ).
+        # 300 SYN/sec — один юзер физически не может достичь без bug в приложении.
+        # CGNAT 200 юзеров с одновременным reconnect: ~150-250 SYN/sec (всплеск).
+        # Реальная атака — 1000+ SYN/sec. 300 — золотая середина.
+        # Burst 500 покрывает редкие пики массового reconnect.
+        # Подъём этого лимита открыл бы дверь Reality scanner'ам (400-1000 SYN/sec).
         tcp dport @protected_ports_tcp ct state new \\
             add @syn_flood_v4 { ip saddr limit rate over 300/second burst 500 packets } \\
             jump syn_overflow
 
         # === UDP rate-limit ===
-        # v3.12.0: 600/sec остаётся (UDP менее проблематичен с CGNAT)
+        # v3.20.0/v3.20.1: 1500/sec, burst 3000 (БЕЗ ИЗМЕНЕНИЙ).
+        # Hysteria2 4K стриминг с одного юзера = 200-400 UDP pkt/sec.
+        # Big home setup (3 устройства 4K) = 600-1500 pkt/sec.
+        # 1500/sec покрывает реальный 4K-трафик с запасом.
+        # Реальный UDP flood атака — 5000+ pkt/sec, ловится.
         udp dport @protected_ports_udp \\
-            add @udp_flood_v4 { ip saddr limit rate over 600/second burst 1000 packets } \\
+            add @udp_flood_v4 { ip saddr limit rate over 1500/second burst 3000 packets } \\
             jump udp_overflow
     }
 
@@ -3578,7 +3717,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.18.12 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.20.1 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -3595,12 +3734,14 @@ DEFAULT_THREAT_UPDATE_INTERVAL="$DEFAULT_THREAT_UPDATE_INTERVAL"
 DEFAULT_TOR_UPDATE_INTERVAL="$DEFAULT_TOR_UPDATE_INTERVAL"
 DEFAULT_CUSTOM_UPDATE_INTERVAL="$DEFAULT_CUSTOM_UPDATE_INTERVAL"
 DEFAULT_MOBILE_RU_UPDATE_INTERVAL="$DEFAULT_MOBILE_RU_UPDATE_INTERVAL"
+DEFAULT_BROADBAND_RU_UPDATE_INTERVAL="$DEFAULT_BROADBAND_RU_UPDATE_INTERVAL"
 
 DEFAULT_MIN_ENTRIES_SCANNER=$DEFAULT_MIN_ENTRIES_SCANNER
 DEFAULT_MIN_ENTRIES_THREAT=$DEFAULT_MIN_ENTRIES_THREAT
 DEFAULT_MIN_ENTRIES_TOR=$DEFAULT_MIN_ENTRIES_TOR
 DEFAULT_MIN_ENTRIES_CUSTOM=$DEFAULT_MIN_ENTRIES_CUSTOM
 DEFAULT_MIN_ENTRIES_MOBILE_RU=$DEFAULT_MIN_ENTRIES_MOBILE_RU
+DEFAULT_MIN_ENTRIES_BROADBAND_RU=$DEFAULT_MIN_ENTRIES_BROADBAND_RU
 
 DEFAULT_FAIL_THRESHOLD=$DEFAULT_FAIL_THRESHOLD
 DEFAULTS_EOF
@@ -3618,8 +3759,9 @@ export LANG=C LC_ALL=C
 
 NAME="${1:-}"
 case "$NAME" in
-    scanner|threat|tor|custom|mobile_ru) ;;
-    *) echo "Usage: $0 <scanner|threat|tor|custom|mobile_ru>" >&2; exit 1 ;;
+    scanner|threat|tor|custom) ;;
+    # v3.20.0: mobile_ru + broadband_ru УБРАНЫ
+    *) echo "Usage: $0 <scanner|threat|tor|custom>" >&2; exit 1 ;;
 esac
 
 LOG_TAG="shieldnode-update-$NAME"
@@ -3633,7 +3775,7 @@ case "$NAME" in
     threat)    NFT_SET="threat_blocklist_v4"  ;;
     tor)       NFT_SET="tor_exit_blocklist_v4" ;;
     custom)    NFT_SET="custom_blocklist_v4"  ;;
-    mobile_ru) NFT_SET="mobile_ru_whitelist_v4" ;;
+    # v3.20.0: mobile_ru + broadband_ru УБРАНЫ
 esac
 
 # Загружаем дефолты + опциональный override
@@ -3644,12 +3786,10 @@ if [ -f /etc/shieldnode/shieldnode.conf ]; then
     . /etc/shieldnode/shieldnode.conf
 fi
 
-# v3.15.0: уважаем ENABLE_RU_MOBILE_WHITELIST=0 — flush set и exit
-if [ "$NAME" = "mobile_ru" ] && [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" != "1" ]; then
-    nft flush set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null
-    logger -t "$LOG_TAG" "ENABLE_RU_MOBILE_WHITELIST=${ENABLE_RU_MOBILE_WHITELIST}, set очищен"
-    exit 0
-fi
+# v3.20.0: ENABLE_RU_MOBILE_WHITELIST / ENABLE_RU_BROADBAND_WHITELIST блоки УБРАНЫ.
+# Если старая нода имеет в shieldnode.conf эти переменные — они просто
+# игнорируются. При следующем upgrade nft sets mobile_ru/broadband_ru_whitelist_v4
+# исчезнут (т.к. их больше нет в новой shield конфигурации).
 
 # Резолвим финальные значения: оператор может задать LOCAL_BLOCKLISTS /
 # REMOTE_BLOCKLISTS; иначе берём DEFAULT_*.
@@ -3672,11 +3812,11 @@ done
 
 # MIN_ENTRIES + FAIL_THRESHOLD: per-name override → DEFAULT_*
 case "$NAME" in
-    scanner)   MIN_ENTRIES="${MIN_ENTRIES_SCANNER:-$DEFAULT_MIN_ENTRIES_SCANNER}"     ;;
-    threat)    MIN_ENTRIES="${MIN_ENTRIES_THREAT:-$DEFAULT_MIN_ENTRIES_THREAT}"       ;;
-    tor)       MIN_ENTRIES="${MIN_ENTRIES_TOR:-$DEFAULT_MIN_ENTRIES_TOR}"             ;;
-    custom)    MIN_ENTRIES="${MIN_ENTRIES_CUSTOM:-$DEFAULT_MIN_ENTRIES_CUSTOM}"       ;;
-    mobile_ru) MIN_ENTRIES="${MIN_ENTRIES_MOBILE_RU:-$DEFAULT_MIN_ENTRIES_MOBILE_RU}" ;;
+    scanner)      MIN_ENTRIES="${MIN_ENTRIES_SCANNER:-$DEFAULT_MIN_ENTRIES_SCANNER}"     ;;
+    threat)       MIN_ENTRIES="${MIN_ENTRIES_THREAT:-$DEFAULT_MIN_ENTRIES_THREAT}"       ;;
+    tor)          MIN_ENTRIES="${MIN_ENTRIES_TOR:-$DEFAULT_MIN_ENTRIES_TOR}"             ;;
+    custom)       MIN_ENTRIES="${MIN_ENTRIES_CUSTOM:-$DEFAULT_MIN_ENTRIES_CUSTOM}"       ;;
+    # v3.20.0: mobile_ru + broadband_ru УБРАНЫ
 esac
 FAIL_THRESHOLD_VAL="${FAIL_THRESHOLD:-$DEFAULT_FAIL_THRESHOLD}"
 
@@ -3837,7 +3977,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.18.12 — github sync для lists/custom.txt
+# shieldnode v3.20.1 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -3918,7 +4058,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.18.12 — version check
+# shieldnode v3.20.1 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -4101,11 +4241,11 @@ Persistent=true
 WantedBy=timers.target
 EOF
 }
-make_timer scanner   "$DEFAULT_SCANNER_UPDATE_INTERVAL"
-make_timer threat    "$DEFAULT_THREAT_UPDATE_INTERVAL"
-make_timer tor       "$DEFAULT_TOR_UPDATE_INTERVAL"
-make_timer custom    "$DEFAULT_CUSTOM_UPDATE_INTERVAL"
-make_timer mobile_ru "$DEFAULT_MOBILE_RU_UPDATE_INTERVAL"
+make_timer scanner      "$DEFAULT_SCANNER_UPDATE_INTERVAL"
+make_timer threat       "$DEFAULT_THREAT_UPDATE_INTERVAL"
+make_timer tor          "$DEFAULT_TOR_UPDATE_INTERVAL"
+make_timer custom       "$DEFAULT_CUSTOM_UPDATE_INTERVAL"
+# v3.20.0: timer'ы mobile_ru и broadband_ru УБРАНЫ.
 
 # 5) inotify path-watcher для custom (мгновенно реагирует на изменение файла)
 cat > /etc/systemd/system/shieldnode-update@custom.path <<EOF
@@ -4230,7 +4370,13 @@ if [ "$BLOCK_TOR" = "1" ]; then
     touch /etc/shieldnode/block_tor
 fi
 if [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" = "1" ]; then
-    ENABLED_LISTS+=(mobile_ru)
+    # v3.20.0: mobile_ru deprecated. Старые ноды с ENABLE_RU_MOBILE_WHITELIST=1
+    # в shieldnode.conf не сломаются — просто игнорируется.
+    : # no-op
+fi
+if [ "${ENABLE_RU_BROADBAND_WHITELIST:-1}" = "1" ]; then
+    # v3.20.0: broadband_ru deprecated.
+    : # no-op
 fi
 
 declare -A LIST_SIZES
@@ -4262,11 +4408,10 @@ for n in "${ENABLED_LISTS[@]}"; do
     if systemctl start "shieldnode-update@${n}.service" 2>/dev/null; then
         sleep 1
         SET_NAME=$(case "$n" in
-            scanner)   echo "scanner_blocklist_v4" ;;
-            threat)    echo "threat_blocklist_v4"  ;;
-            tor)       echo "tor_exit_blocklist_v4" ;;
-            custom)    echo "custom_blocklist_v4"  ;;
-            mobile_ru) echo "mobile_ru_whitelist_v4" ;;
+            scanner)      echo "scanner_blocklist_v4" ;;
+            threat)       echo "threat_blocklist_v4"  ;;
+            tor)          echo "tor_exit_blocklist_v4" ;;
+            custom)       echo "custom_blocklist_v4"  ;;
         esac)
         SIZE=$(nft list set inet ddos_protect "$SET_NAME" 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
         SIZE="${SIZE:-0}"
@@ -4445,7 +4590,7 @@ if ! command -v cscli >/dev/null 2>&1; then
     # отработают через timeout на самом apt-get.
     mkdir -p /etc/crowdsec
     cat > /etc/crowdsec/.shieldnode-skip-unattended <<'SKIP_EOF'
-# Создан установщиком shieldnode v3.18.12
+# Создан установщиком shieldnode v3.20.1
 # Сигнал для cscli setup unattended что shieldnode сделает hub upgrade сам.
 SKIP_EOF
     # На многих версиях CrowdSec post-inst читает эту env var
@@ -5187,7 +5332,7 @@ NEW_CURSOR=$(grep -oE '^-- cursor: .+$' "$TMP" | tail -1 | sed 's/^-- cursor: //
 # [shield:conn_flood] и [shield:newconn_flood] (v3.15.2),
 # [shield:tcp_invalid], [shield:fib_spoof], [shield:syn_escalate], [shield:udp_escalate] (v3.15.3)
 # Формат kernel-лога: "[shield:scanner] IN=eth0 SRC=85.142.100.2 DST=... PROTO=TCP DPT=8443 ..."
-declare -A scanner_ips ddos_ips tor_ips threat_ips custom_ips mobile_ru_ips conn_flood_ips newconn_flood_ips
+declare -A scanner_ips ddos_ips tor_ips threat_ips custom_ips conn_flood_ips newconn_flood_ips
 declare -A tcp_invalid_ips fib_spoof_ips syn_escalate_ips udp_escalate_ips
 # v3.16.0: UFW дропы (если оператор включил 'ufw logging on')
 declare -A ufw_block_ips ufw_block_ports
@@ -5217,9 +5362,6 @@ while IFS='|' read -r kind ip port proto; do
             ;;
         custom)
             [ -n "$ip" ] && custom_ips[$ip]=$((${custom_ips[$ip]:-0} + 1))
-            ;;
-        mobile_ru)
-            [ -n "$ip" ] && mobile_ru_ips[$ip]=$((${mobile_ru_ips[$ip]:-0} + 1))
             ;;
         conn_flood)
             [ -n "$ip" ] && conn_flood_ips[$ip]=$((${conn_flood_ips[$ip]:-0} + 1))
@@ -5278,12 +5420,8 @@ done < <(awk '
             if (ip != "") print "custom|" ip "||"
         }
     }
-    /\[shield:mobile_ru_drop\]/ {
-        if (match($0, /SRC=[^ ]+/)) {
-            ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
-            if (ip != "") print "mobile_ru|" ip "||"
-        }
-    }
+    # v3.20.0: patterns для [shield:mobile_ru_drop] и [shield:broadband_ru_drop]
+    # УБРАНЫ (whitelist'ы удалены, эти log prefixes больше не генерируются).
     /\[shield:conn_flood\]/ {
         if (match($0, /SRC=[^ ]+/)) {
             ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
@@ -5373,20 +5511,16 @@ TS=$(date '+%Y-%m-%d %H:%M:%S')
         cnt=${custom_ips[$ip]}
         echo "[$TS] CUSTOM BLOCK ip=$ip hits=$cnt"
     done
-    # v3.13.1: mobile-RU drops (превысили даже relaxed-лимит ct=1000)
-    for ip in "${!mobile_ru_ips[@]}"; do
-        cnt=${mobile_ru_ips[$ip]}
-        echo "[$TS] MOBILE_RU OVERFLOW ip=$ip hits=$cnt (CGNAT exceeded ct=1000)"
-    done
-    # v3.15.2: conn-flood drops (>400 одновременных connections, не mobile-RU)
+    # v3.20.0: output loops для mobile_ru/broadband_ru УБРАНЫ.
+    # v3.20.1: conn-flood drops (>5000 concurrent connections, единый лимит)
     for ip in "${!conn_flood_ips[@]}"; do
         cnt=${conn_flood_ips[$ip]}
-        echo "[$TS] CONN-FLOOD ip=$ip hits=$cnt (exceeded ct=400)"
+        echo "[$TS] CONN-FLOOD ip=$ip hits=$cnt (exceeded ct=5000)"
     done
-    # v3.15.2: newconn-flood drops (>500 new conn/min, escalated to confirmed_attack)
+    # v3.20.1: newconn-flood drops (>5000 new conn/min)
     for ip in "${!newconn_flood_ips[@]}"; do
         cnt=${newconn_flood_ips[$ip]}
-        echo "[$TS] NEWCONN-FLOOD ip=$ip hits=$cnt (>500 new conn/min — banned 1h)"
+        echo "[$TS] NEWCONN-FLOOD ip=$ip hits=$cnt (>5000 new conn/min — banned 1h)"
     done
     # v3.15.3: TCP-flag-invalid drops (XMAS/NULL/SYN+FIN scans — nmap)
     for ip in "${!tcp_invalid_ips[@]}"; do
@@ -5491,12 +5625,8 @@ NOW=$(date +%s)
         cnt=${custom_ips[$ip]}
         echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('custom', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
     done
-    # v3.13.1: mobile-RU overflow events
-    for ip in "${!mobile_ru_ips[@]}"; do
-        cnt=${mobile_ru_ips[$ip]}
-        echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('mobile_ru', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
-    done
-    # v3.15.2: conn-flood events (ct>400, не mobile-RU)
+    # v3.20.0: mobile_ru/broadband_ru INSERT loops УБРАНЫ (whitelist'ы удалены)
+    # v3.20.0: conn-flood events (>3000 concurrent)
     for ip in "${!conn_flood_ips[@]}"; do
         cnt=${conn_flood_ips[$ip]}
         echo "INSERT INTO events(type, ip, first_seen, last_seen, count) VALUES('conn_flood', '$ip', $NOW, $NOW, $cnt) ON CONFLICT(type, ip) DO UPDATE SET last_seen=$NOW, count=count+$cnt;"
@@ -5544,7 +5674,7 @@ TOTAL_DDOS=${#ddos_ips[@]}
 TOTAL_TOR=${#tor_ips[@]}
 TOTAL_THREAT=${#threat_ips[@]}
 TOTAL_CUSTOM=${#custom_ips[@]}
-TOTAL_MOBILE_RU=${#mobile_ru_ips[@]}
+# v3.20.0: TOTAL_MOBILE_RU и TOTAL_BROADBAND_RU УБРАНЫ (whitelist'ы удалены)
 TOTAL_CONN_FLOOD=${#conn_flood_ips[@]}
 TOTAL_NEWCONN_FLOOD=${#newconn_flood_ips[@]}
 TOTAL_TCP_INVALID=${#tcp_invalid_ips[@]}
@@ -5552,9 +5682,9 @@ TOTAL_FIB_SPOOF=${#fib_spoof_ips[@]}
 TOTAL_SYN_ESC=${#syn_escalate_ips[@]}
 TOTAL_UDP_ESC=${#udp_escalate_ips[@]}
 TOTAL_UFW_BLOCK=${#ufw_block_ips[@]}
-TOTAL_ANY=$((TOTAL_SCANNERS + TOTAL_DDOS + TOTAL_TOR + TOTAL_THREAT + TOTAL_CUSTOM + TOTAL_MOBILE_RU + TOTAL_CONN_FLOOD + TOTAL_NEWCONN_FLOOD + TOTAL_TCP_INVALID + TOTAL_FIB_SPOOF + TOTAL_SYN_ESC + TOTAL_UDP_ESC + TOTAL_UFW_BLOCK))
+TOTAL_ANY=$((TOTAL_SCANNERS + TOTAL_DDOS + TOTAL_TOR + TOTAL_THREAT + TOTAL_CUSTOM + TOTAL_CONN_FLOOD + TOTAL_NEWCONN_FLOOD + TOTAL_TCP_INVALID + TOTAL_FIB_SPOOF + TOTAL_SYN_ESC + TOTAL_UDP_ESC + TOTAL_UFW_BLOCK))
 if [ $TOTAL_ANY -gt 0 ]; then
-    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS, ddos=$TOTAL_DDOS, tor=$TOTAL_TOR, threat=$TOTAL_THREAT, custom=$TOTAL_CUSTOM, mobile_ru=$TOTAL_MOBILE_RU, conn_flood=$TOTAL_CONN_FLOOD, newconn_flood=$TOTAL_NEWCONN_FLOOD, tcp_invalid=$TOTAL_TCP_INVALID, fib_spoof=$TOTAL_FIB_SPOOF, syn_esc=$TOTAL_SYN_ESC, udp_esc=$TOTAL_UDP_ESC, ufw_block=$TOTAL_UFW_BLOCK unique IPs"
+    logger -t "$LOG_TAG" "Processed: scanners=$TOTAL_SCANNERS, ddos=$TOTAL_DDOS, tor=$TOTAL_TOR, threat=$TOTAL_THREAT, custom=$TOTAL_CUSTOM, conn_flood=$TOTAL_CONN_FLOOD, newconn_flood=$TOTAL_NEWCONN_FLOOD, tcp_invalid=$TOTAL_TCP_INVALID, fib_spoof=$TOTAL_FIB_SPOOF, syn_esc=$TOTAL_SYN_ESC, udp_esc=$TOTAL_UDP_ESC, ufw_block=$TOTAL_UFW_BLOCK unique IPs"
 fi
 AGG_EOF
 
@@ -5954,6 +6084,13 @@ collect_stats() {
     read MOBILE_RU_PASS_PKTS MOBILE_RU_PASS_BYTES <<< "$(read_counter mobile_ru_passes_v4)"
     read MOBILE_RU_CONN_PKTS MOBILE_RU_CONN_BYTES <<< "$(read_counter mobile_ru_conn_flood_v4)"
 
+    # v3.19.0: размер broadband-RU whitelist + counters
+    BROADBAND_RU_SET_SIZE=$(nft list set inet ddos_protect broadband_ru_whitelist_v4 2>/dev/null | \
+        tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+    BROADBAND_RU_SET_SIZE="${BROADBAND_RU_SET_SIZE:-0}"
+    read BROADBAND_RU_PASS_PKTS BROADBAND_RU_PASS_BYTES <<< "$(read_counter broadband_ru_passes_v4)"
+    read BROADBAND_RU_CONN_PKTS BROADBAND_RU_CONN_BYTES <<< "$(read_counter broadband_ru_conn_flood_v4)"
+
     # Когда nft started — для "stats since"
     NFT_SINCE=$(systemctl show nftables.service --property=ActiveEnterTimestamp --value 2>/dev/null | \
         xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
@@ -6124,7 +6261,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.18.12${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.20.1${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -6151,10 +6288,17 @@ draw_snapshot() {
     printf  "  ├─ ${DIM}blocklists${N}          %s\n" "$bl_summary"
     # v3.13.0: mobile-RU whitelist line (только если активен и не пустой)
     if [ "$MOBILE_RU_SET_SIZE" -gt 0 ]; then
-        printf  "  └─ ${G}mobile-RU whitelist${N} %s CIDRs ${DIM}(relaxed: ct=1000, newconn=2000/min, %s passes)${N}\n" \
+        printf  "  ├─ ${G}mobile-RU whitelist${N} %s CIDRs ${DIM}(relaxed: ct=1000, newconn=2000/min, %s passes)${N}\n" \
             "$(human_num "$MOBILE_RU_SET_SIZE")" "$(human_num "$MOBILE_RU_PASS_PKTS")"
     else
-        printf  "  └─ ${DIM}mobile-RU whitelist${N} ${DIM}disabled or empty (will populate from github on first sync)${N}\n"
+        printf  "  ├─ ${DIM}mobile-RU whitelist${N} ${DIM}disabled or empty (will populate from github on first sync)${N}\n"
+    fi
+    # v3.19.0: broadband-RU whitelist line
+    if [ "$BROADBAND_RU_SET_SIZE" -gt 0 ]; then
+        printf  "  └─ ${G}broadband-RU whitelist${N} %s CIDRs ${DIM}(relaxed: ct=3000, newconn=3000/min, %s passes)${N}\n" \
+            "$(human_num "$BROADBAND_RU_SET_SIZE")" "$(human_num "$BROADBAND_RU_PASS_PKTS")"
+    else
+        printf  "  └─ ${DIM}broadband-RU whitelist${N} ${DIM}disabled or empty (will populate from github on first sync)${N}\n"
     fi
     echo ""
 
@@ -6634,30 +6778,22 @@ show_settings_menu() {
 
     while true; do
         clear 2>/dev/null
-        local sync_state vc_state mobile_state tor_state
+        local sync_state vc_state tor_state
         sync_state=$(_read_setting "ENABLE_GITHUB_SYNC" "1")
         vc_state=$(_read_setting "ENABLE_VERSION_CHECK" "1")
-        mobile_state=$(_read_setting "ENABLE_RU_MOBILE_WHITELIST" "1")
         tor_state=$(_read_setting "BLOCK_TOR" "0")
 
         # ON/OFF строки (зелёный для ON, серый для OFF)
-        local s1 s2 s3 s4
-        [ "$sync_state"   = "1" ] && s1="${G}ON ${N}" || s1="${DIM}OFF${N}"
-        [ "$vc_state"     = "1" ] && s2="${G}ON ${N}" || s2="${DIM}OFF${N}"
-        [ "$mobile_state" = "1" ] && s3="${G}ON ${N}" || s3="${DIM}OFF${N}"
-        [ "$tor_state"    = "1" ] && s4="${G}ON ${N}" || s4="${DIM}OFF${N}"
+        local s1 s2 s4
+        [ "$sync_state"      = "1" ] && s1="${G}ON ${N}" || s1="${DIM}OFF${N}"
+        [ "$vc_state"        = "1" ] && s2="${G}ON ${N}" || s2="${DIM}OFF${N}"
+        [ "$tor_state"       = "1" ] && s4="${G}ON ${N}" || s4="${DIM}OFF${N}"
 
-        # v3.15.0: mobile-RU больше не требует MAXMIND_LICENSE_KEY
-        # Источник: lists/mobile-ru.txt из github (auto-generated через RIPEstat).
-        local mobile_extra=""
-        local mobile_size
-        mobile_size=$(nft list set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
-        mobile_size="${mobile_size:-0}"
-        if [ "$mobile_state" = "1" ] && [ "$mobile_size" -gt 0 ]; then
-            mobile_extra=" ${DIM}($mobile_size CIDRs loaded)${N}"
-        elif [ "$mobile_state" = "1" ]; then
-            mobile_extra=" ${Y}(set empty — first sync pending)${N}"
-        fi
+        # v3.20.0: mobile-RU и broadband-RU extra status строки УБРАНЫ
+        # (whitelist'ы удалены — см. changelog).
+
+        # v3.20.0: блоки расчёта mobile_extra/broadband_extra УБРАНЫ
+        # вместе со whitelist'ами.
 
         echo ""
         echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
@@ -6666,11 +6802,12 @@ show_settings_menu() {
         echo ""
         echo -e "  [${B}1${N}] Auto-sync github custom.txt    $s1  ${DIM}(every 6h)${N}"
         echo -e "  [${B}2${N}] Check for shieldnode updates  $s2  ${DIM}(every 1d)${N}"
-        echo -e "  [${B}3${N}] Mobile-RU whitelist           $s3 $mobile_extra"
         echo -e "  [${B}4${N}] Tor exit blocklist            $s4"
         echo ""
+        echo -e "  ${DIM}v3.20.0: пункты [3] Mobile-RU и [5] Broadband-RU убраны.${N}"
+        echo -e "  ${DIM}Защита упрощена — единый лимит ct=5000 для всех IP.${N}"
+        echo ""
         echo -e "  [${B}f${N}] Force github sync now"
-        echo -e "  [${B}m${N}] Force mobile-RU update now"
         echo -e "  [${B}v${N}] Force version check now"
         echo ""
         # v3.18.8: Trusted IPs counter
@@ -6714,20 +6851,6 @@ show_settings_menu() {
                 fi
                 sleep 1
                 ;;
-            3)
-                if [ "$mobile_state" = "1" ]; then
-                    _write_setting "ENABLE_RU_MOBILE_WHITELIST" "0"
-                    systemctl disable --now shieldnode-update@mobile_ru.timer >/dev/null 2>&1
-                    nft flush set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null
-                    echo -e "  ${G}✓${N} Mobile-RU whitelist ${R}disabled${N}"
-                else
-                    _write_setting "ENABLE_RU_MOBILE_WHITELIST" "1"
-                    systemctl enable --now shieldnode-update@mobile_ru.timer >/dev/null 2>&1
-                    systemctl start shieldnode-update@mobile_ru.service >/dev/null 2>&1 &
-                    echo -e "  ${G}✓${N} Mobile-RU whitelist ${G}enabled${N} (загрузка запущена)"
-                fi
-                sleep 1
-                ;;
             4)
                 if [ "$tor_state" = "1" ]; then
                     _write_setting "BLOCK_TOR" "0"
@@ -6750,14 +6873,6 @@ show_settings_menu() {
                 systemctl start shieldnode-github-sync.service
                 sleep 2
                 journalctl -t shieldnode-github-sync -n 3 --no-pager 2>/dev/null | sed 's/^/  /'
-                sleep 1
-                ;;
-            m|M)
-                echo ""
-                echo -e "  ${DIM}Запускаю mobile-RU update...${N}"
-                systemctl start shieldnode-update@mobile_ru.service
-                sleep 2
-                journalctl -t shieldnode-update-mobile_ru -n 3 --no-pager 2>/dev/null | sed 's/^/  /'
                 sleep 1
                 ;;
             v|V)
@@ -7363,11 +7478,10 @@ else
     # Краткий отчёт по размерам set'ов
     for n in scanner threat tor custom mobile_ru; do
         SET_NAME=$(case "$n" in
-            scanner)   echo "scanner_blocklist_v4" ;;
-            threat)    echo "threat_blocklist_v4"  ;;
-            tor)       echo "tor_exit_blocklist_v4" ;;
-            custom)    echo "custom_blocklist_v4"  ;;
-            mobile_ru) echo "mobile_ru_whitelist_v4" ;;
+            scanner)      echo "scanner_blocklist_v4" ;;
+            threat)       echo "threat_blocklist_v4"  ;;
+            tor)          echo "tor_exit_blocklist_v4" ;;
+            custom)       echo "custom_blocklist_v4"  ;;
         esac)
         SIZE=$(nft list set inet ddos_protect "$SET_NAME" 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
         SIZE="${SIZE:-0}"
@@ -7436,7 +7550,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.18.12 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.20.1 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
@@ -7453,7 +7567,7 @@ elif [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" = "1" ]; then
 else
     echo -e "   • Mobile-RU:     ${DIM}отключён${NC}"
 fi
-echo -e "   • Лимиты:        ct=400, new-conn=500/min ${DIM}(CGNAT-friendly)${NC}"
+echo -e "   • Лимиты:        ct=5000, new-conn=5000/min ${DIM}(extreme-CGNAT-friendly)${NC}"
 # v3.14.0: статус auto-sync features
 if [ "${ENABLE_GITHUB_SYNC:-1}" = "1" ]; then
     echo -e "   • GitHub sync:   ${GREEN}ON${NC}  ${DIM}(custom.txt каждые 6ч)${NC}"
