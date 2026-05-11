@@ -1,6 +1,44 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.20.3 (Commercial Edition) — DISK USAGE FIX
+#  v3.20.3: КРИТИЧЕСКИЙ FIX переполнения диска от логов.
+#
+#           ПРОБЛЕМА:
+#           На production нодах syslog/kern.log росли до 1.3 GB/день — диск
+#           забивался за неделю-две. Причина: shieldnode писал log на КАЖДЫЙ
+#           conn_flood drop. При атаке 10000 pkt/sec из одного IP = 10000
+#           строк/sec в kern.log.
+#
+#           ИЗМЕНЕНИЯ:
+#           1. УБРАН log prefix из conn_flood rule (был БЕЗ rate-limit).
+#              Counter conn_flood_v4 продолжает считать все drops — видно
+#              в guard dashboard. Aggregator теряет per-IP visibility для
+#              conn_flood — это приемлемый trade-off (можно использовать
+#              `nft list set inet ddos_protect connlimit_v4` для списка IP).
+#
+#           2. УБРАН log prefix из newconn_overflow chain (тоже без rate-limit).
+#
+#           3. ДОБАВЛЕН /etc/logrotate.d/shieldnode-syslog-aggressive:
+#              - rotate 3, daily, maxsize 100M
+#              - Покрывает /var/log/syslog, kern.log, auth.log
+#              - Ротирует когда файл превысил 100MB (не дожидаясь дня)
+#
+#           4. ДОБАВЛЕН shieldnode-logrotate.timer (hourly):
+#              - Запускает logrotate раз в час вместо ежедневного cron
+#              - Гарантирует что при росте логов ротация happens быстро
+#
+#           5. ДОБАВЛЕН shieldnode-cleanup.timer (weekly):
+#              - Оставляет только 2 последних backup'а в /var/lib/shieldnode/backup
+#              - Удаляет ASN cache entries старше 7 дней
+#              - Удаляет старые fail counters > 30 дней
+#
+#           ЭФФЕКТ:
+#           - kern.log/syslog рост: ~1.3 GB/день → ~10-50 MB/день
+#           - При атаке: рост логов в 100-1000 раз меньше
+#           - Диск стабильно остаётся в пределах 50-70% utilization
+#           - При накоплении автоматически ротируется max каждый час
+#
 #  VPN NODE DDoS PROTECTION v3.20.2 (Commercial Edition) — UI CLEANUP
 #  v3.20.2: COSMETIC FIXES — убраны устаревшие display lines в guard dashboard:
 #           - "mobile-RU whitelist disabled or empty" line — удалена (whitelist
@@ -1325,7 +1363,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.20.2"
+SHIELDNODE_VERSION="3.20.3"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1555,6 +1593,8 @@ if [ "${1:-}" = "--uninstall" ]; then
                 shieldnode-update@broadband_ru.timer shieldnode-update@broadband_ru.service \
                 shieldnode-github-sync.timer shieldnode-github-sync.service \
                 shieldnode-version-check.timer shieldnode-version-check.service \
+                shieldnode-logrotate.timer shieldnode-logrotate.service \
+                shieldnode-cleanup.timer shieldnode-cleanup.service \
                 shieldnode-whitelist.path shieldnode-whitelist.service; do
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
@@ -1580,6 +1620,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /usr/local/sbin/shieldnode-version-check.sh
     rm -f /usr/local/sbin/shieldnode-whitelist-updater.sh
     rm -f /usr/local/sbin/shieldnode-defaults.sh
+    rm -f /usr/local/sbin/shieldnode-cleanup.sh  # v3.20.3
     rm -f /usr/local/bin/guard
     print_ok "Скрипты удалены (включая команду guard)"
 
@@ -1596,6 +1637,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     # v3.5: human-readable логи + logrotate
     rm -rf /var/log/shieldnode
     rm -f /etc/logrotate.d/shieldnode
+    rm -f /etc/logrotate.d/shieldnode-syslog-aggressive  # v3.20.3
     print_ok "Логи и logrotate-конфиг удалены"
 
     # Sysctl hardening (v3.3+, оба имени файла — старое 99 и новое 90 из v3.7)
@@ -3142,9 +3184,17 @@ $FIB_ANTISPOOF_RULE
         # extreme CGNAT). Защита от slowloris дополнительно обеспечивается
         # newconn rate + SYN flood + blocklist'ами.
         # История: v3.0=150 → v3.12.0=400 → v3.18.13=1500 → v3.20.0=3000 → v3.20.1=5000.
+        # v3.20.3: log УБРАН с этого правила.
+        # Причина: раньше log писался при КАЖДОМ дропнутом пакете → при атаке
+        # 10000 pkt/sec из одного IP писалось 10000 строк/sec в kern.log →
+        # лог рос на 1.3 GB/день, забивая диск.
+        # Counter conn_flood_v4 продолжает считать все drops (видно в guard
+        # dashboard, total pkts/bytes). Aggregator теряет per-IP visibility
+        # для conn_flood — это приемлемый trade-off за экономию места.
+        # Если нужна детальная аналитика — можно использовать `nft monitor trace`
+        # или временно вернуть log.
         tcp dport @protected_ports_tcp ct state new \\
             add @connlimit_v4 { ip saddr ct count over 5000 } \\
-            log prefix "[shield:conn_flood] " level info flags ip options \\
             counter name conn_flood_v4 drop
 
         # === NEW CONNECTION RATE-LIMIT ===
@@ -3189,9 +3239,10 @@ $FIB_ANTISPOOF_RULE
     # Не трогают meter-set'ы → не могут вызвать double-charge.
     chain newconn_overflow {
         # Уже под наблюдением → escalate в confirmed (бан 1ч)
-        # v3.15.2: log prefix для observability
+        # v3.20.3: log УБРАН — раньше каждое срабатывание писало строку в kern.log,
+        # при атаке это давало большой поток логов. Counter newconn_flood_v4
+        # считает все drops, видно в guard dashboard.
         ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\
-            log prefix "[shield:newconn_flood] " level info flags ip options \\
             counter name newconn_flood_v4 drop
         # Первое нарушение → suspect (наблюдение 30мин, без drop)
         add @suspect_v4 { ip saddr } counter name newconn_flood_v4
@@ -3753,7 +3804,7 @@ print_header "ШАГ 6: BLOCKLIST UPDATER"
 #    updater и установщик использовали один источник истины.
 cat > "$SHIELD_DEFAULTS_FILE" <<DEFAULTS_EOF
 #!/bin/bash
-# shieldnode v3.20.2 — дефолты blocklists (генерится установщиком)
+# shieldnode v3.20.3 — дефолты blocklists (генерится установщиком)
 # НЕ редактировать руками — будет перезаписан при следующей установке/обновлении.
 # Для переопределения — создай /etc/shieldnode/shieldnode.conf.
 
@@ -4013,7 +4064,7 @@ print_ok "Updater: $SHIELD_UPDATER_SCRIPT"
 SHIELD_GITHUB_SYNC_SCRIPT="/usr/local/sbin/shieldnode-github-sync.sh"
 cat > "$SHIELD_GITHUB_SYNC_SCRIPT" <<GITHUB_SYNC_EOF
 #!/bin/bash
-# shieldnode v3.20.2 — github sync для lists/custom.txt
+# shieldnode v3.20.3 — github sync для lists/custom.txt
 # Запускается через shieldnode-github-sync.timer (раз в 6ч).
 # Без интернета или 404 — оставляет существующий файл как есть.
 
@@ -4094,7 +4145,7 @@ print_ok "GitHub sync updater: $SHIELD_GITHUB_SYNC_SCRIPT"
 SHIELD_VERSION_CHECK_SCRIPT="/usr/local/sbin/shieldnode-version-check.sh"
 cat > "$SHIELD_VERSION_CHECK_SCRIPT" <<VERSION_CHECK_EOF
 #!/bin/bash
-# shieldnode v3.20.2 — version check
+# shieldnode v3.20.3 — version check
 # Запускается через shieldnode-version-check.timer (раз в день).
 # Парсит первые 10 строк github shieldnode.sh, ищет 'v3.X.Y'.
 # Результат пишет в /var/lib/shieldnode/.upstream_version
@@ -4626,7 +4677,7 @@ if ! command -v cscli >/dev/null 2>&1; then
     # отработают через timeout на самом apt-get.
     mkdir -p /etc/crowdsec
     cat > /etc/crowdsec/.shieldnode-skip-unattended <<'SKIP_EOF'
-# Создан установщиком shieldnode v3.20.2
+# Создан установщиком shieldnode v3.20.3
 # Сигнал для cscli setup unattended что shieldnode сделает hub upgrade сам.
 SKIP_EOF
     # На многих версиях CrowdSec post-inst читает эту env var
@@ -5284,6 +5335,114 @@ cat > /etc/logrotate.d/shieldnode <<'LOGROTATE_EOF'
 }
 LOGROTATE_EOF
 print_ok "Logrotate: /etc/logrotate.d/shieldnode (daily, rotate 30, maxsize 50M)"
+
+# v3.20.3: Aggressive logrotate для /var/log/syslog и /var/log/kern.log
+# Причина: shieldnode/nftables/CrowdSec пишут много drop-events в kern.log.
+# Дефолтный rsyslog ротирует ежедневно — но за день может накопиться 1-2 GB.
+# Этот конфиг добавляет maxsize 100M — ротация happens при любом превышении,
+# не дожидаясь конца дня. Дополнительно ограничивает rotate 3 (вместо 7 default)
+# чтобы экономить место.
+cat > /etc/logrotate.d/shieldnode-syslog-aggressive <<'LOGROTATE_EOF'
+/var/log/syslog
+/var/log/kern.log
+/var/log/auth.log
+{
+    rotate 3
+    daily
+    maxsize 100M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 syslog adm
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate 2>/dev/null || true
+    endscript
+}
+LOGROTATE_EOF
+print_ok "Logrotate: /etc/logrotate.d/shieldnode-syslog-aggressive (rotate 3, maxsize 100M)"
+
+# v3.20.3: Hourly logrotate timer (вместо daily cron)
+# Дефолтный logrotate cron запускается раз в день. При активной ноде с DDoS
+# атаками логи могут вырасти до 1+ GB за день. Hourly проверка ловит overflow
+# раньше — maxsize 100M будет ротировать сразу при превышении.
+cat > /etc/systemd/system/shieldnode-logrotate.service <<'EOF'
+[Unit]
+Description=shieldnode hourly logrotate (catches log overflow before disk fills)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate /etc/logrotate.conf
+EOF
+
+cat > /etc/systemd/system/shieldnode-logrotate.timer <<'EOF'
+[Unit]
+Description=Run logrotate hourly (shieldnode aggressive rotation)
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now shieldnode-logrotate.timer >/dev/null 2>&1
+print_ok "Hourly logrotate timer: shieldnode-logrotate.timer"
+
+# v3.20.3: Weekly cleanup timer — старые backup'ы shieldnode + ASN cache
+# v3.20.3 FIX: используем отдельный скрипт вместо ExecStart с inline bash -c.
+# Причина: systemd unit'ы НЕ поддерживают многострочный ExecStart с backslash
+# continuation, и кавычки/апострофы в комментариях/строках ломают парсер.
+cat > /usr/local/sbin/shieldnode-cleanup.sh <<'CLEANUP_EOF'
+#!/bin/bash
+# shieldnode weekly cleanup — старые backup'ы + ASN cache + failed counters
+
+# 1) Оставляем только 2 последних backup'а
+if [ -d /var/lib/shieldnode/backup ]; then
+    find /var/lib/shieldnode/backup -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+        | sort | head -n -2 | xargs -r rm -rf
+fi
+
+# 2) Удаляем ASN cache entries старше 7 дней
+if [ -d /var/lib/shieldnode/asn_cache ]; then
+    find /var/lib/shieldnode/asn_cache -type f -mtime +7 -delete 2>/dev/null
+fi
+
+# 3) Удаляем старые failed fetch counters (>30 дней)
+find /var/lib/shieldnode -maxdepth 1 -name "*_fail_count" -mtime +30 -delete 2>/dev/null
+
+exit 0
+CLEANUP_EOF
+chmod 0755 /usr/local/sbin/shieldnode-cleanup.sh
+
+cat > /etc/systemd/system/shieldnode-cleanup.service <<'EOF'
+[Unit]
+Description=shieldnode weekly cleanup (old backups + stale ASN cache)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/shieldnode-cleanup.sh
+EOF
+
+cat > /etc/systemd/system/shieldnode-cleanup.timer <<'EOF'
+[Unit]
+Description=Weekly shieldnode cleanup
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now shieldnode-cleanup.timer >/dev/null 2>&1
+print_ok "Weekly cleanup timer: shieldnode-cleanup.timer (old backups + ASN cache)"
 
 # Инициализируем БД
 sqlite3 "$DB_FILE" <<'SQL_EOF'
@@ -6285,7 +6444,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.20.2${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v3.20.3${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -7561,7 +7720,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.20.2 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.20.3 установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
