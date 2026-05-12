@@ -1,6 +1,31 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.20.5 (Commercial Edition) — ARCH SIMPLIFICATION
+#  v3.20.5: упрощение архитектуры, убраны пересечения зон ответственности
+#           с vpn-node-setup. Никакой регрессии функциональности.
+#
+#           ИЗМЕНЕНИЯ:
+#           1. Удалён MSS clamp forward chain (был дубликат vpn-node-setup'овского
+#              MSS clamp на priority -150). Теперь shieldnode не делает MSS clamp —
+#              этим владеет vpn-node-setup (table inet vpn_node_mss_clamp).
+#              Двойного применения в netfilter pipeline больше нет.
+#
+#           2. Удалён panel auto-detect через docker ps. Раньше priorities
+#              менялись динамически (panel: -150/-50, standalone: -100/filter)
+#              на основе detected docker containers. После update панели или
+#              остановки docker детект ломался → priorities перестраивались →
+#              race condition. Теперь priorities захардкожены под standalone
+#              (prerouting -100).
+#
+#           3. Manual override через env/conf: PANEL_TYPE="remnawave" даст
+#              prerouting priority -150 (compat mode), любое другое значение
+#              или отсутствие — стандартный -100.
+#
+#           ВАЖНО: после применения убедись что vpn-node-setup v5.0.4+
+#                  установлен — иначе MSS clamp перестанет работать и клиенты
+#                  с PMTU<1500 могут видеть blackhole.
+#
 #  VPN NODE DDoS PROTECTION v3.20.4 (Commercial Edition) — CRITICAL HOTFIX
 #  v3.20.4: HOTFIX — критический баг в v3.20.3 который вешал установку.
 #
@@ -1816,21 +1841,20 @@ if [ -r "$PREINSTALL_CONF" ]; then
     shield_safe_source "$PREINSTALL_CONF"
 fi
 
-# v3.18.3: Panel auto-detect ВСЕГДА выполняется (даже в non-interactive),
-# независимо от того, есть ли conf-файл. Это предотвращает баг когда
-# в CI/CD деплое на ноду с Remnawave устанавливался standalone-режим
-# и возникал конфликт priorities.
+# v3.20.5: panel auto-detect через docker ps удалён.
+# Раньше priorities менялись динамически на основе detected panel:
+#   • panel detected → prerouting -150, forward -50
+#   • no panel       → prerouting -100, forward filter (=0)
+# Это создавало неконсистентное состояние: одна нода с docker панелью
+# имела одни priorities, другая (та же конфигурация, но docker остановлен) —
+# другие. После update панели (новые контейнеры/имена) детект ломался,
+# priorities перестраивались → race condition в netfilter.
+# Теперь ВСЕГДА standalone-режим. Если нужен panel-compat (-150 prerouting) —
+# выставить вручную в /etc/shieldnode/pre-install.conf:
+#   PANEL_TYPE="remnawave"
+# либо как env var перед запуском.
 if [ -z "${PANEL_TYPE:-}" ]; then
-    if docker ps 2>/dev/null | grep -qi "remnanode\|remnawave"; then
-        PANEL_TYPE="remnawave"
-    elif docker ps 2>/dev/null | grep -qi "marzban"; then
-        PANEL_TYPE="marzban"
-    elif docker ps 2>/dev/null | grep -qi "3x-ui\|x-ui"; then
-        PANEL_TYPE="3x-ui"
-    else
-        # Safe default — коммерческий продукт обычно ставится с панелью
-        PANEL_TYPE="remnawave"
-    fi
+    PANEL_TYPE="none"
 fi
 
 # Не интерактивный режим — пропускаем опрос (но auto-detect выше уже отработал)
@@ -1920,16 +1944,12 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
     fi
     echo ""
 
-    # v3.18.3: Panel auto-detect уже выполнен ВЫШЕ (вне интерактивного блока).
-    # Просто показываем результат оператору.
-    if [ "$PANEL_TYPE" = "remnawave" ] || [ "$PANEL_TYPE" = "marzban" ] || [ "$PANEL_TYPE" = "3x-ui" ]; then
-        if docker ps 2>/dev/null | grep -qiE "remnanode|remnawave|marzban|3x-ui|x-ui"; then
-            print_ok "Panel auto-detected: $PANEL_TYPE — compatible nft priorities"
-        else
-            print_info "Panel: $PANEL_TYPE (default compat-режим — panel-friendly)"
-            print_info "Если на ноде НЕТ панели — отредактируй $PREINSTALL_CONF:"
-            print_info "  PANEL_TYPE=\"none\" и сделай reinstall"
-        fi
+    # v3.20.5: показываем PANEL_TYPE только если оператор явно установил его
+    # в pre-install.conf или env var. Auto-detect через docker удалён.
+    if [ "${PANEL_TYPE:-none}" != "none" ]; then
+        print_info "Panel mode: $PANEL_TYPE (compat priority -150 для prerouting)"
+    else
+        print_info "Standalone mode (PANEL_TYPE=none, default)"
     fi
     echo ""
 
@@ -2860,18 +2880,18 @@ else
     FIB_ANTISPOOF_RULE="        # fib anti-spoofing отключён (multi-homed VPS — может дать false-positive)"
 fi
 
-# v3.18.1: panel-aware nft priorities
-# Если на ноде установлена VPN-панель (Remnawave/Marzban/3x-ui) — используем
-# compatible priorities чтобы не конфликтовать с её плагинами. Иначе —
-# стандартные (более эффективные, наш hook выполняется первым).
+# v3.20.5: priorities захардкожены под standalone-режим.
+# Forward chain удалён (см. Patch S1 ниже — MSS clamp принадлежит vpn-node-setup),
+# поэтому SHIELD_FORWARD_PRIO больше не используется в nft-конфиге.
+# Prerouting priority -100 применяется ко всем нодам одинаково.
+# Если оператор явно поставил PANEL_TYPE != "none" в pre-install.conf или
+# через env var — используем compat priority -150 для prerouting.
 if [ "${PANEL_TYPE:-none}" != "none" ]; then
     SHIELD_PREROUTING_PRIO="-150"
-    SHIELD_FORWARD_PRIO="-50"
-    print_info "Panel detected ($PANEL_TYPE) — compatible nft priorities (-150 / -50)"
+    print_info "PANEL_TYPE=$PANEL_TYPE — compat prerouting priority -150 (manual override)"
 else
     SHIELD_PREROUTING_PRIO="-100"
-    SHIELD_FORWARD_PRIO="filter"
-    print_info "Standalone-режим — стандартные nft priorities (-100 / filter)"
+    print_info "Standalone — prerouting priority -100"
 fi
 
 cat > "$NFT_DDOS_CONF" <<EOF
@@ -3288,23 +3308,13 @@ $FIB_ANTISPOOF_RULE
         add @suspect_v4 { ip saddr }
     }
 
-    # === v3.8: TCP MSS CLAMPING (forward hook) ===
-    # Что: для new TCP connection clamp MSS option в SYN до "path MTU - 40".
-    # Зачем: VPN-туннели (tun0/wg0) часто имеют MTU < 1500. Без clamping'а
-    # клиент шлёт пакет 1460 byte payload (MSS=1460 для eth0 1500), который
-    # потом приходится фрагментировать или дропать с ICMP "frag needed".
-    # Симптом без clamping'а: "сайт грузится медленно" / "не открывается".
-    # С clamping'ом: клиент сразу шлёт правильный MSS, нет ретрансмитов.
-    #
-    # priority: filter (после rate-limit'а в prerouting, перед NAT).
-    # Применяется ТОЛЬКО к forwarded трафику (не локальному SSH/control plane).
-    chain forward {
-        # v3.18.1: priority динамический ($SHIELD_FORWARD_PRIO).
-        # Если есть VPN-панель (Remnawave) — используем -50 чтобы делать
-        # MSS clamping ДО panel banlist'а. Если панели нет — filter (=0).
-        type filter hook forward priority $SHIELD_FORWARD_PRIO; policy accept;
-        tcp flags syn tcp option maxseg size set rt mtu
-    }
+    # === v3.20.5: MSS clamping moved to vpn-node-setup (ШАГ 7.8) ===
+    # Раньше shieldnode делал MSS clamp на forward hook (`tcp option maxseg
+    # size set rt mtu`). Теперь этим владеет vpn-node-setup
+    # (table inet vpn_node_mss_clamp, hook forward priority -150).
+    # Удалено отсюда чтобы избежать двойного clamp'а в netfilter pipeline.
+    # Если vpn-node-setup на ноде НЕ установлен — MSS clamp не делается
+    # вообще, клиенты с PMTU<1500 (мобильные, PPPoE) могут видеть blackhole.
 }
 EOF
 
