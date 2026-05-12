@@ -4,7 +4,7 @@ Bash-скрипт DDoS-защиты для VPN-нод (Reality / Xray / sing-box
 
 Стек: **nftables + CrowdSec + UFW**. Целевые ОС: Ubuntu 22.04 / 24.04, Debian 11 / 12.
 
-## Архитектура (v3.20.6)
+## Архитектура (v3.20.7)
 
 **Чистое разделение зон ответственности с vpn-node-setup:**
 
@@ -70,6 +70,7 @@ sudo guard --json   # JSON-вывод для интеграций (Zabbix, Prome
 
 ## Версии
 
+- **v3.20.7** — WHITELIST CONSISTENCY FIX: единая точка управления whitelist'ом во всех слоях. На установке автоимпортируются UFW `ALLOW from <IP>` правила в `whitelist-local.txt` + `TRUSTED_IPS` в `shieldnode.conf` + применяются через CrowdSec whitelist на 1 год. `BRIDGE_IPS` тоже расширен на все 3 слоя. Раньше IP попадали только в nft set через port-syncer, но UI `guard → Trusted IPs` показывал «пусто» и CrowdSec мог их забанить.
 - **v3.20.6** — SMOKE-TEST FIX: убран ложный smoke-test FAIL после v3.20.5. Smoke-test проверял наличие `chain forward` (которая удалена в v3.20.5 by design) → все установки показывали красный FAIL хотя защита работала. Косметика, функциональность не менялась.
 - **v3.20.5** — ARCH SIMPLIFICATION: удалён MSS clamp forward chain (зона vpn-node-setup), удалён panel auto-detect через docker ps (нестабильное определение priorities), priorities захардкожены (prerouting -100 standalone, -150 panel-mode через manual override).
 - **v3.20.4** — HOTFIX: критический баг в v3.20.3 (backticks в unquoted heredoc).
