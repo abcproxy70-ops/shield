@@ -1,10 +1,16 @@
-# shieldnode scanner blocklist (seed)
-# nft set: scanner_blocklist_v4
+# scanner.txt — seed file for known scanner IPs
 #
-# Этот файл объединяется с URL'ами из конфига:
-#   - shadow-netlab/traffic-guard-lists/antiscanner.list
-#   - shadow-netlab/traffic-guard-lists/government_networks.list
-#   - tread-lightly/CyberOK_Skipa_ips/skipa_cidr.txt
+# Этот файл объединяется с URL-источниками (см. lists/README.md).
+# На ноде кладётся в /etc/shieldnode/lists/scanner.txt.
 #
-# Добавляй сюда IPs которые URL-источники пропускают.
-# Один IP или CIDR на строку, # = комментарий.
+# Большинство IP качаются из публичных источников каждые 6 часов:
+#   - shadow-netlab/traffic-guard-lists (Shodan, Censys, общие сканеры)
+#   - tread-lightly/CyberOK_Skipa_ips (российские госсканеры SKIPA)
+#   - MISP/CIRCL warning lists
+#
+# Сюда добавляй свои findings которых нет в публичных списках.
+# Формат: один IP или CIDR на строку. Комментарии через #.
+
+# === Examples (раскомментируй или добавь свои) ===
+# 198.51.100.42       # local observation 2025-12-15
+# 203.0.113.0/24      # mass scanner subnet
