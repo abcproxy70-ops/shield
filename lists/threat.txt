@@ -1,10 +1,17 @@
-# shieldnode threat blocklist (seed)
-# nft set: threat_blocklist_v4
+# threat.txt — seed file for criminal/botnet IPs
 #
-# Этот файл объединяется с URL'ами из конфига:
-#   - Spamhaus DROP (https://www.spamhaus.org/drop/drop.txt)
+# Этот файл объединяется с URL-источниками (см. lists/README.md).
+# На ноде кладётся в /etc/shieldnode/lists/threat.txt.
+#
+# Основные источники качаются ежедневно:
+#   - Spamhaus DROP list (https://www.spamhaus.org/drop/drop.txt)
 #   - FireHOL Level 1 (https://iplists.firehol.org/files/firehol_level1.netset)
 #
-# Spamhaus + FireHOL дают ~5000+ IPs (high-confidence криминальные сети).
-# Локальные дополнения тут — для специфичных нод/регионов.
-# Один IP или CIDR на строку, # = комментарий.
+# Сюда — только high-confidence криминал (botnet C2, ransomware ops, etc).
+# Низкий false-positive rate важен — это критичный set, ложный бан легитимного
+# IP здесь хуже чем пропустить настоящий threat (для них есть scanner+rate-limit).
+#
+# Формат: один IP или CIDR на строку. Комментарии через #.
+
+# === Examples ===
+# 198.51.100.0/24    # known botnet subnet, observed 2025-12-15
