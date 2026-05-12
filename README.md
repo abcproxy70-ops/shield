@@ -4,7 +4,7 @@ Bash-скрипт DDoS-защиты для VPN-нод (Reality / Xray / sing-box
 
 Стек: **nftables + CrowdSec + UFW**. Целевые ОС: Ubuntu 22.04 / 24.04, Debian 11 / 12.
 
-## Архитектура (v3.20.7)
+## Архитектура (v3.21.1)
 
 **Чистое разделение зон ответственности с vpn-node-setup:**
 
@@ -70,6 +70,8 @@ sudo guard --json   # JSON-вывод для интеграций (Zabbix, Prome
 
 ## Версии
 
+- **v3.21.1** — SSH PROTECTION ORDER FIX: SSH-блок перемещён после tor_blocklist/scanner_blocklist в prerouting chain. Раньше Tor exit nodes могли подключаться к SSH даже при `BLOCK_TOR=1`, потому что `tcp dport SSH accept` стоял до tor-drop. Теперь все blocklist'ы дропают раньше, SSH-rate-limit работает только на оставшийся "чистый" трафик.
+- **v3.21.0** — SSH PRE-AUTH FLOOD DEFENSE: закрыта дыра когда атакующий мог открывать 100+ параллельных TCP-соединений до sshd, упираясь в `MaxStartups`, при этом softirq на kernel-handshake забивал CPU (наблюдалось 59% softirq на одном ядре). CrowdSec не видел повод банить — пакеты дропались на pre-auth, без failed login events. Добавлены 2 SSH-специфичных nft-сета (`ssh_connlimit_v4`, `ssh_newconn_rate_v4`) с RELAXED-лимитами: max 5 одновременных соединений с IP и max 10 новых коннектов/минуту с IP. Легитимный админ (1-3 коннекта/сессию) не задет, manual_whitelist обходит всё. Добавлены 2 counter'а (`ssh_conn_flood_v4`, `ssh_newconn_flood_v4`) с интеграцией в guard dashboard и JSON-output.
 - **v3.20.7** — WHITELIST CONSISTENCY FIX: единая точка управления whitelist'ом во всех слоях. На установке автоимпортируются UFW `ALLOW from <IP>` правила в `whitelist-local.txt` + `TRUSTED_IPS` в `shieldnode.conf` + применяются через CrowdSec whitelist на 1 год. `BRIDGE_IPS` тоже расширен на все 3 слоя. Раньше IP попадали только в nft set через port-syncer, но UI `guard → Trusted IPs` показывал «пусто» и CrowdSec мог их забанить.
 - **v3.20.6** — SMOKE-TEST FIX: убран ложный smoke-test FAIL после v3.20.5. Smoke-test проверял наличие `chain forward` (которая удалена в v3.20.5 by design) → все установки показывали красный FAIL хотя защита работала. Косметика, функциональность не менялась.
 - **v3.20.5** — ARCH SIMPLIFICATION: удалён MSS clamp forward chain (зона vpn-node-setup), удалён panel auto-detect через docker ps (нестабильное определение priorities), priorities захардкожены (prerouting -100 standalone, -150 panel-mode через manual override).
