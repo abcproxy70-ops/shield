@@ -1,7 +1,13 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.20.7 (Commercial Edition) — WHITELIST CONSISTENCY FIX
+#  VPN NODE DDoS PROTECTION v3.21.2 (Commercial Edition) — SSH PRE-AUTH FLOOD DEFENSE
+#  v3.21.2: UX fix — whitelist add/remove теперь явно триггерит updater,
+#           больше не нужно вручную нажимать [f] Force re-sync.
+#  v3.21.1: SSH защита перемещена после tor_blocklist/scanner_blocklist drops.
+#  v3.21.0: добавлены SSH pre-auth flood rate-limits (ssh_connlimit_v4,
+#           ssh_newconn_rate_v4). Закрыта дыра: атакующий мог открывать
+#           100+ TCP-коннектов до sshd, забивая softirq на handshake.
 #  v3.20.7: BUGFIX — единая точка управления whitelist'ом во всех слоях.
 #
 #           ПРОБЛЕМА (v3.20.6 и раньше):
@@ -1471,7 +1477,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.20.7"
+SHIELDNODE_VERSION="3.21.2"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -6993,12 +6999,16 @@ show_whitelist_ips() {
                     else
                         echo "$NEW_IP" >> "$WL_FILE"
                         echo -e "  ${G}✓${N} $NEW_IP добавлен. Применяется..."
-                        sleep 2
+                        # v3.21.2: явно триггерим updater вместо ожидания path-watcher'а
+                        # (path-watcher может отставать на debounce-окно и юзеру
+                        # приходилось вручную нажимать [f] Force re-sync).
+                        /usr/local/sbin/update-protected-ports.sh >/dev/null 2>&1 || true
+                        sleep 1
                         if nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
                             tr ',' '\n' | grep -qE "(^|[ {])$(echo "$NEW_IP" | sed 's/\./\\./g')([ },]|$)"; then
                             echo -e "  ${G}✓${N} $NEW_IP активен в nft"
                         else
-                            echo -e "  ${Y}!${N} Path-watcher ещё не сработал — попробуй [f] Force re-sync"
+                            echo -e "  ${Y}!${N} Не применилось — попробуй [f] Force re-sync"
                         fi
                     fi
                 fi
@@ -7019,12 +7029,14 @@ show_whitelist_ips() {
                     DEL_ESC=$(echo "$DEL_IP" | sed 's/[.\/]/\\&/g')
                     sed -i "/^${DEL_ESC}$/d" "$WL_FILE"
                     echo -e "  ${G}✓${N} $DEL_IP удалён из файла. Применяется..."
-                    sleep 2
+                    # v3.21.2: явно триггерим updater (см. add-ветку выше)
+                    /usr/local/sbin/update-protected-ports.sh >/dev/null 2>&1 || true
+                    sleep 1
                     if ! nft list set inet ddos_protect manual_whitelist_v4 2>/dev/null | \
                         tr ',' '\n' | grep -qE "(^|[ {])$(echo "$DEL_IP" | sed 's/\./\\./g')([ },]|$)"; then
                         echo -e "  ${G}✓${N} $DEL_IP убран из nft"
                     else
-                        echo -e "  ${Y}!${N} Path-watcher ещё не сработал — попробуй [f] Force re-sync"
+                        echo -e "  ${Y}!${N} Не применилось — попробуй [f] Force re-sync"
                     fi
                 fi
                 echo -ne "  ${DIM}Press Enter...${N}"
