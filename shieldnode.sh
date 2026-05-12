@@ -3442,12 +3442,10 @@ $FIB_ANTISPOOF_RULE
         # даже при BLOCK_TOR=1. Теперь все blocklist'ы дропают раньше,
         # SSH-rate-limit работает только на оставшийся "чистый" трафик.
         # NB: ssh_connlimit_v4 без timeout — conntrack чистит сам (как у connlimit_v4).
-        tcp dport { $SSH_PORTS_NFT } ct state new \\
-            add @ssh_connlimit_v4 { ip saddr ct count over 5 } \\
-            counter name ssh_conn_flood_v4 drop
-        tcp dport { $SSH_PORTS_NFT } ct state new \\
-            add @ssh_newconn_rate_v4 { ip saddr limit rate over 10/minute burst 15 packets } \\
-            counter name ssh_newconn_flood_v4 drop
+        # ВАЖНО: правила в одну строку. Многострочный синтаксис с \\ ломается
+        # в bash heredoc без кавычек — открывающий { трактуется как brace expansion.
+        tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_connlimit_v4 { ip saddr ct count over 5 } counter name ssh_conn_flood_v4 drop
+        tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_newconn_rate_v4 { ip saddr limit rate over 10/minute burst 15 packets } counter name ssh_newconn_flood_v4 drop
         # Прошёл все blocklist'ы и оба лимита — пропускаем дальше к sshd.
         tcp dport { $SSH_PORTS_NFT } accept
 
