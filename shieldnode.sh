@@ -1,7 +1,49 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.20.6 (Commercial Edition) — SMOKE-TEST FIX
+#  VPN NODE DDoS PROTECTION v3.20.7 (Commercial Edition) — WHITELIST CONSISTENCY FIX
+#  v3.20.7: BUGFIX — единая точка управления whitelist'ом во всех слоях.
+#
+#           ПРОБЛЕМА (v3.20.6 и раньше):
+#           IP попадали в nft set `manual_whitelist_v4` через 2 разных пути,
+#           которые НЕ синхронизировались между собой:
+#             A. port-syncer читает UFW "ALLOW from X" → nft set
+#                (но не пишет в whitelist-local.txt и не в TRUSTED_IPS conf)
+#             B. BRIDGE_IPS env → whitelist-local.txt
+#                (но не в TRUSTED_IPS conf и не в CrowdSec/UFW comments)
+#           Симптомы:
+#             - IP whitelisted в shieldnode защите (rate-limit обходится)
+#             - НО CrowdSec community CAPI мог их забанить (whitelist нет)
+#             - UI 'guard → Trusted IPs' показывал "пусто" (читает TRUSTED_IPS)
+#             - Юзер не понимал где IP, как ими управлять
+#
+#           FIX в v3.20.7 — два новых блока на install:
+#
+#           1. Расширенный BRIDGE_IPS блок (строка ~2007):
+#              - Пишет single IPs в TRUSTED_IPS в shieldnode.conf
+#              - export TRUSTED_IPS → ШАГ 12.5 применит UFW + CrowdSec whitelist
+#              - CIDR остаются только в whitelist-local.txt (UFW/CrowdSec не
+#                поддерживают /N в виде «обычного whitelist»)
+#
+#           2. UFW auto-import (после BRIDGE_IPS, до ШАГ 1):
+#              - Парсит UFW status, извлекает все "ALLOW from <IPv4>" правила
+#              - Добавляет IP в whitelist-local.txt (если ещё нет)
+#              - Мержит single IPs в TRUSTED_IPS в shieldnode.conf
+#              - export TRUSTED_IPS → ШАГ 12.5 применит UFW comment + CrowdSec
+#              - Idempotent — повторный запуск не дублирует
+#
+#           Итог: единый "source of truth" для whitelist'а через все 3 слоя:
+#             1) whitelist-local.txt (для path-watcher → nft set)
+#             2) TRUSTED_IPS в shieldnode.conf (для guard UI)
+#             3) CrowdSec whitelist decisions (через apply_trusted_ip ШАГ 12.5)
+#             4) UFW comment "Trusted (TRUSTED_IPS)" (через apply_trusted_ip)
+#
+#           Runtime port-syncer (читает UFW → nft) оставлен без изменений —
+#           это design decision: runtime защита может быть шире чем postоянное
+#           хранилище. Если admin хочет постоянно whitelist — должен
+#           использовать guard UI или TRUSTED_IPS conf.
+#
+#  VPN NODE DDoS PROTECTION v3.20.6 (Commercial Edition) — SMOKE-TEST + VERSION FIX
 #  v3.20.6: HOTFIX — убран ложный smoke-test FAIL после v3.20.5.
 #
 #           ПРОБЛЕМА:
@@ -1429,7 +1471,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.20.6"
+SHIELDNODE_VERSION="3.20.7"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1982,15 +2024,20 @@ if [ -z "${PREINSTALL_SKIP:-}" ]; then
     echo ""
 fi
 
-# Если bridge IPs заданы — добавляем их в whitelist-local.txt сразу
-# (до того как shieldnode-nftables.service загрузит правила)
+# Если bridge IPs заданы — добавляем их в whitelist-local.txt + TRUSTED_IPS
+# (полный whitelist через все 3 слоя: shieldnode + UFW + CrowdSec)
 # v3.18.3: добавлена валидация формата IP/CIDR
+# v3.20.7: BRIDGE_IPS теперь также попадают в TRUSTED_IPS → видны в
+# 'guard → Trusted IPs', применяются через ШАГ 12.5 (UFW comment + CrowdSec).
+# Раньше только в whitelist-local.txt → защищены от rate-limit, но не от
+# CrowdSec community CAPI бана (если bridge IP в community blocklist).
 if [ -n "${BRIDGE_IPS:-}" ]; then
     WL_LOCAL="/etc/shieldnode/lists/whitelist-local.txt"
     mkdir -p /etc/shieldnode/lists
     if [ ! -e "$WL_LOCAL" ]; then
         echo "# shieldnode whitelist (auto-populated from BRIDGE_IPS)" > "$WL_LOCAL"
     fi
+    BRIDGE_TRUSTED_ADDED=""
     IFS=',' read -ra BR_ARR <<< "$BRIDGE_IPS"
     for ip in "${BR_ARR[@]}"; do
         # v3.18.11 SH-NEW-10: строгая валидация (отклоняет 0.0.0.0/0 etc)
@@ -2003,7 +2050,153 @@ if [ -n "${BRIDGE_IPS:-}" ]; then
             echo "$ip" >> "$WL_LOCAL"
             print_ok "Добавлен в whitelist: $ip"
         fi
+        # v3.20.7: single IPs (не CIDR) идут в TRUSTED_IPS чтобы guard UI их показывал
+        # и ШАГ 12.5 применил UFW + CrowdSec whitelist.
+        if [[ "$ip" != */* ]]; then
+            if [ -z "$BRIDGE_TRUSTED_ADDED" ]; then
+                BRIDGE_TRUSTED_ADDED="$ip"
+            else
+                BRIDGE_TRUSTED_ADDED="${BRIDGE_TRUSTED_ADDED},${ip}"
+            fi
+        fi
     done
+
+    # v3.20.7: мержим BRIDGE_IPS (single IPs) в TRUSTED_IPS conf и переменную
+    if [ -n "$BRIDGE_TRUSTED_ADDED" ]; then
+        SHIELD_CONF="/etc/shieldnode/shieldnode.conf"
+        mkdir -p /etc/shieldnode
+        if [ ! -e "$SHIELD_CONF" ]; then
+            touch "$SHIELD_CONF"
+            chmod 0644 "$SHIELD_CONF"
+        fi
+        EXISTING_TRUSTED=$(grep -E '^TRUSTED_IPS=' "$SHIELD_CONF" 2>/dev/null | head -1 | \
+            sed -E 's/^TRUSTED_IPS="?([^"]*)"?.*/\1/')
+        # Merge BRIDGE_IPS в EXISTING_TRUSTED
+        ALL_TRUSTED="$EXISTING_TRUSTED"
+        IFS=',' read -ra NEW_ARR <<< "$BRIDGE_TRUSTED_ADDED"
+        for new_ip in "${NEW_ARR[@]}"; do
+            if ! echo "$ALL_TRUSTED" | tr ',' '\n' | grep -qxF "$new_ip"; then
+                if [ -z "$ALL_TRUSTED" ]; then
+                    ALL_TRUSTED="$new_ip"
+                else
+                    ALL_TRUSTED="${ALL_TRUSTED},${new_ip}"
+                fi
+            fi
+        done
+        if [ -n "$ALL_TRUSTED" ] && [ "$ALL_TRUSTED" != "$EXISTING_TRUSTED" ]; then
+            if grep -qE '^TRUSTED_IPS=' "$SHIELD_CONF" 2>/dev/null; then
+                sed -i "s|^TRUSTED_IPS=.*|TRUSTED_IPS=\"${ALL_TRUSTED}\"|" "$SHIELD_CONF"
+            else
+                echo "TRUSTED_IPS=\"${ALL_TRUSTED}\"" >> "$SHIELD_CONF"
+            fi
+            export TRUSTED_IPS="$ALL_TRUSTED"
+            print_ok "BRIDGE_IPS добавлены в TRUSTED_IPS (видимо в guard → Trusted IPs)"
+        fi
+    fi
+fi
+
+# v3.20.7: импорт существующих UFW "ALLOW from <IP>" правил в whitelist-local.txt
+# на первой установке.
+#
+# КОНТЕКСТ: shieldnode-nftables.service запускает port-syncer, который читает
+# UFW status и заполняет nft set manual_whitelist_v4 IP'шниками из правил
+# "ALLOW from <IP>" (это admin IPs, mgmt IPs, инфраструктура).
+#
+# ПРОБЛЕМА (до v3.20.7): IP попадают в nft set, но не в whitelist-local.txt.
+# UI "guard → Trusted IPs" читает только файл → показывает «пусто» хотя
+# IP whitelisted. Юзер не понимает где IP, как ими управлять.
+#
+# РЕШЕНИЕ: на первой установке импортируем UFW "ALLOW from X" → файл.
+# Дальше управление унифицировано через файл + UI.
+# Re-install НЕ перетирает существующий файл (только дополняет).
+WL_LOCAL="/etc/shieldnode/lists/whitelist-local.txt"
+if command -v ufw >/dev/null 2>&1 && \
+   LANG=C ufw status 2>/dev/null | grep -q "Status: active"; then
+    mkdir -p /etc/shieldnode/lists
+
+    # Создаём файл если нет
+    if [ ! -e "$WL_LOCAL" ]; then
+        echo "# shieldnode whitelist (auto-populated from UFW ALLOW rules)" > "$WL_LOCAL"
+        echo "# Управление через: sudo guard → Trusted IPs" >> "$WL_LOCAL"
+        echo "" >> "$WL_LOCAL"
+    fi
+
+    # Извлекаем IP из правил вида "PORT/proto  ALLOW  IP" (только IPv4, не Anywhere)
+    UFW_MGMT_IPS=$(LANG=C ufw status 2>/dev/null | awk '
+        $2 == "ALLOW" && $0 !~ /\(v6\)/ && $3 != "Anywhere" {
+            if ($3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) print $3
+        }
+    ' | sort -u)
+
+    IMPORTED=0
+    if [ -n "$UFW_MGMT_IPS" ]; then
+        while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            # Валидация (защита от 0.0.0.0/x, multicast, broken)
+            if ! validate_ipv4_or_cidr "$ip" 2>/dev/null; then
+                continue
+            fi
+            # Добавляем только если ещё нет (idempotent)
+            if ! grep -qxF "$ip" "$WL_LOCAL" 2>/dev/null; then
+                echo "$ip" >> "$WL_LOCAL"
+                IMPORTED=$((IMPORTED + 1))
+            fi
+        done <<< "$UFW_MGMT_IPS"
+    fi
+
+    if [ "$IMPORTED" -gt 0 ]; then
+        print_ok "Импортировано $IMPORTED IP из UFW ALLOW rules в $WL_LOCAL"
+
+        # Также записать в TRUSTED_IPS в shieldnode.conf — чтобы guard → Trusted IPs
+        # UI их показывал. Иначе IP лежат в файле + nft set, но menu пустое.
+        SHIELD_CONF="/etc/shieldnode/shieldnode.conf"
+        mkdir -p /etc/shieldnode
+        if [ ! -e "$SHIELD_CONF" ]; then
+            touch "$SHIELD_CONF"
+            chmod 0644 "$SHIELD_CONF"
+        fi
+
+        # Текущий TRUSTED_IPS (может быть пустой)
+        EXISTING_TRUSTED=$(grep -E '^TRUSTED_IPS=' "$SHIELD_CONF" 2>/dev/null | head -1 | \
+            sed -E 's/^TRUSTED_IPS="?([^"]*)"?.*/\1/')
+
+        # Merge: existing + новые из UFW (только single IPs, без CIDR — TRUSTED_IPS
+        # формат это single IPs для UFW/CrowdSec consistency)
+        ALL_TRUSTED=""
+        if [ -n "$EXISTING_TRUSTED" ]; then
+            ALL_TRUSTED="$EXISTING_TRUSTED"
+        fi
+        while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            # Только single IPs для TRUSTED_IPS (CIDR'ы остаются только в whitelist-local.txt)
+            if [[ "$ip" == */* ]]; then
+                continue
+            fi
+            if ! echo "$ALL_TRUSTED" | tr ',' '\n' | grep -qxF "$ip"; then
+                if [ -z "$ALL_TRUSTED" ]; then
+                    ALL_TRUSTED="$ip"
+                else
+                    ALL_TRUSTED="${ALL_TRUSTED},${ip}"
+                fi
+            fi
+        done <<< "$UFW_MGMT_IPS"
+
+        # Записать обновлённый TRUSTED_IPS в conf (idempotent — добавляет или обновляет)
+        if [ -n "$ALL_TRUSTED" ]; then
+            if grep -qE '^TRUSTED_IPS=' "$SHIELD_CONF" 2>/dev/null; then
+                # Обновить существующую строку
+                sed -i "s|^TRUSTED_IPS=.*|TRUSTED_IPS=\"${ALL_TRUSTED}\"|" "$SHIELD_CONF"
+            else
+                # Добавить новую строку
+                echo "TRUSTED_IPS=\"${ALL_TRUSTED}\"" >> "$SHIELD_CONF"
+            fi
+            print_ok "TRUSTED_IPS в $SHIELD_CONF обновлён (видимо в guard → Trusted IPs)"
+            # Экспортируем в текущую среду — чтобы apply_trusted_ip в ШАГ 12.5
+            # подхватил эти IP и применил CrowdSec whitelist + UFW comment
+            export TRUSTED_IPS="$ALL_TRUSTED"
+        fi
+        print_info "  Управление: sudo guard → Trusted IPs"
+    fi
 fi
 
 # ==============================================================================
