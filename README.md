@@ -4,7 +4,7 @@ Bash-скрипт DDoS-защиты для VPN-нод (Reality / Xray / sing-box
 
 Стек: **nftables + CrowdSec + UFW**. Целевые ОС: Ubuntu 22.04 / 24.04, Debian 11 / 12.
 
-## Архитектура (v3.20.5)
+## Архитектура (v3.20.6)
 
 **Чистое разделение зон ответственности с vpn-node-setup:**
 
@@ -42,19 +42,22 @@ Bash-скрипт DDoS-защиты для VPN-нод (Reality / Xray / sing-box
 ## Установка
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode.sh)
+curl -fL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode.sh | sudo bash
 ```
+
+> ⚠️ Use `curl | sudo bash` вместо `bash <(curl ...)` — process substitution не
+> работает на OpenVZ/LXC контейнерах и некоторых embedded environments.
 
 ## Совместимость
 
-- Работает рядом с **vpn-node-setup v5.0.5+** (рекомендуется ставить порядком: shieldnode → vpn-node-setup)
+- Работает рядом с **vpn-node-setup v5.0.5+** (рекомендуется порядок: **vpn-node-setup первым, потом shieldnode** — минимизирует окно потери MSS clamp)
 - Совместим с UFW (читает open ports автоматически)
 - Совместим с любыми VPN-стэками (Xray Reality, sing-box, Hysteria2, WireGuard)
 
 ## Удаление
 
 ```bash
-sudo bash <(curl -sL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode.sh) --uninstall
+curl -fL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode.sh | sudo bash -s -- --uninstall
 ```
 
 ## guard CLI
@@ -67,6 +70,7 @@ sudo guard --json   # JSON-вывод для интеграций (Zabbix, Prome
 
 ## Версии
 
+- **v3.20.6** — SMOKE-TEST FIX: убран ложный smoke-test FAIL после v3.20.5. Smoke-test проверял наличие `chain forward` (которая удалена в v3.20.5 by design) → все установки показывали красный FAIL хотя защита работала. Косметика, функциональность не менялась.
 - **v3.20.5** — ARCH SIMPLIFICATION: удалён MSS clamp forward chain (зона vpn-node-setup), удалён panel auto-detect через docker ps (нестабильное определение priorities), priorities захардкожены (prerouting -100 standalone, -150 panel-mode через manual override).
 - **v3.20.4** — HOTFIX: критический баг в v3.20.3 (backticks в unquoted heredoc).
 - **v3.20.3** — DISK USAGE FIX: ротация логов, ограничения на size.
