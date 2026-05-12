@@ -6495,7 +6495,7 @@ draw_snapshot() {
     # ===== HEADER (v3.12.0) =====
     echo ""
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
-    printf  "  ${B}shieldnode v3.20.4${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
+    printf  "  ${B}shieldnode v${SHIELDNODE_VERSION}${N}   %s   ${DIM}up %s${N}\n" "$hn ($ip)" "${uptime_str:-?}"
     echo -e "${C}══════════════════════════════════════════════════════════════════${N}"
 
     # v3.14.0: upgrade banner (если version-check нашёл новую версию)
@@ -7375,6 +7375,10 @@ while true; do
 done
 GUARD_EOF
 
+# v3.20.6: literal '${SHIELDNODE_VERSION}' внутри quoted heredoc'а не expand'ится.
+# Подставляем актуальную версию через sed после генерации файла.
+sed -i "s/\${SHIELDNODE_VERSION}/${SHIELDNODE_VERSION}/g" "$GUARD_BIN"
+
 chmod 0755 "$GUARD_BIN"
 print_ok "Команда установлена: $GUARD_BIN"
 print_info "Снимок состояния: ${BOLD}sudo guard${NC}  (или ${BOLD}sudo guard --json${NC})"
@@ -7777,7 +7781,7 @@ TCP_PORTS_COUNT=$(echo "$XRAY_PORTS_TCP" | tr ',' '\n' | grep -c .)
 
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
-echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v3.20.4 установлен${NC}"
+echo -e "  ${GREEN}✓${NC} ${BOLD}shieldnode v${SHIELDNODE_VERSION} установлен${NC}"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "  ${BOLD}Защита активна:${NC}"
