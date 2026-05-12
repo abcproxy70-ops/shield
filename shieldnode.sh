@@ -1429,7 +1429,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.20.4"
+SHIELDNODE_VERSION="3.20.6"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -7691,7 +7691,8 @@ else
     # пустой. Сейчас nft table 100% активна (smoke-test это проверил),
     # перезапускаем все updater'ы один раз для гарантии загрузки.
     print_status "Финальная загрузка blocklists (после smoke-test)..."
-    for n in scanner threat tor custom mobile_ru; do
+    # v3.20.6: mobile_ru удалён из списка — whitelist отменён в v3.20.0
+    for n in scanner threat tor custom; do
         # Только если сервис вообще существует (например tor — только при BLOCK_TOR=1)
         if [ -f "/etc/systemd/system/shieldnode-update@${n}.service" ] || \
            systemctl cat "shieldnode-update@${n}.service" >/dev/null 2>&1; then
@@ -7701,7 +7702,7 @@ else
         fi
     done
     # Краткий отчёт по размерам set'ов
-    for n in scanner threat tor custom mobile_ru; do
+    for n in scanner threat tor custom; do
         SET_NAME=$(case "$n" in
             scanner)      echo "scanner_blocklist_v4" ;;
             threat)       echo "threat_blocklist_v4"  ;;
@@ -7765,7 +7766,8 @@ SCANNER_NUM=$(nft list set inet ddos_protect scanner_blocklist_v4 2>/dev/null | 
 THREAT_NUM=$(nft list set inet ddos_protect threat_blocklist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
 CUSTOM_NUM=$(nft list set inet ddos_protect custom_blocklist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
 TOR_NUM=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | wc -l)
-MOBILE_RU_NUM=$(nft list set inet ddos_protect mobile_ru_whitelist_v4 2>/dev/null | tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l)
+# v3.20.6: MOBILE_RU_NUM удалён — mobile_ru_whitelist_v4 set не существует
+# после удаления whitelist'а в v3.20.0.
 CS_NUM=0
 if [ -r /var/lib/crowdsec/data/crowdsec.db ] && command -v sqlite3 >/dev/null 2>&1; then
     CS_NUM=$(sqlite3 /var/lib/crowdsec/data/crowdsec.db "SELECT COUNT(*) FROM decisions WHERE type='ban' AND until > datetime('now')" 2>/dev/null)
@@ -7785,13 +7787,9 @@ echo -e "   • CrowdSec:      $(printf "%'d" "$CS_NUM") IPs (community CAPI)"
 BL_LINE="scanner=$(printf "%'d" "${SCANNER_NUM:-0}"), threat=$(printf "%'d" "${THREAT_NUM:-0}"), custom=$(printf "%'d" "${CUSTOM_NUM:-0}")"
 [ "${TOR_NUM:-0}" -gt 0 ] && BL_LINE="$BL_LINE, tor=$(printf "%'d" "$TOR_NUM")"
 echo -e "   • Blocklists:    ${BL_LINE}"
-if [ "${MOBILE_RU_NUM:-0}" -gt 0 ]; then
-    echo -e "   • Mobile-RU:     $(printf "%'d" "$MOBILE_RU_NUM") CIDRs (relaxed: ct=1000, newconn=2000/min)"
-elif [ "${ENABLE_RU_MOBILE_WHITELIST:-1}" = "1" ]; then
-    echo -e "   • Mobile-RU:     ${YELLOW}пустой${NC} ${DIM}(первый sync через несколько минут)${NC}"
-else
-    echo -e "   • Mobile-RU:     ${DIM}отключён${NC}"
-fi
+# v3.20.6: блок Mobile-RU удалён — whitelist отменён в v3.20.0, оставшаяся
+# отображалка вводила в заблуждение ("первый sync через несколько минут" —
+# никакого sync не будет, фичи нет).
 echo -e "   • Лимиты:        ct=5000, new-conn=5000/min ${DIM}(extreme-CGNAT-friendly)${NC}"
 # v3.14.0: статус auto-sync features
 if [ "${ENABLE_GITHUB_SYNC:-1}" = "1" ]; then
