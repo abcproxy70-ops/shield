@@ -1,15 +1,19 @@
-# shieldnode custom blocklist (seed)
-# nft set: custom_blocklist_v4
+# custom.txt — твой личный blocklist (синкается с github каждые 6ч)
 #
-# Этот файл — личный список оператора. По умолчанию URL-источников НЕТ:
-# работает только то что лежит здесь.
+# ⚠️ ВАЖНО:
+#   - Этот файл хранится в github репо и автоматически качается на все ноды
+#     каждые 6 часов (https://raw.githubusercontent.com/abcproxy70-ops/shield/main/lists/custom.txt)
+#   - На ноде он пишется в /etc/shieldnode/lists/custom.txt (read-only от sync)
+#   - НЕ редактируй custom.txt на ноде напрямую — будет перезатёрто при следующем sync
 #
-# Path-watcher (inotify) триггерит обновление сразу при изменении файла —
-# изменения подхватываются за <1 секунды.
+# Чтобы добавить IP:
+#   - Постоянно для всех нод → PR в этот файл на github
+#   - Только на конкретной ноде → /etc/shieldnode/lists/custom-local.txt
+#     (не синкается, локальные изменения сохраняются)
 #
-# На сервере:
-#   echo '198.51.100.42' | sudo tee -a /etc/shieldnode/lists/custom.txt
-#
-# Один IP или CIDR на строку, # = комментарий.
-#
-# === Сюда залей свой список из 880 IPs (содержимое txt.txt от пользователя) ===
+# Формат: один IP или CIDR на строку. Комментарии через #.
+
+# === Твои findings ===
+# Пример:
+# 198.51.100.42      # observed attack on node-de-01, 2025-12-15
+# 203.0.113.0/24     # bad subnet, multiple complaints
