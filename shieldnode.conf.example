@@ -1,117 +1,104 @@
-# shieldnode v3.15.0 — пример конфигурации
+# ==============================================================================
+# shieldnode.conf — оператор настройки
+# Расположение на ноде: /etc/shieldnode/shieldnode.conf
+# Применяется при запуске установщика и при чтении настроек.
+# ==============================================================================
 #
-# Этот файл ОПЦИОНАЛЕН. Если его НЕТ в /etc/shieldnode/shieldnode.conf
-# — используются hardcoded дефолты в скрипте (те что закомментированы ниже).
+# Использование:
+#   1. Скопируй этот файл на ноду в /etc/shieldnode/shieldnode.conf:
+#        sudo mkdir -p /etc/shieldnode
+#        sudo cp shieldnode.conf.example /etc/shieldnode/shieldnode.conf
+#   2. Раскомментируй и измени нужные значения.
+#   3. Запусти reinstall: sudo bash <(curl -sL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode.sh)
 #
-# Установка:
-#   sudo cp shieldnode.conf.example /etc/shieldnode/shieldnode.conf
-#   sudo nano /etc/shieldnode/shieldnode.conf
-#   sudo systemctl restart 'shieldnode-update@*.service'
-#
-# Альтернативно — все toggle'ы можно изменить через `sudo guard` →
-# меню [s] settings (auto-sync, version check, mobile-RU, tor).
-#
-# Синтаксис: bash array. Чтобы для одного set'а было НЕСКОЛЬКО URL'ов —
-# объединяй через запятую без пробелов.
+# Также большинство этих настроек можно менять через interactive menu:
+#   sudo guard → settings (клавиша [s])
+# ==============================================================================
 
-# ==============================================================================
-# v3.14.0: AUTO-SYNC FROM GITHUB
-# ==============================================================================
-# Каждые 6ч нода скачивает lists/custom.txt с github и заменяет локальный.
-# Локальные дополнения оператора (эта нода) — в /etc/shieldnode/lists/custom-local.txt
-# (НЕ трогается github sync'ом, объединяется с custom.txt в nft set).
-#ENABLE_GITHUB_SYNC=1
 
-# Раз в день нода проверяет github на новую версию shieldnode.sh.
-# Если есть новая — guard CLI покажет [upgrade] баннер. Никаких авто-апгрейдов.
-# Команды: 'sudo guard upgrade' (re-run installer), 'sudo guard check' (force).
-#ENABLE_VERSION_CHECK=1
+# === Tor exit nodes blocklist (опционально) ===
+# По умолчанию 0 — Tor не блокируется (Reality/Xray может legitimately ходить через Tor).
+# Включи если на ноде только VPN-traffic и Tor однозначно враждебный.
+#BLOCK_TOR=1
 
-# ==============================================================================
-# v3.15.0: MOBILE-RU AS WHITELIST (CGNAT-friendly relaxed limits)
-# ==============================================================================
-# Российские мобильные операторы дают CGNAT с 50-200 абонентами на 1 IP.
-# При активной нагрузке такой IP может выдавать 600-1000 concurrent — что
-# превышает стандартный ct=400. Mobile-RU whitelist даёт RELAXED лимиты:
-#   - ct count:    400  → 1000   (CGNAT с 100-200 юзерами)
-#   - newconn rate: 500/min → 2000/min, burst 1000 → 4000
-#   - SYN/UDP rate-limit пропускаются для этих IPs (accept early)
+
+# === Custom blocklist sync с GitHub ===
+# По умолчанию 1 — нода каждые 6ч качает lists/custom.txt из github репо
+# (raw.githubusercontent.com/abcproxy70-ops/shield/main/lists/custom.txt).
+# Локальные дополнения хранятся в /etc/shieldnode/lists/custom-local.txt —
+# они НЕ перезаписываются при sync.
+# Отключи если работаешь полностью оффлайн или ведёшь свой forked-репо.
+#ENABLE_GITHUB_SYNC=0
+
+
+# === Trusted IPs (manual whitelist) ===
+# Список IP/CIDR через запятую — будут добавлены в:
+#   1. shieldnode manual_whitelist_v4 (обходит все наши rate-limits)
+#   2. UFW: ufw allow from <IP> (comment 'Trusted (TRUSTED_IPS)')
+#   3. CrowdSec whitelist (decisions delete --type ban для этих IP)
+# Использовать для: management-серверов, мониторинга, личных IP.
+#TRUSTED_IPS="77.239.107.190,213.165.55.166,138.124.88.15"
+
+
+# === Bridge/upstream nodes ===
+# Если эта нода — front для bridge-связки (RU-front → FI-bridge),
+# укажи IP моста. Он будет автоматически whitelist'ен.
+#BRIDGE_IPS="1.2.3.4,5.6.7.8"
+
+
+# === Panel detection (override) ===
+# По умолчанию v3.20.5: PANEL_TYPE=none (standalone, prerouting priority -100).
+# Если на ноде установлена VPN-панель с собственными nft-правилами на
+# priority -100 (например Remnawave plugin) — выставь явно для compat:
+#   none      → prerouting -100  (standalone, default)
+#   remnawave → prerouting -150  (compat с remnawave/marzban/3x-ui)
+#PANEL_TYPE=remnawave
+
+
+# === Custom blocklist sources (advanced) ===
+# По умолчанию shieldnode скачивает blocklist'ы из публичных источников
+# (Spamhaus, FireHOL, Shodan-fingerprints и т.д.). Если хочешь свои
+# источники, раскомментируй и измени массивы ниже.
 #
-# v3.15.0: список CIDR'ов берётся из github (lists/mobile-ru.txt), который
-# автогенерируется раз в неделю через GitHub Actions из RIPEstat API.
-# НИКАКИХ ключей или регистрации не нужно — обычный публичный blocklist.
-#
-# Включён по умолчанию. Можно отключить:
-#ENABLE_RU_MOBILE_WHITELIST=0
+# Формат: ENTRY="имя_set=URL1,URL2,URL3"
+# Файлы доступа: HTTP/HTTPS GET, текстовый формат (IP или CIDR по строке).
+# Множественные URL'ы для одного set объединяются (union, дедупликация).
 
-# ==============================================================================
-# v3.12.0: LOCAL BLOCKLISTS (file-based)
-# ==============================================================================
-# Путь к локальному .txt файлу для каждого set'а. Объединяется (union) с URL'ами.
-# v3.14.0: custom поддерживает 2 файла через запятую — github sync + локальный.
-
+# Локальные файлы (формат: path):
 #LOCAL_BLOCKLISTS=(
 #    "scanner=/etc/shieldnode/lists/scanner.txt"
 #    "threat=/etc/shieldnode/lists/threat.txt"
 #    "tor=/etc/shieldnode/lists/tor.txt"
 #    "custom=/etc/shieldnode/lists/custom.txt,/etc/shieldnode/lists/custom-local.txt"
-#    "mobile_ru=/etc/shieldnode/lists/mobile-ru.txt"
 #)
 
-# ==============================================================================
-# v3.12.0: REMOTE BLOCKLISTS (URL-based)
-# ==============================================================================
-# Несколько URL'ов через запятую — объединение для одного set'а.
-# Если для set'а нет URL'ов — оставь "name=" (пустое значение).
-
+# Удалённые источники (формат: URL):
 #REMOTE_BLOCKLISTS=(
-#    "scanner=https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list,https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list,https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
+#    "scanner=https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/main/public/antiscanner.list,https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/main/lists/skipa_cidr.txt"
 #    "threat=https://www.spamhaus.org/drop/drop.txt,https://iplists.firehol.org/files/firehol_level1.netset"
 #    "tor=https://check.torproject.org/torbulkexitlist"
-#    "custom="
-#    "mobile_ru=https://raw.githubusercontent.com/abcproxy70-ops/shield/main/lists/mobile-ru.txt"
+#    "custom=https://raw.githubusercontent.com/MY_ORG/MY_FORK/main/lists/custom.txt"
 #)
 
-# ==============================================================================
-# UPDATE INTERVALS (формат systemd OnUnitActiveSec)
-# ==============================================================================
-#SCANNER_UPDATE_INTERVAL="6h"
-#THREAT_UPDATE_INTERVAL="1d"
-#TOR_UPDATE_INTERVAL="1h"
-#CUSTOM_UPDATE_INTERVAL="6h"
-#MOBILE_RU_UPDATE_INTERVAL="1d"   # github cron обновляет раз в неделю,
-                                   # клиент чекает раз в день
 
-# ==============================================================================
-# MIN ENTRIES (sanity check против corrupted upstream)
-# ==============================================================================
+# === Update intervals (advanced) ===
+# Интервалы обновления blocklist'ов (формат: systemd timer — 1h, 6h, 1d).
+#SCANNER_UPDATE_INTERVAL=6h
+#THREAT_UPDATE_INTERVAL=1d
+#TOR_UPDATE_INTERVAL=1h
+#CUSTOM_UPDATE_INTERVAL=6h
+
+
+# === Min entries threshold (sanity check) ===
+# Если updater получает менее N записей в blocklist'е — считаем что
+# источник битый и не применяем (защита от пустых апдейтов которые
+# могут разморозить рейтлимиты на проде).
 #MIN_ENTRIES_SCANNER=100
 #MIN_ENTRIES_THREAT=500
 #MIN_ENTRIES_TOR=100
 #MIN_ENTRIES_CUSTOM=0
-#MIN_ENTRIES_MOBILE_RU=100
 
+
+# === Failure threshold ===
+# Сколько подряд неудачных update-попыток до alarm в guard CLI.
 #FAIL_THRESHOLD=3
-
-# ==============================================================================
-# v3.11: TOR EXIT BLOCKLIST
-# ==============================================================================
-# Блокирует подключения Tor exit nodes. По умолчанию ОТКЛЮЧЕНО — операторы
-# которые хостят Tor → VPN bridge для параноиков должны оставлять выключенным.
-#BLOCK_TOR=0
-
-# ==============================================================================
-# Примеры кастомизации
-# ==============================================================================
-
-# Пример 1: offline-mode (только локальные файлы)
-#REMOTE_BLOCKLISTS=("scanner=" "threat=" "tor=" "custom=" "mobile_ru=")
-
-# Пример 2: реже обновлять (для слабого сервера)
-#SCANNER_UPDATE_INTERVAL="12h"
-#THREAT_UPDATE_INTERVAL="2d"
-
-# Пример 3: свой источник mobile-RU CIDR'ов (если форкнул репо)
-#REMOTE_BLOCKLISTS=(
-#    "mobile_ru=https://raw.githubusercontent.com/MY_FORK/shield/main/lists/mobile-ru.txt"
-#)
