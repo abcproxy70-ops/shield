@@ -1,105 +1,101 @@
 # shieldnode blocklists
 
-Файлы в этом каталоге — seed-данные для встроенных blocklist'ов shieldnode.
+Seed-файлы для blocklist'ов shieldnode. На ноде они кладутся в
+`/etc/shieldnode/lists/` и автоматически объединяются с URL-источниками
+(union, дедупликация).
 
-При установке через `bash <(curl ...)` они автоматически скачиваются в
-`/etc/shieldnode/lists/` на сервере. При git-clone установке — копируются
-из `./lists/`.
-
-## Файлы
-
-| Файл          | nft set                  | Назначение                                    |
-|---------------|--------------------------|-----------------------------------------------|
-| `scanner.txt` | `scanner_blocklist_v4`   | Известные сканеры (Shodan, Censys, gov)       |
-| `threat.txt`  | `threat_blocklist_v4`    | Spamhaus DROP, FireHOL Level 1                |
-| `tor.txt`     | `tor_exit_blocklist_v4`  | Tor exit nodes (активен при `BLOCK_TOR=1`)    |
-| `custom.txt`  | `custom_blocklist_v4`    | Личный список оператора                       |
-
-## Формат
-
-Один IP или CIDR на строку. Комментарии начинаются с `#`. Пустые строки
-игнорируются.
+## Структура
 
 ```
-# Это комментарий
-8.8.8.8
-1.2.3.0/24
-192.0.2.5
-203.0.113.0/24    # inline-комментарий тоже работает
+lists/
+├── scanner.txt       — известные сканеры (Shodan, Censys, госсканеры РФ)
+├── threat.txt        — high-confidence криминальные IP (botnet C2, ransomware)
+├── tor.txt           — Tor exit nodes (применяется только если BLOCK_TOR=1)
+└── custom.txt        — личный список оператора (синкается с github каждые 6ч)
 ```
 
-Поддерживаются также форматы:
+## Формат файла
 
-* **Spamhaus**: `1.2.3.0/24 ; SBL12345` — символ `;` и всё после игнорируется
-* **FireHOL**: блоки `# header`-комментариев в начале файла
-* **MISP/CIRCL JSON**: `{"list": ["1.2.3.0/24", ...]}` — извлекается через `jq`
+Один IP или CIDR на строке. Комментарии через `#`. Пустые строки игнорируются.
 
-## Sanity-фильтр
+```
+# Пример
+198.51.100.42
+203.0.113.0/24
+192.0.2.0/28
+```
 
-Updater автоматически отсеивает:
+## Custom list
 
-* prefix `< 8` (слишком широко — сотни миллионов IP)
-* bogons: `0/8`, `10/8`, `127/8`, `169.254/16`, `172.16-31/12`, `192.168/16`
-* multicast и reserved: `224.0.0.0/3`
+`lists/custom.txt` — особый файл:
+- **На GitHub** хранится этот файл (синкается с нодами каждые 6ч)
+- **На ноде** автоматически качается в `/etc/shieldnode/lists/custom.txt`
+  (read-only от sync — НЕ редактируй вручную, перезатрётся)
+- **Локальные дополнения** оператор кладёт в `/etc/shieldnode/lists/custom-local.txt`
+  (не синкается, остаётся на ноде)
 
-## Объединение local + URL
-
-Каждый set — это **union** локального файла и (опциональных) URL-источников
-из `/etc/shieldnode/shieldnode.conf`. Дефолтные URL'ы:
-
-* `scanner` — shadow-netlab/traffic-guard-lists, tread-lightly/CyberOK_Skipa_ips
-* `threat` — Spamhaus DROP, FireHOL Level 1
-* `tor` — check.torproject.org/torbulkexitlist
-* `custom` — только локальный файл (URL по умолчанию нет)
-
-## Обновление
-
-После изменения `custom.txt` на сервере updater запускается **мгновенно**
-через systemd path-watcher (inotify). Остальные blocklist'ы обновляются
-по таймеру:
-
-| Set     | Интервал |
-|---------|----------|
-| scanner | 6 часов  |
-| threat  | раз в день |
-| tor     | 1 час    |
-| custom  | 6 часов + path-watcher |
-
-Принудительно:
+### Добавить IP в custom на работающей ноде
 
 ```bash
-sudo systemctl start shieldnode-update@scanner.service
-sudo systemctl start shieldnode-update@threat.service
-sudo systemctl start shieldnode-update@tor.service
-sudo systemctl start shieldnode-update@custom.service
+# Постоянное добавление (переживает reboot):
+echo '198.51.100.42' | sudo tee -a /etc/shieldnode/lists/custom-local.txt
+# inotify path-watcher подхватит за <1 секунды
+
+# Временное добавление (до перезагрузки nft):
+sudo nft add element inet ddos_protect custom_blocklist_v4 { 198.51.100.42 }
 ```
 
-## Защита от corruption
-
-Если все URL'ы недоступны **И** нет локального файла — old set остаётся
-как есть. После 3 подряд провалов set очищается (stale-data protection).
-
-Если результат меньше `MIN_ENTRIES_*` — set не обновляется (защита от
-supply-chain атаки на upstream).
-
-## Просмотр текущего состояния
+### Удалить IP из custom
 
 ```bash
-# Сколько IPs в каждом set'е
-sudo nft list set inet ddos_protect scanner_blocklist_v4 | wc -l
-sudo nft list set inet ddos_protect threat_blocklist_v4  | wc -l
-sudo nft list set inet ddos_protect tor_exit_blocklist_v4 | wc -l
-sudo nft list set inet ddos_protect custom_blocklist_v4  | wc -l
+# Из локального файла:
+sudo sed -i '/^198\.51\.100\.42$/d' /etc/shieldnode/lists/custom-local.txt
+# Path-watcher уберёт из nft set за <1 секунды
 
-# Лог последнего обновления
-sudo journalctl -t shieldnode-update-scanner --since "1 hour ago"
+# Если IP в синкаемом custom.txt — нужен PR в github репо или
+# временное удаление до следующего sync:
+sudo nft delete element inet ddos_protect custom_blocklist_v4 { 198.51.100.42 }
 ```
 
-## Edit на проде
+## Default URL-источники
 
-Чтобы добавить IP в `custom`-список на работающей ноде:
+Если seed-файлы пустые, shieldnode скачивает blocklist'ы с публичных URL:
+
+### scanner
+- [shadow-netlab/traffic-guard-lists](https://github.com/shadow-netlab/traffic-guard-lists) — общие сканеры (Shodan, Censys)
+- [tread-lightly/CyberOK_Skipa_ips](https://github.com/tread-lightly/CyberOK_Skipa_ips) — российские госсканеры (SKIPA, ГРЧЦ, НКЦКИ)
+
+### threat
+- [Spamhaus DROP](https://www.spamhaus.org/drop/drop.txt) — high-confidence криминал
+- [FireHOL Level 1](https://iplists.firehol.org/files/firehol_level1.netset) — bogon networks + блекхолы
+
+### tor
+- [Tor Project exit list](https://check.torproject.org/torbulkexitlist) — официальный список exit-нодов
+
+## Override URL-источников
+
+В `/etc/shieldnode/shieldnode.conf` можно переопределить `REMOTE_BLOCKLISTS`
+для использования своих источников. См. [shieldnode.conf.example](../shieldnode.conf.example).
+
+## Sync интервалы
+
+| Set | Интервал | Триггер |
+|---|---|---|
+| scanner | 6h | systemd timer |
+| threat | 1d | systemd timer |
+| tor | 1h | systemd timer (только если `BLOCK_TOR=1`) |
+| custom | 6h | systemd timer + inotify path-watcher на локальный файл |
+
+## Проверка состояния
 
 ```bash
-echo '198.51.100.42' | sudo tee -a /etc/shieldnode/lists/custom.txt
-# inotify подхватит изменение за <1 секунды → updater → nft set
+# Сколько IP в каждом set:
+sudo nft list set inet ddos_protect scanner_blocklist_v4 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' | wc -l
+
+# Последний sync:
+sudo systemctl status shield-blocklist-update.timer
+sudo journalctl -u shield-blocklist-update.service -n 20
+
+# Через guard:
+sudo guard --once  # покажет blocklist sizes и last sync time
 ```
