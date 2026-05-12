@@ -1,6 +1,28 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.20.6 (Commercial Edition) — SMOKE-TEST FIX
+#  v3.20.6: HOTFIX — убран ложный smoke-test FAIL после v3.20.5.
+#
+#           ПРОБЛЕМА:
+#           В v3.20.5 удалён `chain forward { MSS clamp }` (зона ответственности
+#           vpn-node-setup v5.0.4+). Но smoke-test в ШАГ 13 продолжал проверять
+#           наличие этого chain'а:
+#               for chain in prerouting forward newconn_overflow ...
+#           Результат: на всех нодах после v3.20.5 установка завершалась с
+#               ✖FAIL: цепочка inet ddos_protect forward не создана
+#               ✖Smoke-test НЕ ПРОЙДЕН.
+#           При этом защита РАБОТАЛА — false positive smoke-test, не реальная
+#           регрессия (см. логи: ddos_protect создан, ports protected, bouncer
+#           на -200, blocklist 26k IP).
+#
+#           FIX: убран 'forward' из списка обязательных цепочек в smoke-test
+#           (строка 7518). Forward chain больше не создаётся — это by design.
+#
+#           ВАЖНО: если на ноде уже установлен v3.20.5 и видишь smoke-test FAIL —
+#                  это косметика, нода работает корректно. Можно либо
+#                  игнорировать сообщение, либо переустановить с v3.20.6.
+#
 #  VPN NODE DDoS PROTECTION v3.20.5 (Commercial Edition) — ARCH SIMPLIFICATION
 #  v3.20.5: упрощение архитектуры, убраны пересечения зон ответственности
 #           с vpn-node-setup. Никакой регрессии функциональности.
@@ -7514,8 +7536,12 @@ if [ -n "$PROTECTED_UDP" ]; then
     fi
 fi
 
-# 4. Все обязательные cleanup-цепочки и подцепочки на месте (refactor v3.10.2)
-for chain in prerouting forward newconn_overflow syn_overflow udp_overflow; do
+# 4. Все обязательные cleanup-цепочки и подцепочки на месте.
+# v3.20.6: УБРАН 'forward' из списка обязательных — MSS clamp forward chain
+# удалён в v3.20.5 (зона ответственности vpn-node-setup, table inet vpn_node_mss_clamp).
+# Раньше smoke-test FAIL'ил на нодах с v3.20.5 потому что forward chain
+# намеренно отсутствует.
+for chain in prerouting newconn_overflow syn_overflow udp_overflow; do
     if ! nft list chain inet ddos_protect "$chain" >/dev/null 2>&1; then
         print_error "FAIL: цепочка inet ddos_protect $chain не создана"
         SMOKE_FAIL=1
