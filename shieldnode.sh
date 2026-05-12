@@ -2915,9 +2915,9 @@ SSH_PORTS_NFT=$(echo "$SSH_PORTS" | sed 's/,/, /g')
 
 # Печать результатов
 if [ "$SSH_PORTS" = "$SSH_PORT" ]; then
-    print_ok "SSH порт: ${BOLD}$SSH_PORT${NC} (исключён из защиты)"
+    print_ok "SSH порт: ${BOLD}$SSH_PORT${NC} (pre-auth flood защита: 5 conn / 10 newconn-min)"
 else
-    print_ok "SSH порты: ${BOLD}$SSH_PORTS${NC} (все исключены из защиты)"
+    print_ok "SSH порты: ${BOLD}$SSH_PORTS${NC} (pre-auth flood защита: 5 conn / 10 newconn-min)"
 fi
 
 if [ -n "$PROTECTED_TCP" ]; then
@@ -3230,6 +3230,28 @@ $XRAY_PORTS_UDP_INIT
         size 65536
     }
 
+    # v3.21.0: SSH-СПЕЦИФИЧНЫЕ сеты для pre-auth flood защиты.
+    # ПРОБЛЕМА: SSH-порт ранее был полностью исключён из prerouting
+    # (`tcp dport SSH accept`), а защита делегировалась CrowdSec'у через
+    # auth.log. Это создавало дыру: атакующий мог открыть 100 параллельных
+    # TCP-соединений до sshd, упереться в MaxStartups (sshd dropping pre-auth),
+    # но softirq уже сожрал CPU на handshake. CrowdSec не видел повода банить
+    # (нет failed login events — только pre-auth drop).
+    # ФИКС: отдельный rate-limit на SSH с relaxed-лимитами (юзер коннектится
+    # 1-3 раза за сессию, атакующий — 50+). Параметры намного мягче основных
+    # protected_ports, чтобы НЕ забанить легитимного админа.
+    set ssh_connlimit_v4 {
+        type ipv4_addr
+        flags dynamic
+        size 16384
+    }
+    set ssh_newconn_rate_v4 {
+        type ipv4_addr
+        flags dynamic, timeout
+        timeout 5m
+        size 16384
+    }
+
     # --- v2.5: STAGE 2 — CONFIRMED ATTACK (бан 1 час) ---
     # Сюда IP попадает если уже сидел в suspect и опять превысил лимит.
     # Это значит — точно атака, баним всерьёз.
@@ -3299,6 +3321,9 @@ $MANUAL_WHITELIST_V4_INIT
     counter conn_flood_v4 { }     # ct count > 400 на src (v3.12.0: CGNAT-friendly)
     counter newconn_flood_v4 { }  # >50 new conn/min на src
     counter tcp_invalid { }       # invalid TCP flag combos
+    # v3.21.0: SSH pre-auth flood counters
+    counter ssh_conn_flood_v4 { }     # ct count > 5 на src для SSH-порта
+    counter ssh_newconn_flood_v4 { }  # > 10 new conn/min на src для SSH-порта
 
     chain prerouting {
         # v3.18.1: priority динамический ($SHIELD_PREROUTING_PRIO).
@@ -3313,9 +3338,8 @@ $MANUAL_WHITELIST_V4_INIT
         # Manual whitelist (всегда первым приоритетом)
         ip saddr @manual_whitelist_v4 accept
 
-        # SSH — без блокировок (защищает CrowdSec)
-        # v3.10.2: поддержка нескольких SSH-портов (e.g. миграция 22 → 2222)
-        tcp dport { $SSH_PORTS_NFT } accept
+        # SSH защита перенесена ниже scanner_blocklist для эффективности
+        # (см. блок === SSH PRE-AUTH FLOOD PROTECTION ===).
 
 $FIB_ANTISPOOF_RULE
 
@@ -3382,6 +3406,9 @@ $FIB_ANTISPOOF_RULE
             counter name scanner_drops_v4 drop
         ip saddr @scanner_blocklist_v4 counter name scanner_drops_v4 drop
 
+        # SSH защита перемещена ниже tor_blocklist drop (v3.21.1)
+        # См. блок === SSH PRE-AUTH FLOOD PROTECTION ===
+
         # === v3.11: Tor exit blocklist drop ===
         # Set заполняется только если оператор активировал BLOCK_TOR=1.
         # Иначе set пустой, эти 2 правила — no-op (overhead близок к нулю,
@@ -3391,6 +3418,38 @@ $FIB_ANTISPOOF_RULE
             log prefix "[shield:tor] " level info flags ip options \\
             counter name tor_drops_v4 drop
         ip saddr @tor_exit_blocklist_v4 counter name tor_drops_v4 drop
+
+        # === SSH PRE-AUTH FLOOD PROTECTION (v3.21.0, перемещён в v3.21.1) ===
+        # v3.10.2: поддержка нескольких SSH-портов (e.g. миграция 22 → 2222)
+        # До v3.21.0: SSH-порт полностью accept'ился, защита делегировалась
+        # CrowdSec'у (парсит auth.log → банит за failed login). Дыра: pre-auth
+        # TCP flood (100+ соединений до stage auth) проходил мимо защиты.
+        # v3.21.0: добавлены rate-limits на SSH с RELAXED-лимитами:
+        #   - max 5 одновременных соединений с одного IP
+        #   - max 10 новых соединений за минуту с одного IP
+        # Легитимный админ: 1-3 коннекта на сессию (далеко от лимитов).
+        # Атакующий: 50+ pre-auth handshake → дропается на kernel-level.
+        # Whitelist (manual_whitelist_v4 в начале) обходит ВСЁ — mgmt IP
+        # точно не пострадают. CrowdSec продолжает работать поверх для
+        # auth-level банов.
+        # ВАЖНО для CI/CD: если используешь ansible (50+ хостов), GitLab runner,
+        # массовый deploy через ssh из одного IP — добавь этот IP в whitelist:
+        #   nft add element inet ddos_protect manual_whitelist_v4 { 1.2.3.4 }
+        # Иначе массовое переподключение может попасть под лимит.
+        # v3.21.1: блок ПЕРЕМЕЩЁН после scanner/tor/threat blocklist drops.
+        # Причина: до v3.21.1 'tcp dport SSH accept' стоял после whitelist,
+        # но до tor_blocklist → Tor exit nodes могли подключаться к SSH
+        # даже при BLOCK_TOR=1. Теперь все blocklist'ы дропают раньше,
+        # SSH-rate-limit работает только на оставшийся "чистый" трафик.
+        # NB: ssh_connlimit_v4 без timeout — conntrack чистит сам (как у connlimit_v4).
+        tcp dport { $SSH_PORTS_NFT } ct state new \\
+            add @ssh_connlimit_v4 { ip saddr ct count over 5 } \\
+            counter name ssh_conn_flood_v4 drop
+        tcp dport { $SSH_PORTS_NFT } ct state new \\
+            add @ssh_newconn_rate_v4 { ip saddr limit rate over 10/minute burst 15 packets } \\
+            counter name ssh_newconn_flood_v4 drop
+        # Прошёл все blocklist'ы и оба лимита — пропускаем дальше к sshd.
+        tcp dport { $SSH_PORTS_NFT } accept
 
         # === v2.5: BAN-ONCE АРХИТЕКТУРА ===
         # Двухэтапная проверка перед баном — снижает ложные баны CGNAT/мобильных.
@@ -6502,6 +6561,9 @@ collect_stats() {
     read CONN_FLOOD_PKTS_V4 CONN_FLOOD_BYTES_V4 <<< "$(read_counter conn_flood_v4)"
     read NEWCONN_FLOOD_PKTS_V4 NEWCONN_FLOOD_BYTES_V4 <<< "$(read_counter newconn_flood_v4)"
     read TCP_INVALID_PKTS TCP_INVALID_BYTES <<< "$(read_counter tcp_invalid)"
+    # v3.21.0: SSH pre-auth flood counters
+    read SSH_CONN_FLOOD_PKTS_V4 SSH_CONN_FLOOD_BYTES_V4 <<< "$(read_counter ssh_conn_flood_v4)"
+    read SSH_NEWCONN_FLOOD_PKTS_V4 SSH_NEWCONN_FLOOD_BYTES_V4 <<< "$(read_counter ssh_newconn_flood_v4)"
 
     # v3.11: размер tor blocklist set'а
     TOR_SET_SIZE=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | \
@@ -6754,8 +6816,8 @@ draw_snapshot() {
     fi
 
     # ===== TODAY (drops / bytes) =====
-    local total_pkts=$((SCANNER_PKTS_V4 + TOR_PKTS_V4 + THREAT_PKTS_V4 + CUSTOM_PKTS_V4 + CONFIRMED_PKTS_V4 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4 + CONN_FLOOD_PKTS_V4 + NEWCONN_FLOOD_PKTS_V4 + TCP_INVALID_PKTS))
-    local total_bytes=$((SCANNER_BYTES_V4 + TOR_BYTES_V4 + THREAT_BYTES_V4 + CUSTOM_BYTES_V4 + CONFIRMED_BYTES_V4 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4 + CONN_FLOOD_BYTES_V4 + NEWCONN_FLOOD_BYTES_V4 + TCP_INVALID_BYTES))
+    local total_pkts=$((SCANNER_PKTS_V4 + TOR_PKTS_V4 + THREAT_PKTS_V4 + CUSTOM_PKTS_V4 + CONFIRMED_PKTS_V4 + SYN_CONF_PKTS_V4 + UDP_CONF_PKTS_V4 + CONN_FLOOD_PKTS_V4 + NEWCONN_FLOOD_PKTS_V4 + TCP_INVALID_PKTS + SSH_CONN_FLOOD_PKTS_V4 + SSH_NEWCONN_FLOOD_PKTS_V4))
+    local total_bytes=$((SCANNER_BYTES_V4 + TOR_BYTES_V4 + THREAT_BYTES_V4 + CUSTOM_BYTES_V4 + CONFIRMED_BYTES_V4 + SYN_CONF_BYTES_V4 + UDP_CONF_BYTES_V4 + CONN_FLOOD_BYTES_V4 + NEWCONN_FLOOD_BYTES_V4 + TCP_INVALID_BYTES + SSH_CONN_FLOOD_BYTES_V4 + SSH_NEWCONN_FLOOD_BYTES_V4))
 
     echo -e "  ${B}Drops since reboot${N} ${DIM}($NFT_SINCE)${N}"
     printf  "  ├─ ${DIM}scanner${N}             %12s pkts  ${DIM}/${N} %s\n" "$(human_num "$SCANNER_PKTS_V4")" "$(human_bytes "$SCANNER_BYTES_V4")"
@@ -6773,6 +6835,8 @@ draw_snapshot() {
     printf  "  ├─ ${DIM}rate-limit (udp)${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$UDP_CONF_PKTS_V4")" "$(human_bytes "$UDP_CONF_BYTES_V4")"
     printf  "  ├─ ${DIM}conn-flood (ct>5000)${N} %11s pkts  ${DIM}/${N} %s\n"   "$(human_num "$CONN_FLOOD_PKTS_V4")" "$(human_bytes "$CONN_FLOOD_BYTES_V4")"
     printf  "  ├─ ${DIM}new-conn flood${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$NEWCONN_FLOOD_BYTES_V4")"
+    printf  "  ├─ ${DIM}ssh conn-flood${N}      %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SSH_CONN_FLOOD_PKTS_V4")" "$(human_bytes "$SSH_CONN_FLOOD_BYTES_V4")"
+    printf  "  ├─ ${DIM}ssh new-conn flood${N}  %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$SSH_NEWCONN_FLOOD_PKTS_V4")" "$(human_bytes "$SSH_NEWCONN_FLOOD_BYTES_V4")"
     printf  "  ├─ ${DIM}TCP flag invalid${N}    %12s pkts  ${DIM}/${N} %s\n"   "$(human_num "$TCP_INVALID_PKTS")" "$(human_bytes "$TCP_INVALID_BYTES")"
     printf  "  └─ ${B}total${N}               ${B}%12s${N} pkts  ${DIM}/${N} ${B}%s${N}\n" "$(human_num "$total_pkts")" "$(human_bytes "$total_bytes")"
     echo ""
@@ -7509,6 +7573,8 @@ if [ "$MODE" = "json" ]; then
     "udp_confirmed_v4_packets": $UDP_CONF_PKTS_V4,
     "conn_flood_v4_packets": $CONN_FLOOD_PKTS_V4,
     "newconn_flood_v4_packets": $NEWCONN_FLOOD_PKTS_V4,
+    "ssh_conn_flood_v4_packets": $SSH_CONN_FLOOD_PKTS_V4,
+    "ssh_newconn_flood_v4_packets": $SSH_NEWCONN_FLOOD_PKTS_V4,
     "tcp_invalid_packets": $TCP_INVALID_PKTS
   },
   "last_blocklist_update": "$LAST_UPDATE"
