@@ -1,6 +1,24 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.21.5.1 (Commercial Edition) — HOTFIX
+#  v3.21.5.1: Косметические багфиксы установщика.
+#
+#           1) Backticks в комментариях внутри unquoted heredoc nft конфига
+#              интерпретировались bash как command substitution. Строки вида
+#              "# (`tcp dport SSH accept`)" приводили к попытке выполнить
+#              `tcp dport SSH accept` как команду → 'tcp: command not found'
+#              дважды во время установки. Защита работала (это были комментарии,
+#              nft их игнорирует), но stderr был засорён.
+#              FIX: заменил backticks на одинарные кавычки в двух комментариях.
+#
+#           2) sqlite3 PRAGMA journal_mode=WAL; возвращает 'wal' в stdout.
+#              Это попадало в вывод установщика отдельной строкой между
+#              "✔ Weekly cleanup timer:" и "✔ БД создана:". Косметика.
+#              FIX: добавил >/dev/null к sqlite3-команде инициализации БД.
+#
+#           Защита/функциональность v3.21.5 без изменений. Только install UX.
+#
 #  VPN NODE DDoS PROTECTION v3.21.5 (Commercial Edition) — INFRASTRUCTURE BYPASS
 #  v3.21.5: Защита от ложных банов критической интернет-инфраструктуры.
 #
@@ -1638,7 +1656,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.21.5"
+SHIELDNODE_VERSION="3.21.5.1"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -3741,7 +3759,7 @@ $XRAY_PORTS_UDP_INIT
 
     # v3.21.0: SSH-СПЕЦИФИЧНЫЕ сеты для pre-auth flood защиты.
     # ПРОБЛЕМА: SSH-порт ранее был полностью исключён из prerouting
-    # (`tcp dport SSH accept`), а защита делегировалась CrowdSec'у через
+    # ("tcp dport SSH accept"), а защита делегировалась CrowdSec'у через
     # auth.log. Это создавало дыру: атакующий мог открыть 100 параллельных
     # TCP-соединений до sshd, упереться в MaxStartups (sshd dropping pre-auth),
     # но softirq уже сожрал CPU на handshake. CrowdSec не видел повода банить
@@ -4138,8 +4156,8 @@ $FIB_ANTISPOOF_RULE
     }
 
     # === v3.20.5: MSS clamping moved to vpn-node-setup (ШАГ 7.8) ===
-    # Раньше shieldnode делал MSS clamp на forward hook (`tcp option maxseg
-    # size set rt mtu`). Теперь этим владеет vpn-node-setup
+    # Раньше shieldnode делал MSS clamp на forward hook ("tcp option maxseg
+    # size set rt mtu"). Теперь этим владеет vpn-node-setup
     # (table inet vpn_node_mss_clamp, hook forward priority -150).
     # Удалено отсюда чтобы избежать двойного clamp'а в netfilter pipeline.
     # Если vpn-node-setup на ноде НЕ установлен — MSS clamp не делается
@@ -6423,7 +6441,8 @@ systemctl enable --now shieldnode-cleanup.timer >/dev/null 2>&1
 print_ok "Weekly cleanup timer: shieldnode-cleanup.timer (old backups + ASN cache)"
 
 # Инициализируем БД
-sqlite3 "$DB_FILE" <<'SQL_EOF'
+# v3.21.5 fix: вывод sqlite (PRAGMA journal_mode возвращает 'wal' в stdout) — глушим
+sqlite3 "$DB_FILE" <<'SQL_EOF' >/dev/null
 -- v3.10.2: WAL mode позволяет concurrent reads (guard) + write (aggregator)
 -- без блокировок. synchronous=NORMAL — приемлемый trade-off (риск потерять
 -- последний commit при power-loss, но не corrupt'ить БД).
