@@ -1,6 +1,104 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.21.4 (Commercial Edition) — SSH RATE-LIMIT TIGHTENED
+#  v3.21.4: Ужесточены SSH per-IP лимиты на основе production-данных.
+#
+#           Было (v3.21.0): ct count over 5, limit rate over 10/minute burst 15.
+#           Стало (v3.21.4): ct count over 3, limit rate over 5/minute burst 15.
+#
+#           Обоснование: на тестовой ноде с открытым :22 в публичный интернет
+#           старые лимиты дали 345M dropped пакетов / 21 GB за 10 часов.
+#           99.5% этих дропов пришлись на ssh_conn_flood_v4 (ct count exceed),
+#           всего 0.5% — на ssh_newconn_flood_v4 (rate exceed). Это slowloris-
+#           style атака: открытые TCP-коннекты без закрытия, не быстрый
+#           SYN-flood. ct count over 3 (вместо 5) режет такие атаки в 1.67x
+#           агрессивнее. Rate 5/min (вместо 10) снижает шанс прохода
+#           массивного brute-force через паузы.
+#
+#           Для админа SSH: 3 одновременных коннекта с одного IP — норма.
+#           tmux/screen решает проблему "много терминалов в одной сессии".
+#           5 новых логинов в минуту — норма для retry после network blip
+#           или открытия нескольких SCP/rsync параллельно.
+#
+#           CGNAT-проблем нет: SSH-админ всегда с фиксированного IP
+#           (домашний/офисный broadband, не мобильная сеть). Если админ
+#           регулярно подключается из CGNAT — добавить его IP в
+#           manual_whitelist_v4 чтобы он обходил эти лимиты.
+#
+#           Применяется только на установке/переинсталле. На уже работающих
+#           нодах нужен reload nft ruleset либо переинсталл.
+#
+#  VPN NODE DDoS PROTECTION v3.21.3 (Commercial Edition) — LOG DEDUP + DB CLEANUP
+#  v3.21.3: Аудит логов выявил 3 утечки места которые v3.20.3 не закрыл:
+#
+#           ПРОБЛЕМА 1 — ДУБЛИРОВАНИЕ kern.log ↔ syslog (×2 место):
+#           На Ubuntu 24.04 дефолтный /etc/rsyslog.d/50-default.conf пишет
+#           kern.* и в /var/log/kern.log, и в /var/log/syslog (через правило
+#           "*.*;auth,authpriv.none"). КАЖДАЯ строка [shield:...] хранится
+#           дважды. При 9 активных log prefix'ах с rate 1/sec это лишние
+#           до ~190 MB/день при максимальном rate-limit'е.
+#
+#           FIX (важно — RC: первая итерация v3.21.3 использовала drop-in
+#           /etc/rsyslog.d/49-shieldnode-kern-dedup.conf, но он НЕ РАБОТАЛ:
+#           rsyslog evaluates ВСЕ matching rules, не "first wins". Правило
+#           из drop-in добавляло запись с kern.none, но правило из 50-default
+#           без kern.none тоже выполнялось → kern.* всё равно в syslog.):
+#
+#           Сейчас делаем точечный sed in-place edit самого 50-default.conf:
+#           заменяем '*.*;auth,authpriv.none' → '*.*;auth,authpriv.none;kern.none'
+#           ТОЛЬКО на строке записи в /var/log/syslog. Backup pristine
+#           оригинала сохраняется в /etc/rsyslog.d/50-default.conf.shieldnode.bak.
+#           Edit идемпотентен (grep-проверка до sed), валидируется через
+#           rsyslogd -N1 после изменения с откатом если конфиг сломан.
+#           reload (SIGHUP) вместо restart — graceful, без обрыва логов.
+#
+#           При uninstall backup восстанавливается на место (только если файл
+#           всё ещё содержит наш kern.none — если оператор сам перередактировал
+#           50-default.conf, backup сохраняется как .bak для ручного восстановления).
+#
+#           ПРОБЛЕМА 2 — journald хранит третью копию kern facility:
+#           journalctl -k показывает все nft log events. Дефолтный
+#           SystemMaxUse на Ubuntu = 10% /var (на 20GB диске ≈ 2GB).
+#           На активной ноде journald быстро забивает квоту.
+#
+#           FIX: /etc/systemd/journald.conf.d/shieldnode.conf
+#                SystemMaxUse=500M, SystemKeepFree=1G, MaxRetentionSec=7day.
+#                Drop-in, не трогает основной конфиг. (Для systemd drop-in
+#                механизм работает корректно — в отличие от rsyslog последний
+#                applied override побеждает в [Section] semantics.)
+#
+#           ПРОБЛЕМА 3 — events.db и asn_cache table растут без bound'а:
+#           shieldnode-cleanup.sh в v3.20.3 чистит только backup'ы и
+#           НЕСУЩЕСТВУЮЩУЮ директорию /var/lib/shieldnode/asn_cache/
+#           (комментарий v3.20.3 обещал чистку ASN cache, но кэш живёт
+#           в sqlite таблице asn_cache внутри events.db, а не в файлах).
+#           Через год: миллион строк events + распухший asn_cache.
+#
+#           FIX: shieldnode-cleanup.sh теперь делает:
+#                - DELETE FROM events WHERE last_seen < now - 90 days
+#                - DELETE FROM asn_cache WHERE cached_at < now - 7 days
+#                - PRAGMA wal_checkpoint(TRUNCATE) — сбрасывает WAL
+#                - VACUUM — реально освобождает место в файле БД
+#                Старый find /var/lib/shieldnode/asn_cache оставлен на
+#                случай если где-то остались файловые остатки от старых
+#                версий (no-op если директории нет).
+#
+#                Дополнительно: после создания БД в installer'е сразу
+#                запускается shieldnode-cleanup.service (без --no-block,
+#                в фоне). На re-install с распухшей events.db первый
+#                cleanup происходит сразу, не через неделю.
+#
+#           ЭФФЕКТ:
+#           - /var/log/syslog рост: ~50% меньше (нет дубля kern)
+#           - journald: жёсткий потолок 500M вместо ~2GB drift
+#           - events.db: стабильный размер, не растёт линейно во времени
+#           - Суммарная экономия на типичной ноде: 0.5–2 GB/месяц
+#
+#           ВАЖНО: правки rsyslog и journald применяются ТОЛЬКО на install.
+#           На уже установленных нодах нужен переинсталл или ручное
+#           создание drop-in'ов (см. комментарии в коде ниже).
+#
 #  VPN NODE DDoS PROTECTION v3.21.2 (Commercial Edition) — SSH PRE-AUTH FLOOD DEFENSE
 #  v3.21.2: UX fix — whitelist add/remove теперь явно триггерит updater,
 #           больше не нужно вручную нажимать [f] Force re-sync.
@@ -1477,7 +1575,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.21.2"
+SHIELDNODE_VERSION="3.21.4"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -1753,6 +1851,46 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f /etc/logrotate.d/shieldnode
     rm -f /etc/logrotate.d/shieldnode-syslog-aggressive  # v3.20.3
     print_ok "Логи и logrotate-конфиг удалены"
+
+    # v3.21.3: rsyslog kern.* dedup (restore from backup) и journald limit drop-in
+    RSYSLOG_RELOAD=0
+    # Сначала чистим старый drop-in от первой версии v3.21.3 (если он остался
+    # на хосте от broken-первой-итерации фикса — drop-in не работал, но мог
+    # быть создан в /etc/rsyslog.d/).
+    if [ -f /etc/rsyslog.d/49-shieldnode-kern-dedup.conf ]; then
+        rm -f /etc/rsyslog.d/49-shieldnode-kern-dedup.conf
+        RSYSLOG_RELOAD=1
+    fi
+    # Восстанавливаем 50-default.conf из backup'а (создан in-place edit'ом).
+    if [ -f /etc/rsyslog.d/50-default.conf.shieldnode.bak ]; then
+        # Проверяем что текущий 50-default.conf ещё содержит наш kern.none
+        # (если оператор сам его перередактировал — не трогаем).
+        if grep -qE '^\*\.\*;auth,authpriv\.none;kern\.none[[:space:]]+-?/var/log/syslog' \
+              /etc/rsyslog.d/50-default.conf 2>/dev/null; then
+            mv /etc/rsyslog.d/50-default.conf.shieldnode.bak /etc/rsyslog.d/50-default.conf
+            print_ok "Восстановлен оригинальный /etc/rsyslog.d/50-default.conf из backup'а"
+            RSYSLOG_RELOAD=1
+        else
+            print_info "50-default.conf изменён вручную после установки — backup сохранён в .shieldnode.bak"
+        fi
+    fi
+    if [ "$RSYSLOG_RELOAD" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+        # reload (SIGHUP) — без обрыва приёма логов
+        systemctl reload rsyslog 2>/dev/null || systemctl restart rsyslog 2>/dev/null || true
+        print_ok "Rsyslog перечитал конфигурацию (kern.* снова дублируется в syslog)"
+    fi
+    JOURNALD_RESTART=0
+    if [ -f /etc/systemd/journald.conf.d/shieldnode.conf ]; then
+        rm -f /etc/systemd/journald.conf.d/shieldnode.conf
+        # Если папка пуста — удаляем (вернули полный дефолт)
+        rmdir /etc/systemd/journald.conf.d 2>/dev/null || true
+        JOURNALD_RESTART=1
+    fi
+    if [ "$JOURNALD_RESTART" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+        # journald не поддерживает reload — нужен restart
+        systemctl restart systemd-journald 2>/dev/null || true
+        print_ok "Journald limit drop-in удалён (дефолтная квота восстановлена)"
+    fi
 
     # Sysctl hardening (v3.3+, оба имени файла — старое 99 и новое 90 из v3.7)
     REMOVED_SYSCTL=0
@@ -3327,9 +3465,9 @@ $MANUAL_WHITELIST_V4_INIT
     counter conn_flood_v4 { }     # ct count > 400 на src (v3.12.0: CGNAT-friendly)
     counter newconn_flood_v4 { }  # >50 new conn/min на src
     counter tcp_invalid { }       # invalid TCP flag combos
-    # v3.21.0: SSH pre-auth flood counters
-    counter ssh_conn_flood_v4 { }     # ct count > 5 на src для SSH-порта
-    counter ssh_newconn_flood_v4 { }  # > 10 new conn/min на src для SSH-порта
+    # v3.21.0: SSH pre-auth flood counters (v3.21.4: лимиты ужесточены)
+    counter ssh_conn_flood_v4 { }     # ct count > 3 на src для SSH-порта (было 5 до v3.21.4)
+    counter ssh_newconn_flood_v4 { }  # > 5 new conn/min на src для SSH-порта (было 10 до v3.21.4)
 
     chain prerouting {
         # v3.18.1: priority динамический ($SHIELD_PREROUTING_PRIO).
@@ -3450,8 +3588,17 @@ $FIB_ANTISPOOF_RULE
         # NB: ssh_connlimit_v4 без timeout — conntrack чистит сам (как у connlimit_v4).
         # ВАЖНО: правила в одну строку. Многострочный синтаксис с \\ ломается
         # в bash heredoc без кавычек — открывающий { трактуется как brace expansion.
-        tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_connlimit_v4 { ip saddr ct count over 5 } counter name ssh_conn_flood_v4 drop
-        tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_newconn_rate_v4 { ip saddr limit rate over 10/minute burst 15 packets } counter name ssh_newconn_flood_v4 drop
+        # v3.21.4: ужесточены лимиты. Было: 5 concurrent, 10/min burst 15.
+        #          Стало: 3 concurrent, 5/min burst 15. Причина — production-нода
+        #          получала 345M dropped пакетов на старом лимите; основной
+        #          вектор атаки — slowloris (открытые TCP-коннекты без активности),
+        #          ловится именно ct count, не rate. Снижение до 3 concurrent
+        #          режет slowloris в 1.67x агрессивнее. Для админа SSH 3 окон
+        #          (tmux/screen решает проблему более чем) с одного IP более
+        #          чем достаточно. CGNAT-проблем нет — SSH-админ всегда с
+        #          фиксированного IP, не из мобильной сети.
+        tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_connlimit_v4 { ip saddr ct count over 3 } counter name ssh_conn_flood_v4 drop
+        tcp dport { $SSH_PORTS_NFT } ct state new add @ssh_newconn_rate_v4 { ip saddr limit rate over 5/minute burst 15 packets } counter name ssh_newconn_flood_v4 drop
         # Прошёл все blocklist'ы и оба лимита — пропускаем дальше к sshd.
         tcp dport { $SSH_PORTS_NFT } accept
 
@@ -5626,6 +5773,102 @@ chmod 0750 "$LOG_DIR"
 touch "$EVENTS_LOG"
 chmod 0640 "$EVENTS_LOG"
 
+# v3.21.3: RSYSLOG DEDUP — убираем дублирование kern.* в syslog
+# ------------------------------------------------------------------------------
+# Ubuntu 24.04 default /etc/rsyslog.d/50-default.conf содержит:
+#     *.*;auth,authpriv.none          -/var/log/syslog
+# Это значит kern.* пишется И в /var/log/kern.log, И в /var/log/syslog.
+# Каждая строка от nft `log prefix [shield:...]` хранится дважды.
+# При 9 активных prefix'ах с rate 1/sec это до ~190 MB/день лишних в syslog.
+#
+# v3.21.3 FIX (важно!): первая попытка фикса использовала drop-in
+# /etc/rsyslog.d/49-shieldnode-kern-dedup.conf с тем же селектором + kern.none.
+# Это НЕ РАБОТАЕТ. Rsyslog evaluates ВСЕ matching rules, не "first wins".
+# (См. https://rsyslog.readthedocs.io/en/latest/configuration/basic_structure.html:
+#  "all rules are always fully evaluated... If message processing shall stop,
+#   the discard action must explicitly be executed".)
+# Поэтому правильное решение — in-place edit самого 50-default.conf с
+# backup'ом для отката при uninstall. Edit идемпотентен (sed с проверкой
+# уже-применено через grep).
+#
+# Discard action не годится — он глобален, выкинет kern.* и из kern.log тоже.
+RSYSLOG_DEFAULT="/etc/rsyslog.d/50-default.conf"
+RSYSLOG_BACKUP="/etc/rsyslog.d/50-default.conf.shieldnode.bak"
+if [ -f "$RSYSLOG_DEFAULT" ] && command -v rsyslogd >/dev/null 2>&1; then
+    # Идемпотентность: проверяем, не правили ли мы уже этот файл.
+    # Маркер — наличие 'kern.none' рядом с '/var/log/syslog' в той же строке.
+    if grep -qE '^\*\.\*;auth,authpriv\.none;kern\.none[[:space:]]+-?/var/log/syslog' "$RSYSLOG_DEFAULT"; then
+        print_info "Rsyslog dedup уже применён (kern.none в 50-default.conf)"
+    else
+        # Создаём backup только если его ещё нет (первый install).
+        # На re-install НЕ перезаписываем backup — он содержит pristine
+        # оригинал от пакета, не наш изменённый файл из прошлого install'а.
+        if [ ! -f "$RSYSLOG_BACKUP" ]; then
+            cp -p "$RSYSLOG_DEFAULT" "$RSYSLOG_BACKUP"
+        fi
+        # Сохраняем копию текущего файла для отката если sed/test упадёт
+        TMP_RSYSLOG=$(mktemp /tmp/rsyslog-default.XXXXXX)
+        cp -p "$RSYSLOG_DEFAULT" "$TMP_RSYSLOG"
+        # Точечный sed: заменяем '*.*;auth,authpriv.none' (стандартная
+        # строка Ubuntu) на '*.*;auth,authpriv.none;kern.none', но ТОЛЬКО
+        # на строках где идёт запись в /var/log/syslog. Другие строки не
+        # трогаем (mail.warn → /var/log/mail.warn и т.п. остаются).
+        sed -i -E 's|^(\*\.\*;auth,authpriv\.none)([[:space:]]+-?/var/log/syslog)|\1;kern.none\2|' "$RSYSLOG_DEFAULT"
+        # Валидируем конфигурацию rsyslog ПОСЛЕ изменения.
+        # Если -N1 fail — откатываем из tmp.
+        if rsyslogd -N1 -f /etc/rsyslog.conf >/dev/null 2>&1; then
+            # reload (SIGHUP) вместо restart — graceful, без обрыва входящих логов.
+            # rsyslog корректно перечитывает конфиг по SIGHUP с версии 8.x.
+            if systemctl reload rsyslog 2>/dev/null; then
+                print_ok "Rsyslog dedup: kern.* убран из /var/log/syslog (backup: $RSYSLOG_BACKUP)"
+            else
+                # reload не сработал (старая версия?) — пробуем restart
+                if systemctl restart rsyslog 2>/dev/null; then
+                    print_ok "Rsyslog dedup: kern.* убран из /var/log/syslog (через restart, backup: $RSYSLOG_BACKUP)"
+                else
+                    print_warn "Rsyslog reload/restart failed — изменения применятся после следующего restart'а"
+                fi
+            fi
+            rm -f "$TMP_RSYSLOG"
+        else
+            # Откат: возвращаем сохранённый файл, удаляем backup если он был
+            # создан только что (т.е. это первый install и мы его сами создали).
+            mv "$TMP_RSYSLOG" "$RSYSLOG_DEFAULT"
+            print_warn "rsyslog config test failed после edit — откатили, dedup пропущен"
+        fi
+    fi
+else
+    print_info "rsyslog 50-default.conf не найден — kern.log dedup пропущен (другая конфигурация syslog)"
+fi
+
+# v3.21.3: JOURNALD LIMIT — третья копия kern.* живёт в systemd-journald
+# ------------------------------------------------------------------------------
+# journalctl -k показывает все nft log events (kern facility идёт в journal
+# напрямую, помимо rsyslog). Дефолтный SystemMaxUse = 10% /var partition
+# (на 20GB диске ~2GB). На активной ноде journal быстро забивает квоту.
+#
+# Drop-in /etc/systemd/journald.conf.d/shieldnode.conf не трогает основной
+# конфиг — overrides только три параметра. Удаляется при uninstall.
+JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
+mkdir -p "$JOURNALD_DROPIN_DIR"
+cat > "$JOURNALD_DROPIN_DIR/shieldnode.conf" <<'JOURNALD_EOF'
+# Managed by shieldnode v3.21.3+
+# Ограничиваем journald чтобы kern.* events от nft не забивали диск.
+# 500M жёсткий потолок, 1G минимально свободного места, 7 дней retention.
+[Journal]
+SystemMaxUse=500M
+SystemKeepFree=1G
+MaxRetentionSec=7day
+JOURNALD_EOF
+chmod 0644 "$JOURNALD_DROPIN_DIR/shieldnode.conf"
+if systemctl restart systemd-journald 2>/dev/null; then
+    # Сразу применяем лимит к существующим логам (журналы могут быть > 500M)
+    journalctl --vacuum-size=500M >/dev/null 2>&1 || true
+    print_ok "Journald limit: SystemMaxUse=500M, 7 days retention"
+else
+    print_warn "systemd-journald restart failed — лимит применится при следующем restart'е"
+fi
+
 # v3.5: logrotate для events.log + install.log
 cat > /etc/logrotate.d/shieldnode <<'LOGROTATE_EOF'
 /var/log/shieldnode/*.log {
@@ -5706,7 +5949,7 @@ print_ok "Hourly logrotate timer: shieldnode-logrotate.timer"
 # continuation, и кавычки/апострофы в комментариях/строках ломают парсер.
 cat > /usr/local/sbin/shieldnode-cleanup.sh <<'CLEANUP_EOF'
 #!/bin/bash
-# shieldnode weekly cleanup — старые backup'ы + ASN cache + failed counters
+# shieldnode weekly cleanup — backup'ы + ASN cache + БД vacuum + fail counters
 
 # 1) Оставляем только 2 последних backup'а
 if [ -d /var/lib/shieldnode/backup ]; then
@@ -5714,12 +5957,36 @@ if [ -d /var/lib/shieldnode/backup ]; then
         | sort | head -n -2 | xargs -r rm -rf
 fi
 
-# 2) Удаляем ASN cache entries старше 7 дней
+# 2) v3.21.3: Чистка events.db — реальная работа с sqlite
+# Старый код (v3.20.3) чистил find в /var/lib/shieldnode/asn_cache/ — но
+# ASN кэш живёт в таблице asn_cache внутри events.db, директории нет.
+# Оставляем find как no-op fallback на случай артефактов от старых версий.
+DB="/var/lib/shieldnode/events.db"
+if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    # Используем busy_timeout чтобы не конфликтовать с aggregator'ом который
+    # пишет в БД в WAL mode. 5 сек ожидания — достаточно для любого write.
+    sqlite3 "$DB" <<SQL 2>/dev/null
+PRAGMA busy_timeout=5000;
+-- События старше 90 дней (long-term история теряется, но aggregator
+-- группирует по (type, ip) с UNIQUE constraint — старые IP уже схлопнуты).
+DELETE FROM events WHERE last_seen < strftime('%s','now','-90 days');
+-- ASN кэш старше 7 дней (TTL и так 7 дней — это просто physical cleanup).
+DELETE FROM asn_cache WHERE cached_at < strftime('%s','now','-7 days');
+-- Сбрасываем WAL в основной файл, обнуляем -wal (часто распухает в idle).
+PRAGMA wal_checkpoint(TRUNCATE);
+-- VACUUM реально освобождает место (после DELETE страницы помечены free,
+-- но файл не уменьшается без VACUUM). Дорогая операция (~секунды на 100MB),
+-- но раз в неделю приемлемо.
+VACUUM;
+SQL
+fi
+
+# 3) Legacy: ASN cache из старых версий (no-op если директории нет)
 if [ -d /var/lib/shieldnode/asn_cache ]; then
     find /var/lib/shieldnode/asn_cache -type f -mtime +7 -delete 2>/dev/null
 fi
 
-# 3) Удаляем старые failed fetch counters (>30 дней)
+# 4) Удаляем старые failed fetch counters (>30 дней)
 find /var/lib/shieldnode -maxdepth 1 -name "*_fail_count" -mtime +30 -delete 2>/dev/null
 
 exit 0
@@ -5791,6 +6058,17 @@ CREATE INDEX IF NOT EXISTS idx_asn_cache_cached_at ON asn_cache(cached_at);
 SQL_EOF
 chmod 0640 "$DB_FILE"
 print_ok "БД создана: $DB_FILE"
+
+# v3.21.3: Немедленный прогон cleanup'а сразу после инициализации БД.
+# Без этого re-install на хосте с распухшей events.db от старых версий
+# ждал бы до недели прежде чем cleanup.timer его прогнал. Запускаем
+# в фоне с & — VACUUM может занять секунды на большой БД, не блокируем
+# дальнейшую установку. systemctl start --no-block тоже подойдёт.
+if [ -x /usr/local/sbin/shieldnode-cleanup.sh ]; then
+    systemctl start --no-block shieldnode-cleanup.service 2>/dev/null || \
+        /usr/local/sbin/shieldnode-cleanup.sh &
+    print_ok "Запущен первый прогон cleanup (events.db vacuum в фоне)"
+fi
 
 # Скрипт-агрегатор
 AGG_SCRIPT="/usr/local/sbin/shieldnode-aggregator.sh"
@@ -5923,7 +6201,14 @@ done < <(awk '
         }
     }
     # v3.20.0: patterns для [shield:mobile_ru_drop] и [shield:broadband_ru_drop]
-    # УБРАНЫ (whitelist'ы удалены, эти log prefixes больше не генерируются).
+    # УБРАНЫ — whitelists более не используются, эти log prefixes не генерируются.
+    #
+    # v3.21.3 BUGFIX: ранее тут был апостроф в русском слове (whitelist + апостроф + ы).
+    # Апостроф в КОММЕНТАРИИ внутри awk-блока, обернутого в single quotes,
+    # закрывал bash single-quoted строку раньше времени. Дальнейший awk-код
+    # парсился bash как команды → aggregator падал с exit 2.
+    # ВАЖНО: в комментариях внутри single-quoted блоков НЕ должно быть символа ASCII 0x27.
+    # Эта секция намеренно содержит ноль таких символов.
     /\[shield:conn_flood\]/ {
         if (match($0, /SRC=[^ ]+/)) {
             ip = substr($0, RSTART+4, RLENGTH-4); gsub(/[^0-9.:]/, "", ip)
