@@ -36,7 +36,6 @@
 45.156.87.0/24	# 1 attacker(s)
 45.198.224.0/24	# 2 attacker(s)
 45.205.1.0/24	# 2 attacker(s)
-46.163.141.0/24	# 1 attacker(s)
 46.175.25.0/24	# 1 attacker(s)
 46.188.124.0/24	# 1 attacker(s)
 46.242.15.0/24	# 1 attacker(s)
