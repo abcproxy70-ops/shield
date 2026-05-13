@@ -1,6 +1,18 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.21.5.2 (Commercial Edition) — HOTFIX
+#  v3.21.5.2: Добавлен Google 192.178.0.0/16 в infrastructure_v4 baseline.
+#
+#           Найдено в production-данных: events.db содержала 192.178.183.95
+#           и 192.178.25.74 как "атакующие" — это YouTube thumbnails / Google
+#           user content. Не покрывались v3.21.5 baseline (там были 142.250/15,
+#           142.251/16, 216.58/19, etc — но не 192.178/16).
+#
+#           Без фикса: при автогенерации custom.txt из топ-атакующих эти Google
+#           IP могли случайно попасть в blocklist → клиенты VPN получили бы
+#           проблемы с YouTube/Google services.
+#
 #  VPN NODE DDoS PROTECTION v3.21.5.1 (Commercial Edition) — HOTFIX
 #  v3.21.5.1: Косметические багфиксы установщика.
 #
@@ -1656,7 +1668,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.21.5.1"
+SHIELDNODE_VERSION="3.21.5.2"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -3249,6 +3261,7 @@ INFRASTRUCTURE_V4_CIDR=$(cat <<'INFRA_V4_EOF'
 209.85.128.0/17
 216.58.192.0/19
 216.239.32.0/19
+192.178.0.0/16
 # === Apple (AS714) — весь /8 ===
 17.0.0.0/8
 # === Meta/Facebook (AS32934) ===
