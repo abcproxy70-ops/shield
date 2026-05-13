@@ -4,26 +4,33 @@ Bash-скрипт DDoS-защиты для VPN-нод (Reality / Xray / sing-box
 
 Стек: **nftables + CrowdSec + UFW**. Целевые ОС: Ubuntu 22.04 / 24.04, Debian 12 / 13.
 
-## Архитектура (v3.22.0)
+## Архитектура (v3.23.0)
 
 **Чистое разделение зон ответственности с vpn-node-setup:**
 
 - shieldnode владеет: scanner blocklist, rate-limit, ct count, fib anti-spoof, CrowdSec, security sysctl (rp_filter, syncookies, redirects, icmp, tcp_rfc1337, log_martians, conntrack UDP timeouts)
-- vpn-node-setup владеет: kernel (XanMod LTS), BBR, qdisc fq, buffers, MSS clamp, NIC tuning, conntrack max + TCP timeouts
+- vpn-node-setup владеет: kernel (XanMod LTS), BBR, qdisc fq, buffers (TCP+UDP), MSS clamp, NIC tuning, conntrack max + TCP timeouts
 
 Никаких пересечений в netfilter pipeline. Двойного MSS clamp нет.
 
-**Лимиты v3.22.0 рассчитаны на ноду с 500-1000 VPN-клиентами:**
+**Изменения v3.23.0 vs v3.22.0:**
+
+- `log_martians = 0` (было 1) — на VPN forwarder с rp_filter=2 (loose) martians = нормальный шум маршрутизации. Логирование грузило rsyslog/journald, косвенно влияя на softirq scheduling.
+- `nf_conntrack_udp_timeout_stream = 600` (было 300) — mobile QUIC/Hysteria2 клиенты в background (Android Doze, iOS suspended) теперь дольше держат state, меньше "freeze on resume" при reconnect.
+- `tcp_synack_retries = 3` (было 2) — для intercontinental клиентов (RU/Asia → DE/SE) с RTT 200-400ms и пакетлоссом 2 retry мало (~3 сек до отказа handshake). SYN cookies продолжают защищать от SYN-flood независимо.
+- `SHIELDNODE_VERBOSE_LOGS=0` по умолчанию — раньше все drop-rules имели `log prefix [shield:*]` → ~3000 events/hour. Теперь только counter (guard CLI работает как раньше). Для debug: `SHIELDNODE_VERBOSE_LOGS=1 sudo bash shieldnode.sh`.
+
+**Лимиты v3.22.0 рассчитаны на ноду с 500-1000 VPN-клиентами (сохранены в v3.23.0):**
 
 - **conn_flood**: `ct count over 50000` per-IP (CGNAT-провайдеры РФ держат до 200 абонентов за одним public IPv4 через PAT — на peak ~30k entries/IP)
 - **newconn rate**: 40000/min, burst 60000 (массовый reconnect 200 юзеров × 50 retry/min = 10000/min sustained)
 - **SYN flood**: 2000/sec, burst 3000 (CGNAT × 200 юзеров × 1-2 SYN/sec = 200-400/sec baseline)
-- **UDP flood**: 10000/sec, burst 20000 (Hysteria2/QUIC 4K streaming + cloud gaming)
+- **UDP flood**: 10000/sec, burst 20000 (QUIC/HTTP3 + Hysteria2 + WireGuard handshakes)
 - **SSH per-IP**: ct=5 + 8/min burst 20 (CGNAT-админы + ansible deploy на ≤5 нод параллельно)
 
 Реальные DDoS-атаки 50k+ SYN/sec, 100k+ connections — drop на kernel level. Ban-once архитектура: первое нарушение → suspect (30 мин наблюдения без drop), второе → confirmed (15 мин drop).
 
-**Требует:** `net.netfilter.nf_conntrack_max >= 262144` (Ubuntu 24.04 default OK на нодах ≥1GB RAM; vpn-node-setup v5.0.6+ ставит tier-aware значения 262k/786k/1M/2M в зависимости от RAM).
+**Требует:** `net.netfilter.nf_conntrack_max >= 262144` (Ubuntu 24.04 default OK на нодах ≥1GB RAM; vpn-node-setup v5.1.0+ ставит tier-aware значения 262k/786k/1M/2M в зависимости от RAM).
 
 ## Возможности
 
@@ -54,7 +61,7 @@ curl -fL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode
 
 ## Совместимость
 
-- Работает рядом с **vpn-node-setup v5.0.6+** (рекомендуется порядок: **vpn-node-setup первым, потом shieldnode**)
+- Работает рядом с **vpn-node-setup v5.1.0+** (рекомендуется порядок: **vpn-node-setup первым, потом shieldnode**)
 - Совместим с UFW (читает open ports автоматически)
 - Совместим с любыми VPN-стэками (Xray Reality, sing-box, Hysteria2, WireGuard, AmneziaWG)
 
@@ -77,6 +84,11 @@ sudo guard sync       # синк custom.txt прямо сейчас
 
 ## Версии
 
+- **v3.23.0** — LOG NOISE & UDP UX:
+  - `log_martians = 0` (было 1) — на VPN forwarder martians = шум маршрутизации, не сигнал атаки
+  - `nf_conntrack_udp_timeout_stream = 600` (было 300) — mobile QUIC/Hysteria background sessions
+  - `tcp_synack_retries = 3` (было 2) — intercontinental RTT 200-400ms нужен запас
+  - `SHIELDNODE_VERBOSE_LOGS=0` default — counter-only mode без log prefix, ~3k events/hour убираются
 - **v3.22.0** — ROBUSTNESS PACK + SECURITY TUNING для 500-1000 клиентов на ноде:
   - **Лимиты подняты под реальный CGNAT load** (МТС/T2/Beeline/Tele2 200+ абонентов/IP): conn_flood 5000→50000, newconn 5000→40000/min, syn 300→2000/sec, udp 1500→10000/sec, ssh ct=3→5
   - **Aggregator robustness**: `journalctl --lines=500000` cap (защита от RAM blow-up под штормом 100k+ events/min), `PRAGMA busy_timeout=5000` (защита от SQLITE_BUSY race с guard)
