@@ -15,7 +15,6 @@
 # - All RU/CIS broadband: МТС, Дом.ру, Билайн, Уфанет, Skytel, ER-Telecom
 # - Microsoft 52.123.128.0/19
 # - DigitalOcean /16 umbrellas
-# - Admin IP 46.163.141.0/24
 # Total: 46 CIDR blocks
 # Confidence: HIGH — only confirmed bulletproof hosters and scanners
 
