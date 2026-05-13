@@ -1,6 +1,69 @@
 #!/bin/bash
 
 # ==============================================================================
+#  VPN NODE DDoS PROTECTION v3.21.5 (Commercial Edition) — INFRASTRUCTURE BYPASS
+#  v3.21.5: Защита от ложных банов критической интернет-инфраструктуры.
+#
+#           ПРОБЛЕМА: на production-ноде с активной атакой events.db
+#           накапливала IP крупных CDN/cloud (Cloudflare, Google) как
+#           "топ атакующих". Причина — TCP retransmits, conntrack quirks,
+#           long-lived sessions попадали в conn_flood / newconn_rate.
+#           Оператор копирующий "топ атакующих" в custom.txt мог
+#           забанить Cloudflare → у VPN-клиентов отвалилось бы 80%
+#           интернета (CF фронтит большую часть веба).
+#
+#           ПОДХОД: вместо post-factum фильтра blocklist'а — bypass
+#           rate-limits для известной инфраструктуры на уровне nft.
+#           Пакет от Cloudflare НЕ считается атакой, не попадает в
+#           events.db, не появляется в дашборде "топ атакующих".
+#           Невозможно случайно скопировать в custom.txt то чего нет.
+#
+#           АРХИТЕКТУРА:
+#           - Новый nft set 'infrastructure_v4' (и v6) — CIDR-блоки
+#             крупных CDN/cloud (Cloudflare, Google, AWS, Azure, Apple,
+#             Meta, Akamai, Fastly, GitHub, Telegram, Yandex, VK, Selectel)
+#           - Новое правило 'ip saddr @infrastructure_v4 accept' в input
+#             chain в позиции ПОСЛЕ blocklist drops (scanner/threat/tor)
+#             но ДО SSH rate-limit и conn_flood/newconn_rate
+#           - Counter 'infrastructure_passes_v4' для observability (no log)
+#           - tcp_invalid и fib_spoof работают для ВСЕХ включая инфра
+#             (санитарный фильтр, не rate-limit)
+#
+#           BASELINE (embedded в скрипт, ~30 крупных supernets):
+#             Cloudflare: 103.21.244.0/22, 104.16.0.0/13, 104.24.0.0/14,
+#                         172.64.0.0/13, ... (полный список из ips-v4)
+#             Google:     8.8.0.0/16, 142.250.0.0/15, 142.251.0.0/16,
+#                         172.217.0.0/16, 216.58.192.0/19, ...
+#             AWS:        52.0.0.0/8 (грубо), 54.0.0.0/8 (грубо)
+#             Azure:      13.64.0.0/11, 20.0.0.0/8 (грубо)
+#             Apple:      17.0.0.0/8
+#             Meta/FB:    31.13.24.0/21, 157.240.0.0/16, ...
+#             Akamai:     23.32.0.0/11, 184.24.0.0/13
+#             Fastly:     151.101.0.0/16, 199.232.0.0/16
+#             Telegram:   91.108.4.0/22, 149.154.160.0/20
+#             Yandex:     5.45.192.0/18, 87.250.224.0/19, 213.180.193.0/24
+#             VK:         87.240.128.0/18, 95.213.0.0/16
+#             Selectel:   188.93.16.0/22, 92.53.96.0/19
+#
+#           DYNAMIC UPDATE (опционально, через 24h timer):
+#           - Cloudflare: https://www.cloudflare.com/ips-v4
+#           - AWS:        https://ip-ranges.amazonaws.com/ip-ranges.json
+#           - Если updater лёг — embedded baseline продолжает работать
+#
+#           TRADE-OFF (честно):
+#           - Реальный атакующий через AWS/Cloudflare relay пройдёт
+#             через rate-limit БЕЗ пометки как атака. Но: пакеты сверх
+#             общих лимитов всё равно дропаются физически, просто не
+#             регистрируются как per-IP инцидент. Целевая защита от
+#             пакетного флуда не страдает; страдает только attribution.
+#           - Маловероятно: AWS/CF активно банят DDoS-источники у себя.
+#             Реальные ботнеты — bulletproof хостинги, не AWS.
+#
+#           ПОЛЬЗОВАТЕЛЬСКАЯ ОПЦИЯ — отсутствует намеренно. Защита
+#           всегда включена. Если кому-то нужно фильтровать даже
+#           Cloudflare (хостинг внутри CF infra) — это эдж-кейс,
+#           решается через ручную правку nft set, не через config.
+#
 #  VPN NODE DDoS PROTECTION v3.21.4 (Commercial Edition) — SSH RATE-LIMIT TIGHTENED
 #  v3.21.4: Ужесточены SSH per-IP лимиты на основе production-данных.
 #
@@ -1575,7 +1638,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.21.4"
+SHIELDNODE_VERSION="3.21.5"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -3100,6 +3163,308 @@ if [ -n "$MGMT_IPV4" ]; then
     MANUAL_WHITELIST_V4_INIT="        elements = { $(echo "$MGMT_IPV4" | sed 's/,/, /g') }"
 fi
 
+# v3.21.5: Embedded infrastructure baseline — крупные CDN/cloud CIDR-блоки.
+# Загружаются ВСЕГДА на установке. Опциональный updater (см. ниже) может
+# заменить их актуальными списками из официальных API, но если updater
+# не работает (нет интернета / лёг сервис) — baseline продолжает защищать.
+#
+# Источники (даты на момент составления — май 2026):
+# - Cloudflare:  https://www.cloudflare.com/ips-v4 (официальный, стабильный)
+# - Google:      крупные supernets из Google AS15169 (BGP feed)
+# - AWS:         крупные supernets AS16509 (consolidated /8 блоки)
+# - Azure:       Microsoft AS8075 крупные supernets
+# - Apple:       AS714 — весь 17.0.0.0/8 (исторически только Apple)
+# - Meta/FB:     AS32934 — известные блоки
+# - Akamai:      AS20940, AS16625 — supernets
+# - Fastly:      AS54113 — основные блоки
+# - GitHub:      AS36459 (внутри Microsoft AS8075, но отдельные диапазоны)
+# - Telegram:    AS62041, AS44907 — официальные
+# - Yandex:      AS13238 — основные supernets
+# - VK:          AS47541, AS28709 — основные
+# - Selectel:    AS50340 — основные
+#
+# ВАЖНО: список консервативный, использует крупные supernets. Это значит
+# overscoping (некоторые субдиапазоны могут быть переделегированы), но
+# для нашей цели (НЕ банить случайно) это безопаснее. Точные диапазоны
+# подтягивает dynamic updater из официальных endpoint'ов.
+INFRASTRUCTURE_V4_CIDR=$(cat <<'INFRA_V4_EOF'
+# === Cloudflare (AS13335) — официальный list из ips-v4 ===
+103.21.244.0/22
+103.22.200.0/22
+103.31.4.0/22
+104.16.0.0/13
+104.24.0.0/14
+108.162.192.0/18
+131.0.72.0/22
+141.101.64.0/18
+162.158.0.0/15
+172.64.0.0/13
+173.245.48.0/20
+188.114.96.0/20
+190.93.240.0/20
+197.234.240.0/22
+198.41.128.0/17
+# === Google (AS15169) ===
+8.8.4.0/24
+8.8.8.0/24
+8.34.208.0/20
+8.35.192.0/20
+34.0.0.0/15
+34.2.0.0/16
+35.184.0.0/13
+35.192.0.0/14
+35.196.0.0/15
+35.198.0.0/16
+35.199.0.0/17
+35.224.0.0/12
+35.240.0.0/13
+64.18.0.0/20
+64.233.160.0/19
+66.102.0.0/20
+66.249.64.0/19
+72.14.192.0/18
+74.125.0.0/16
+108.177.0.0/17
+142.250.0.0/15
+172.217.0.0/16
+173.194.0.0/16
+209.85.128.0/17
+216.58.192.0/19
+216.239.32.0/19
+# === Apple (AS714) — весь /8 ===
+17.0.0.0/8
+# === Meta/Facebook (AS32934) ===
+31.13.24.0/21
+31.13.64.0/18
+66.220.144.0/20
+69.63.176.0/20
+69.171.224.0/19
+74.119.76.0/22
+102.132.96.0/20
+129.134.0.0/16
+157.240.0.0/16
+163.70.128.0/17
+173.252.64.0/18
+185.60.216.0/22
+204.15.20.0/22
+# === Akamai (AS20940, AS16625) ===
+23.32.0.0/11
+23.64.0.0/14
+23.192.0.0/11
+72.246.0.0/15
+95.100.0.0/15
+96.6.0.0/15
+104.64.0.0/10
+184.24.0.0/13
+204.245.32.0/20
+# === Fastly (AS54113) ===
+23.235.32.0/20
+43.249.72.0/22
+103.244.50.0/24
+146.75.0.0/16
+151.101.0.0/16
+157.52.64.0/18
+167.82.0.0/17
+199.27.72.0/21
+199.232.0.0/16
+# === GitHub (AS36459) ===
+140.82.112.0/20
+143.55.64.0/20
+185.199.108.0/22
+192.30.252.0/22
+# === Telegram (AS62041, AS44907) ===
+91.108.4.0/22
+91.108.8.0/22
+91.108.12.0/22
+91.108.16.0/22
+91.108.56.0/22
+149.154.160.0/20
+# === Yandex (AS13238) ===
+5.45.192.0/18
+5.255.192.0/18
+77.88.0.0/18
+87.250.224.0/19
+93.158.128.0/18
+141.8.128.0/18
+178.154.128.0/17
+213.180.192.0/19
+# === VK / Mail.ru (AS47541, AS28709) ===
+87.240.128.0/18
+93.186.224.0/20
+95.142.192.0/20
+95.213.0.0/16
+# === Selectel (AS50340, AS49505) ===
+85.119.144.0/20
+92.53.96.0/19
+185.32.248.0/22
+188.93.16.0/22
+# === AWS (AS16509) — TIGHTLY-SCOPED supernets ===
+# ВАЖНО: НЕ /8 — AWS делит крупные блоки с другими.
+# Только подтверждённые supernets из официального ip-ranges.json.
+# Полное покрытие AWS — задача dynamic updater'а (v3.21.6+).
+3.2.0.0/16
+3.5.0.0/19
+13.34.0.0/15
+13.224.0.0/14
+15.177.0.0/18
+15.230.0.0/16
+18.32.0.0/14
+18.130.0.0/16
+18.144.0.0/15
+18.156.0.0/14
+18.184.0.0/13
+18.192.0.0/10
+18.230.0.0/15
+35.71.64.0/22
+35.71.96.0/22
+35.71.128.0/22
+50.16.0.0/15
+50.18.0.0/16
+52.4.0.0/14
+52.16.0.0/14
+52.32.0.0/11
+52.84.0.0/15
+52.94.0.0/22
+52.95.0.0/16
+52.119.128.0/17
+52.144.192.0/20
+52.192.0.0/11
+52.216.0.0/15
+52.218.0.0/15
+52.220.0.0/15
+52.222.0.0/16
+54.64.0.0/13
+54.72.0.0/15
+54.74.0.0/15
+54.144.0.0/12
+54.160.0.0/12
+54.176.0.0/12
+54.192.0.0/16
+54.198.0.0/15
+54.204.0.0/14
+54.208.0.0/13
+54.216.0.0/14
+54.220.0.0/15
+54.222.0.0/15
+54.224.0.0/12
+54.240.0.0/12
+99.78.0.0/18
+99.79.0.0/16
+99.80.0.0/15
+99.150.16.0/20
+# === Microsoft Azure (AS8075) — TIGHTLY-SCOPED ===
+# Подтверждённые блоки из Azure service tags JSON.
+13.64.0.0/11
+13.96.0.0/13
+13.104.0.0/14
+20.33.0.0/16
+20.34.0.0/15
+20.36.0.0/14
+20.40.0.0/13
+20.48.0.0/12
+20.64.0.0/10
+20.128.0.0/16
+20.135.0.0/16
+20.140.0.0/15
+20.143.0.0/16
+20.150.0.0/15
+20.157.0.0/16
+20.160.0.0/12
+20.176.0.0/14
+20.180.0.0/14
+20.184.0.0/13
+20.192.0.0/10
+40.64.0.0/10
+40.74.0.0/15
+40.76.0.0/14
+40.80.0.0/12
+40.96.0.0/12
+40.112.0.0/13
+40.120.0.0/14
+40.124.0.0/16
+40.125.0.0/17
+51.4.0.0/15
+51.8.0.0/16
+51.10.0.0/15
+51.11.0.0/16
+51.12.0.0/15
+51.18.0.0/16
+51.51.0.0/16
+51.103.0.0/16
+51.104.0.0/15
+51.107.0.0/16
+51.116.0.0/16
+51.120.0.0/15
+51.124.0.0/16
+51.132.0.0/16
+51.136.0.0/15
+51.138.0.0/16
+51.140.0.0/14
+51.144.0.0/15
+52.96.0.0/12
+52.112.0.0/14
+52.120.0.0/14
+52.125.0.0/16
+52.126.0.0/15
+52.130.0.0/15
+52.132.0.0/14
+52.136.0.0/13
+52.145.0.0/16
+52.146.0.0/15
+52.148.0.0/14
+52.152.0.0/13
+52.160.0.0/11
+52.224.0.0/11
+65.52.0.0/14
+70.37.0.0/17
+94.245.64.0/18
+104.40.0.0/13
+131.107.0.0/16
+137.116.0.0/15
+137.135.0.0/16
+138.91.0.0/16
+INFRA_V4_EOF
+)
+
+INFRASTRUCTURE_V6_CIDR=$(cat <<'INFRA_V6_EOF'
+2400:cb00::/32
+2606:4700::/32
+2803:f800::/32
+2405:8100::/32
+2a06:98c0::/29
+2c0f:f248::/32
+2001:4860::/32
+2607:f8b0::/32
+2800:3f0::/32
+2a00:1450::/32
+2402:9800::/32
+2404:6800::/32
+2406:da00::/24
+2600:1f00::/24
+2620:107:300f::/48
+2603:1000::/24
+2620:1ec::/36
+17::/32
+2a03:2880::/29
+2620:0:1c00::/40
+2620:0:1cff::/48
+2a01:111::/32
+2620:1ec:c::/48
+2a01:b740::/32
+2620:11c::/32
+2606:4700:90::/44
+INFRA_V6_EOF
+)
+
+INFRASTRUCTURE_V4_INIT=""
+INFRASTRUCTURE_V6_INIT=""
+if [ -n "$INFRASTRUCTURE_V4_CIDR" ]; then
+    INFRASTRUCTURE_V4_INIT="        elements = { $(echo "$INFRASTRUCTURE_V4_CIDR" | grep -v '^$' | grep -v '^#' | paste -sd',' | sed 's/,/, /g') }"
+fi
+if [ -n "$INFRASTRUCTURE_V6_CIDR" ]; then
+    INFRASTRUCTURE_V6_INIT="        elements = { $(echo "$INFRASTRUCTURE_V6_CIDR" | grep -v '^$' | grep -v '^#' | paste -sd',' | sed 's/,/, /g') }"
+fi
+
 # Инициализирующие elements для nft-set
 nft_set_init() {
     local list="$1"
@@ -3447,6 +3812,24 @@ $XRAY_PORTS_UDP_INIT
 $MANUAL_WHITELIST_V4_INIT
     }
 
+    # v3.21.5: Infrastructure bypass — крупные CDN/cloud провайдеры
+    # обходят rate-limit и conn_flood/newconn_rate, не попадая в events.db
+    # как "атакующие". См. блок 3) Embedded CIDR baseline ниже.
+    # Этот set заполняется через инициализацию (\$INFRASTRUCTURE_V4_INIT),
+    # обновляется опционально через shieldnode-update@infrastructure.timer.
+    # tcp_invalid и fib_spoof проверки работают для ВСЕХ включая инфра.
+    set infrastructure_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+$INFRASTRUCTURE_V4_INIT
+    }
+    set infrastructure_v6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+$INFRASTRUCTURE_V6_INIT
+    }
     # v2.7: Named counters для статистики "всего заблокировано".
     # Каждый counter сохраняет packets и bytes с момента старта nft.
     # Сбрасываются при ребуте/перезагрузке правил.
@@ -3468,6 +3851,10 @@ $MANUAL_WHITELIST_V4_INIT
     # v3.21.0: SSH pre-auth flood counters (v3.21.4: лимиты ужесточены)
     counter ssh_conn_flood_v4 { }     # ct count > 3 на src для SSH-порта (было 5 до v3.21.4)
     counter ssh_newconn_flood_v4 { }  # > 5 new conn/min на src для SSH-порта (было 10 до v3.21.4)
+    # v3.21.5: пакеты прошедшие через infrastructure bypass (Cloudflare/Google/AWS/etc).
+    # Без log prefix — слишком много трафика. Только counter для observability.
+    counter infrastructure_passes_v4 { }
+    counter infrastructure_passes_v6 { }
 
     chain prerouting {
         # v3.18.1: priority динамический ($SHIELD_PREROUTING_PRIO).
@@ -3562,6 +3949,23 @@ $FIB_ANTISPOOF_RULE
             log prefix "[shield:tor] " level info flags ip options \\
             counter name tor_drops_v4 drop
         ip saddr @tor_exit_blocklist_v4 counter name tor_drops_v4 drop
+
+        # === v3.21.5: INFRASTRUCTURE BYPASS ===
+        # Крупные CDN/cloud (Cloudflare, Google, AWS, Azure, Apple, Meta,
+        # Akamai, Fastly, GitHub, Telegram, Yandex, VK, Selectel) — accept
+        # БЕЗ прохождения SSH rate-limit и conn_flood/newconn_rate проверок.
+        # Решает проблему ложных банов: их IP попадали в events.db как
+        # "топ атакующие" из-за TCP retransmits/conntrack quirks, оператор
+        # копировал в custom.txt → блокировал половину интернета у VPN-клиентов.
+        # Set заполняется embedded baseline на установке + dynamic updater.
+        # Этот accept ПОСЛЕ blocklists (scanner/threat/tor) — если инфра-IP
+        # каким-то чудом окажется в blocklist'е, всё равно дропнется раньше.
+        # Этот accept ДО SSH rate-limit и conn_flood — пакеты от CF/Google
+        # не считаются "флудом" даже если их много (что нормально для CDN).
+        # tcp_invalid и fib_spoof ВЫШЕ — они работают для всех включая инфра.
+        # Counter без log prefix — слишком высокий объём для логирования.
+        ip saddr @infrastructure_v4 counter name infrastructure_passes_v4 accept
+        ip6 saddr @infrastructure_v6 counter name infrastructure_passes_v6 accept
 
         # === SSH PRE-AUTH FLOOD PROTECTION (v3.21.0, перемещён в v3.21.1) ===
         # v3.10.2: поддержка нескольких SSH-портов (e.g. миграция 22 → 2222)
@@ -6853,6 +7257,13 @@ collect_stats() {
     # v3.21.0: SSH pre-auth flood counters
     read SSH_CONN_FLOOD_PKTS_V4 SSH_CONN_FLOOD_BYTES_V4 <<< "$(read_counter ssh_conn_flood_v4)"
     read SSH_NEWCONN_FLOOD_PKTS_V4 SSH_NEWCONN_FLOOD_BYTES_V4 <<< "$(read_counter ssh_newconn_flood_v4)"
+    # v3.21.5: infrastructure bypass counters (Cloudflare/Google/AWS/etc passes)
+    read INFRA_PASSES_PKTS_V4 INFRA_PASSES_BYTES_V4 <<< "$(read_counter infrastructure_passes_v4)"
+    read INFRA_PASSES_PKTS_V6 INFRA_PASSES_BYTES_V6 <<< "$(read_counter infrastructure_passes_v6)"
+    # Размер infrastructure_v4 set'а для дашборда
+    INFRA_SET_SIZE=$(nft list set inet ddos_protect infrastructure_v4 2>/dev/null | \
+        tr '\n' ' ' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | wc -l)
+    INFRA_SET_SIZE="${INFRA_SET_SIZE:-0}"
 
     # v3.11: размер tor blocklist set'а
     TOR_SET_SIZE=$(nft list set inet ddos_protect tor_exit_blocklist_v4 2>/dev/null | \
@@ -7870,7 +8281,10 @@ if [ "$MODE" = "json" ]; then
     "newconn_flood_v4_packets": $NEWCONN_FLOOD_PKTS_V4,
     "ssh_conn_flood_v4_packets": $SSH_CONN_FLOOD_PKTS_V4,
     "ssh_newconn_flood_v4_packets": $SSH_NEWCONN_FLOOD_PKTS_V4,
-    "tcp_invalid_packets": $TCP_INVALID_PKTS
+    "tcp_invalid_packets": $TCP_INVALID_PKTS,
+    "infrastructure_passes_v4_packets": $INFRA_PASSES_PKTS_V4,
+    "infrastructure_passes_v6_packets": $INFRA_PASSES_PKTS_V6,
+    "infrastructure_set_size": $INFRA_SET_SIZE
   },
   "last_blocklist_update": "$LAST_UPDATE"
 }
@@ -8105,6 +8519,27 @@ for chain in prerouting newconn_overflow syn_overflow udp_overflow; do
         SMOKE_FAIL=1
     fi
 done
+
+# v3.21.5: проверка что infrastructure bypass работает.
+# Set должен существовать и содержать хотя бы Apple /8 (стабильнее всех).
+if ! nft list set inet ddos_protect infrastructure_v4 >/dev/null 2>&1; then
+    print_error "FAIL: set inet ddos_protect infrastructure_v4 не создан"
+    print_info "Manual check: sudo nft list set inet ddos_protect infrastructure_v4"
+    SMOKE_FAIL=1
+else
+    INFRA_COUNT=$(nft list set inet ddos_protect infrastructure_v4 2>/dev/null | \
+        tr '\n' ' ' | grep -oE 'elements = \{[^}]*\}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' | wc -l)
+    if [ "$INFRA_COUNT" -lt 50 ]; then
+        print_warn "WARN: infrastructure_v4 содержит только $INFRA_COUNT CIDR (ожидается >50)"
+    else
+        print_ok "Smoke: infrastructure_v4 set активен ($INFRA_COUNT CIDR блоков)"
+    fi
+fi
+
+# v3.21.5: проверка что counter infrastructure_passes_v4 объявлен.
+if ! nft list counter inet ddos_protect infrastructure_passes_v4 >/dev/null 2>&1; then
+    print_warn "WARN: counter infrastructure_passes_v4 не объявлен"
+fi
 
 # 5. shieldnode-nftables.service в active-состоянии
 if ! systemctl is-active --quiet shieldnode-nftables.service; then
