@@ -1,40 +1,30 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.22.0 (Commercial Edition) — ROBUSTNESS PACK
+#  VPN NODE DDoS PROTECTION v3.23.0 (Commercial Edition) — LOG NOISE & UDP UX
 #
-#  Что нового vs v3.21.5.2:
-#    1. aggregator: PRAGMA busy_timeout=5000 + journalctl --lines=500000 cap.
-#       Защита от SQLITE_BUSY race с guard и от RAM blow-up под штормом.
-#    2. update-protected-ports: timer 60s → 5min. Path-unit (inotify) ловит
-#       изменения мгновенно, timer остаётся как catch-all safety net.
-#       Экономия ~15% CPU на 1GB нодах в простое.
-#    3. guard ASN lookup: curl timeout 2s → 0.5s + offline-mode fallback.
-#       Top attackers больше не лагает на 40 сек при недоступности ipinfo.io.
-#    4. shieldnode-cleanup: Nice=19, IOSchedulingClass=idle в service unit.
-#       VACUUM на shared-disk VPS не блокирует sshd/Xray logs.
-#    5. unban_all: + `conntrack -D -s <ip>` для каждого разбаниваемого IP.
-#       False-positive ban от CGNAT теперь реально снимается, без переустановки.
-#       Добавлена depend: пакет `conntrack` (apt install).
-#    6. healthcheck: `timeout 5 cscli ...` вместо unbounded scan на 28k decisions.
-#       Установка завершается быстрее на нодах с активной CAPI subscription.
-#    7. Удалены мёртвые counters mobile_ru_passes_v4, mobile_ru_conn_flood_v4,
-#       broadband_ru_passes_v4, broadband_ru_conn_flood_v4 (deprecated с v3.20.0).
-#       guard --json больше не возвращает 4 пустых поля.
-#    8. Changelog history (v1.1 — v3.21.5.2) удалён — был >1600 строк. История
-#       в git: https://github.com/abcproxy70-ops/shield/commits/main/shieldnode.sh
-#    9. SECURITY TUNING для VPN-нод 500-1000 клиентов:
-#       conn_flood   5000 → 50000  (slowloris и реальные атаки >100k всё равно ловятся)
-#       newconn_rate 5000 → 40000/min  burst 8k → 60k
-#       syn_flood    300  → 2000/sec   burst 500 → 3000
-#       udp_flood    1500 → 10000/sec  burst 3k → 20k
-#       ssh_connlimit ct=3 → ct=5       (CGNAT-админы + ansible 8-нод deploy)
-#       ssh_newconn   5/min → 8/min     burst 15 → 20
-#       Расчёт: CGNAT 200 юзеров/IP × ~150 conn = 30k baseline. Старые лимиты
-#       (5000 ct, 1500 UDP/sec) активно дропали легитимных РФ broadband/mobile
-#       юзеров под нагрузкой. Новые лимиты по-прежнему ниже реальных DDoS
-#       векторов в 5-50 раз. Требует net.netfilter.nf_conntrack_max >= 262144
-#       (Ubuntu default OK).
+#  Что нового vs v3.22.0:
+#    1. CRIT-2: log_martians = 0 (was 1).
+#       На VPN forwarder с rp_filter=2 (loose) martians — нормальный шум
+#       маршрутизации, не сигнал атаки. Логирование martians грузило
+#       rsyslog/journald disk-writes, косвенно влияя на softirq scheduling.
+#       Mitigation (rsyslog dedup, journald limit, hourly logrotate) оставлены
+#       как defense-in-depth, но первопричина теперь убрана.
+#    2. IMPR: nf_conntrack_udp_timeout_stream = 600 (was 300).
+#       Hysteria2 mobile клиенты в background (Android Doze, iOS suspended)
+#       могут не слать пакеты дольше 5 минут. Старый timeout = принудительный
+#       reconnect → user видит "freeze on resume from background".
+#       10 минут — sweet spot между state bloat и UX.
+#    3. IMPR: tcp_synack_retries = 3 (was 2).
+#       2 retry = ~3 сек до отказа handshake. Для intercontinental клиентов
+#       (RU/Asia → DE/SE) с RTT 200-400ms и пакетлоссом этого мало.
+#       SYN cookies продолжают защищать от SYN-flood независимо от этого.
+#    4. IMPR: SHIELDNODE_VERBOSE_LOGS=0 по умолчанию.
+#       Раньше: все drop-rules имели `log prefix [shield:*]` → ~3000 log
+#       events/hour на проде. Теперь: только counter-based metrics (видны
+#       через guard), без log prefix. Aggregator работает только при =1.
+#       Operator может включить =1 для debug сессий.
+#       Уменьшает disk write rate и journald CPU usage.
 #
 #  Архитектура pipeline (inet ddos_protect, prerouting priority -100/-150):
 #    ct established/related accept
@@ -135,7 +125,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.22.0"
+SHIELDNODE_VERSION="3.23.0"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -228,6 +218,17 @@ ENABLE_GITHUB_SYNC="${ENABLE_GITHUB_SYNC:-1}"
 ENABLE_VERSION_CHECK="${ENABLE_VERSION_CHECK:-1}"
 DEFAULT_GITHUB_SYNC_INTERVAL="6h"
 DEFAULT_VERSION_CHECK_INTERVAL="1d"
+
+# v3.23.0: SHIELDNODE_VERBOSE_LOGS — toggle для nft `log prefix [shield:*]` правил.
+#   0 (default): только counter+drop без log prefix. Минимум disk-writes,
+#     минимум journald CPU. guard CLI всё равно показывает counters (счётчики
+#     обновляются независимо от log). Aggregator (events.db) при =0 будет
+#     получать пустые batches — это OK, оператору обычно нужны live-counters.
+#   1: полный log prefix как в v3.22.x — для debug сессий. Aggregator парсит
+#     journald в events.db (history "top attackers" etc).
+# Примерный профит =0 на проде: ~3000 log lines/hour убираются, что даёт
+# заметное снижение disk I/O / journald CPU на shared-disk VPS.
+SHIELDNODE_VERBOSE_LOGS="${SHIELDNODE_VERBOSE_LOGS:-0}"
 
 # v3.12.0: detect pipe-mode (curl | bash) vs git-clone-mode (./shieldnode.sh)
 # Pipe-mode → BASH_SOURCE[0] = /dev/fd/* или похожее → нет ./lists рядом со скриптом
@@ -464,20 +465,23 @@ if [ "${1:-}" = "--uninstall" ]; then
         # v3.18.9: sysctl --system НЕ сбрасывает значения которые писал ТОЛЬКО
         # удалённый файл — они "залипают" в памяти ядра до ребута. Явно сбрасываем
         # ключи которые shieldnode писал (на kernel defaults). Если оператор
-        # установил vpn-node-setup.sh — он перезапишет своими значениями через
-        # 99-conntrack.conf / 99-xray-tuning.conf при sysctl --system ниже.
+        # установил vpn-node-setup.sh v5.1.0+ — он перезапишет своими значениями
+        # через 80-vpn-node-tuning.conf при sysctl --system ниже.
         # Если его нет — сбросим явно.
         sysctl -w net.ipv4.tcp_synack_retries=5 >/dev/null 2>&1 || true
         sysctl -w net.ipv4.tcp_syn_retries=6 >/dev/null 2>&1 || true
         sysctl -w net.netfilter.nf_conntrack_udp_timeout=30 >/dev/null 2>&1 || true
         sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=180 >/dev/null 2>&1 || true
         sysctl -w net.ipv4.icmp_ignore_bogus_error_responses=0 >/dev/null 2>&1 || true
+        # v3.23.0: log_martians теперь = 0 в установщике, всё равно сбрасываем явно
+        # (на случай если оператор включал вручную)
         sysctl -w net.ipv4.conf.all.log_martians=0 >/dev/null 2>&1 || true
+        sysctl -w net.ipv4.conf.default.log_martians=0 >/dev/null 2>&1 || true
         # Остальные ключи (rp_filter, syncookies, accept_redirects, send_redirects,
         # accept_source_route, icmp_echo_ignore_broadcasts, tcp_rfc1337) обычно
         # дублируются vpn-node-setup.sh с теми же значениями — sysctl --system
-        # их применит из 99-xray-tuning.conf. Если setup не установлен — оператор
-        # вернёт defaults вручную или ребутом.
+        # их применит из 80-vpn-node-tuning.conf. Если setup не установлен —
+        # оператор вернёт defaults вручную или ребутом.
         sysctl --system >/dev/null 2>&1 || true
         print_ok "Sysctl hardening удалён (UDP-timeout/synack/martians сброшены на defaults)"
     fi
@@ -1130,9 +1134,9 @@ fi
 print_status "Применяю sysctl kernel hardening..."
 
 # v3.7: миграция со старого имени 99-shieldnode.conf → 90-shieldnode.conf.
-# Префикс 90 < 99, теперь vpn-node-setup.sh (99-xray-tuning) грузится ПОСЛЕ нас
-# и при коллизиях побеждает (но коллизий быть не должно — setup ставит те же
-# значения что и мы, см. блок ниже).
+# v5.1.0/v3.23.0 порядок: 80-vpn-node-tuning.conf (база) → 90-shieldnode.conf
+# (security overrides) → 99-z-* (ad-hoc operator fixes).
+# Лексикографически 80 < 90 < 99 → каждый следующий перетирает предыдущий.
 if [ -f /etc/sysctl.d/99-shieldnode.conf ]; then
     rm -f /etc/sysctl.d/99-shieldnode.conf
     print_info "Удалён старый /etc/sysctl.d/99-shieldnode.conf (миграция v3.7)"
@@ -1140,9 +1144,10 @@ fi
 
 SYSCTL_FILE="/etc/sysctl.d/90-shieldnode.conf"
 cat > "$SYSCTL_FILE" <<'SYSCTL_EOF'
-# Shieldnode kernel hardening v3.7
-# Префикс 90 — это базовая security-полка. vpn-node-setup.sh (99-xray-tuning)
-# может перетереть отдельные ключи, если у оператора другие приоритеты.
+# Shieldnode kernel hardening v3.23.0
+# Префикс 90 — security-полка поверх базы (80-vpn-node-tuning.conf).
+# vpn-node-setup v5.1.0+ пишет базу в 80-, мы перетираем нужные ключи
+# поверх. Любые ad-hoc operator fixes (99-z-*) перетирают и нас.
 #
 # v3.7: shieldnode стал standalone. Раньше критичные security-ключи
 # (rp_filter, syncookies, redirects, ...) ставил только vpn-node-setup.sh,
@@ -1158,8 +1163,12 @@ cat > "$SYSCTL_FILE" <<'SYSCTL_EOF'
 # === SYN-flood mitigation ===
 # SYN cookies (kernel сам активирует когда backlog переполнен)
 net.ipv4.tcp_syncookies = 1
-# Сколько раз отправлять SYN+ACK перед сдачей (по умолчанию 5 — слишком долго под flood)
-net.ipv4.tcp_synack_retries = 2
+# Сколько раз отправлять SYN+ACK перед сдачей.
+# v3.23.0: 2 → 3. Default kernel = 5. 2 было слишком агрессивно для
+# intercontinental клиентов (RU/Asia → DE/SE) с RTT 200-400ms и пакетлоссом:
+# 2 retry = ~3 сек до отказа handshake → user видит timeout вместо connect.
+# SYN cookies продолжают защищать от SYN-flood независимо от этого retry.
+net.ipv4.tcp_synack_retries = 3
 # Сколько раз ретраить SYN при исходящих (по умолчанию 6)
 net.ipv4.tcp_syn_retries = 3
 
@@ -1191,8 +1200,17 @@ net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.tcp_rfc1337 = 1
 
 # === Logging ===
-# Логировать martian packets (странные source IP — ранний сигнал атаки)
-net.ipv4.conf.all.log_martians = 1
+# v3.23.0: log_martians = 0 (was 1).
+# На VPN forwarder с rp_filter=2 (loose) martians — нормальный шум
+# маршрутизации (asymmetric paths, Docker host-mode, multiple ifaces),
+# не сигнал атаки. Логирование martian каждого пакета:
+#   - грузит kernel printk() → rsyslog → /var/log disk writes
+#   - дублируется в systemd-journald (третья копия)
+#   - на 1000+ юзеров может дать сотни/час log lines
+# Если нужен martian-логирование для debug — выставить вручную:
+#   sysctl -w net.ipv4.conf.all.log_martians=1
+net.ipv4.conf.all.log_martians = 0
+net.ipv4.conf.default.log_martians = 0
 
 # === v3.16.4: UDP conntrack timeout для VPN keepalive ===
 # Default UDP timeout 30 сек слишком короткий для VPN-протоколов с
@@ -1200,15 +1218,22 @@ net.ipv4.conf.all.log_martians = 1
 # Без этого — UFW дропает каждый второй keepalive ответ как "новый пакет
 # на закрытый порт", т.к. conntrack теряет state между keepalive'ами.
 #
-# 180 сек охватывает все VPN-сценарии. По алфавиту 90-shieldnode.conf
-# применяется ДО 99-xray-tuning.conf от vpn-node-setup.sh, поэтому если
-# у оператора уже стоят свои значения — они переопределят наши.
+# 180 сек охватывает все VPN-сценарии для unidirectional UDP. По алфавиту
+# 80-vpn-node-tuning.conf применяется ПЕРВЫМ (база), затем
+# 90-shieldnode.conf (security overrides) перетирает нужные ключи.
+# Раньше у setup'а было 99-vpn-node-tuning → setup побеждал shieldnode,
+# что было багом. С v5.1.0 / v3.23.0 порядок правильный.
+#
+# v3.23.0: stream 300 → 600. Bidirectional UDP "stream" state (Hysteria2
+# established session) теперь живёт 10 минут. Mobile клиенты в background
+# (Android Doze, iOS suspended) могут не слать пакеты дольше 5 минут.
+# 5 мин timeout = принудительный reconnect → user видит "freeze on resume".
+# 10 мин — sweet spot между state bloat и UX.
 #
 # TCP timeout'ы НАМЕРЕННО не трогаем — это зона ответственности
-# vpn-node-setup.sh (default 432000 для established он или не он, но
-# мы туда не лезем чтобы не сломать существующие конфиги).
+# vpn-node-setup.sh.
 net.netfilter.nf_conntrack_udp_timeout = 180
-net.netfilter.nf_conntrack_udp_timeout_stream = 300
+net.netfilter.nf_conntrack_udp_timeout_stream = 600
 SYSCTL_EOF
 
 # Применяем
@@ -2098,17 +2123,23 @@ mkdir -p "$NFT_CONF_DIR"
 
 # v3.8: подготовка conditional-правил для nft template.
 # fib anti-spoofing — только на single-homed VPS.
+# v3.23.0: log prefix в правиле fib_spoof тоже опционален (SHIELDNODE_VERBOSE_LOGS=1).
 if [ "${ENABLE_FIB_ANTISPOOF:-0}" = "1" ]; then
-    FIB_ANTISPOOF_RULE="        # === v3.8: ANTI-SPOOFING (fib reverse-path) ===
+    if [ "$SHIELDNODE_VERBOSE_LOGS" = "1" ]; then
+        FIB_ANTISPOOF_RULE="        # === v3.8: ANTI-SPOOFING (fib reverse-path) ===
         # Стронгер чем rp_filter loose — ловит spoofed src из соседних сетей,
         # для которых kernel'у не известен обратный маршрут.
-        # iif lo пропускаем (локальный трафик не должен попадать под fib check).
-        # Включено потому что VPS single-homed (один upstream).
-        # v3.15.3: добавлен log prefix '[shield:fib_spoof]' для observability —
-        # видно spoofed-source attacks которые kernel не может маршрутизировать обратно.
+        # v3.15.3: log prefix '[shield:fib_spoof]' для observability (verbose mode).
         iif \"lo\" accept
         fib saddr . iif oif missing limit rate 1/second burst 5 packets log prefix \"[shield:fib_spoof] \" level info flags ip options counter name tcp_invalid drop
         fib saddr . iif oif missing counter name tcp_invalid drop"
+    else
+        FIB_ANTISPOOF_RULE="        # === v3.8: ANTI-SPOOFING (fib reverse-path) ===
+        # Стронгер чем rp_filter loose — ловит spoofed src из соседних сетей.
+        # v3.23.0: counter-only mode (no log, SHIELDNODE_VERBOSE_LOGS=0 default).
+        iif \"lo\" accept
+        fib saddr . iif oif missing counter name tcp_invalid drop"
+    fi
 else
     FIB_ANTISPOOF_RULE="        # fib anti-spoofing отключён (multi-homed VPS — может дать false-positive)"
 fi
@@ -2125,6 +2156,38 @@ if [ "${PANEL_TYPE:-none}" != "none" ]; then
 else
     SHIELD_PREROUTING_PRIO="-100"
     print_info "Standalone — prerouting priority -100"
+fi
+
+# v3.23.0: generation of log prefix blocks based on SHIELDNODE_VERBOSE_LOGS.
+# При =0 (default) — лог-правила НЕ генерируются. Counter+drop остаются на своих
+# местах, поэтому guard CLI продолжает работать как раньше (counters обновляются
+# независимо от log).
+# При =1 — лог-правила добавляются как в v3.22.x для aggregator/events.db.
+#
+# Хитрость: ВЕСЬ блок генерируется одной переменной (включая все строки правила
+# с обратными слэшами для line-continuation). При =0 переменная пустая → блок
+# полностью отсутствует в nft conf, синтаксис не ломается.
+if [ "$SHIELDNODE_VERBOSE_LOGS" = "1" ]; then
+    print_info "Verbose logs ENABLED (SHIELDNODE_VERBOSE_LOGS=1) — full log prefix on drop rules"
+    SHIELD_LOG_TCP_INVALID=$'\n        tcp flags & (fin|syn) == (fin|syn) limit rate 1/second burst 5 packets \\\n            log prefix "[shield:tcp_invalid] " level info flags ip options\n        tcp flags & (syn|rst) == (syn|rst) limit rate 1/second burst 5 packets \\\n            log prefix "[shield:tcp_invalid] " level info flags ip options\n        tcp flags & (fin|rst) == (fin|rst) limit rate 1/second burst 5 packets \\\n            log prefix "[shield:tcp_invalid] " level info flags ip options\n        tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 limit rate 1/second burst 5 packets \\\n            log prefix "[shield:tcp_invalid] " level info flags ip options\n        tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|psh|urg) limit rate 1/second burst 5 packets \\\n            log prefix "[shield:tcp_invalid] " level info flags ip options'
+    SHIELD_LOG_THREAT_FULL=$'\n        ip saddr @threat_blocklist_v4 limit rate 1/second \\\n            log prefix "[shield:threat] " level info flags ip options \\\n            counter name threat_drops_v4 drop'
+    SHIELD_LOG_CUSTOM_FULL=$'\n        ip saddr @custom_blocklist_v4 limit rate 1/second \\\n            log prefix "[shield:custom] " level info flags ip options \\\n            counter name custom_drops_v4 drop'
+    SHIELD_LOG_SCANNER_FULL=$'\n        ip saddr @scanner_blocklist_v4 limit rate 1/second \\\n            log prefix "[shield:scanner] " level info flags ip options \\\n            counter name scanner_drops_v4 drop'
+    SHIELD_LOG_TOR_FULL=$'\n        ip saddr @tor_exit_blocklist_v4 limit rate 1/second \\\n            log prefix "[shield:tor] " level info flags ip options \\\n            counter name tor_drops_v4 drop'
+    SHIELD_LOG_DDOS_FULL=$'\n        ip saddr @confirmed_attack_v4 limit rate 1/second \\\n            log prefix "[shield:ddos] " level info flags ip options \\\n            counter name confirmed_drops_v4 drop'
+    SHIELD_LOG_SYN_ESC_FULL=$'        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\\n            limit rate 1/second burst 5 packets \\\n            log prefix "[shield:syn_escalate] " level info flags ip options \\\n            counter name syn_confirmed_v4 drop'
+    SHIELD_LOG_UDP_ESC_FULL=$'        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\\n            limit rate 1/second burst 5 packets \\\n            log prefix "[shield:udp_escalate] " level info flags ip options \\\n            counter name udp_confirmed_v4 drop'
+else
+    print_info "Verbose logs DISABLED (default, SHIELDNODE_VERBOSE_LOGS=0) — counter-only mode"
+    print_info "  Включить для debug:  SHIELDNODE_VERBOSE_LOGS=1 sudo bash shieldnode.sh"
+    SHIELD_LOG_TCP_INVALID=""
+    SHIELD_LOG_THREAT_FULL=""
+    SHIELD_LOG_CUSTOM_FULL=""
+    SHIELD_LOG_SCANNER_FULL=""
+    SHIELD_LOG_TOR_FULL=""
+    SHIELD_LOG_DDOS_FULL=""
+    SHIELD_LOG_SYN_ESC_FULL=""
+    SHIELD_LOG_UDP_ESC_FULL=""
 fi
 
 cat > "$NFT_DDOS_CONF" <<EOF
@@ -2394,16 +2457,9 @@ $FIB_ANTISPOOF_RULE
         # сканеров nmap -sN/-sF/-sX. Сами drop-правила ниже остались без
         # логов для производительности (большинство атак тут rate-limited
         # уже по факту, но первый пакет залогируется этим правилом).
-        tcp flags & (fin|syn) == (fin|syn) limit rate 1/second burst 5 packets \\
-            log prefix "[shield:tcp_invalid] " level info flags ip options
-        tcp flags & (syn|rst) == (syn|rst) limit rate 1/second burst 5 packets \\
-            log prefix "[shield:tcp_invalid] " level info flags ip options
-        tcp flags & (fin|rst) == (fin|rst) limit rate 1/second burst 5 packets \\
-            log prefix "[shield:tcp_invalid] " level info flags ip options
-        tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 limit rate 1/second burst 5 packets \\
-            log prefix "[shield:tcp_invalid] " level info flags ip options
-        tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|psh|urg) limit rate 1/second burst 5 packets \\
-            log prefix "[shield:tcp_invalid] " level info flags ip options
+        # v3.23.0: log-блок генерится опционально (SHIELDNODE_VERBOSE_LOGS=1).
+        # Counter+drop правила ниже всегда активны.
+$SHIELD_LOG_TCP_INVALID
 
         tcp flags & (fin|syn) == (fin|syn) counter name tcp_invalid drop
         tcp flags & (syn|rst) == (syn|rst) counter name tcp_invalid drop
@@ -2420,27 +2476,22 @@ $FIB_ANTISPOOF_RULE
         # === v3.12.0: THREAT BLOCKLIST (Spamhaus DROP, FireHOL Level 1) ===
         # High-confidence криминальные сети. Идёт ПЕРВЫМ — самый дорогой
         # источник нежелательного трафика, отсекаем сразу.
-        # Лог с rate-limit 1/sec для агрегатора и guard статистики.
-        ip saddr @threat_blocklist_v4 limit rate 1/second \\
-            log prefix "[shield:threat] " level info flags ip options \\
-            counter name threat_drops_v4 drop
+        # v3.23.0: log-rule опционален (SHIELDNODE_VERBOSE_LOGS=1).
+        # Counter-rule всегда активен — guard CLI читает счётчик независимо.
+$SHIELD_LOG_THREAT_FULL
         ip saddr @threat_blocklist_v4 counter name threat_drops_v4 drop
 
         # === v3.12.0: CUSTOM BLOCKLIST (operator personal IPs) ===
         # Источник: /etc/shieldnode/lists/custom.txt (+ опциональные URL'ы).
         # Идёт после threat но до scanner — оператор может явно перехватить
         # любой IP даже если других списков его пока нет.
-        ip saddr @custom_blocklist_v4 limit rate 1/second \\
-            log prefix "[shield:custom] " level info flags ip options \\
-            counter name custom_drops_v4 drop
+$SHIELD_LOG_CUSTOM_FULL
         ip saddr @custom_blocklist_v4 counter name custom_drops_v4 drop
 
         # Pre-emptive drop известных сканеров (с counter v2.7).
         # Стоит ПЕРЕД rate-limit — экономит conntrack-слоты и CPU.
-        # v2.9: log с rate-limit 1/sec на IP — для history БД (агрегатор парсит journald)
-        ip saddr @scanner_blocklist_v4 limit rate 1/second \\
-            log prefix "[shield:scanner] " level info flags ip options \\
-            counter name scanner_drops_v4 drop
+        # v3.23.0: log опционален — counter всегда активен.
+$SHIELD_LOG_SCANNER_FULL
         ip saddr @scanner_blocklist_v4 counter name scanner_drops_v4 drop
 
         # SSH защита перемещена ниже tor_blocklist drop (v3.21.1)
@@ -2450,10 +2501,8 @@ $FIB_ANTISPOOF_RULE
         # Set заполняется только если оператор активировал BLOCK_TOR=1.
         # Иначе set пустой, эти 2 правила — no-op (overhead близок к нулю,
         # nft проверка пустого set'а — O(1)).
-        # Лог с rate-limit 1/sec для guard CLI и aggregator статистики.
-        ip saddr @tor_exit_blocklist_v4 limit rate 1/second \\
-            log prefix "[shield:tor] " level info flags ip options \\
-            counter name tor_drops_v4 drop
+        # v3.23.0: log опционален.
+$SHIELD_LOG_TOR_FULL
         ip saddr @tor_exit_blocklist_v4 counter name tor_drops_v4 drop
 
         # === v3.21.5: INFRASTRUCTURE BYPASS ===
@@ -2523,10 +2572,8 @@ $FIB_ANTISPOOF_RULE
         # Двухэтапная проверка перед баном — снижает ложные баны CGNAT/мобильных.
         #
         # Этап 0: Если IP в confirmed_attack — он уже подтверждённый атакующий, дропаем.
-        # v2.9: log с rate-limit 1/sec на IP — для history БД
-        ip saddr @confirmed_attack_v4 limit rate 1/second \\
-            log prefix "[shield:ddos] " level info flags ip options \\
-            counter name confirmed_drops_v4 drop
+        # v3.23.0: при SHIELDNODE_VERBOSE_LOGS=1 добавится log-rule перед drop.
+$SHIELD_LOG_DDOS_FULL
         ip saddr @confirmed_attack_v4 counter name confirmed_drops_v4 drop
 
         # === v3.5+v3.9: CONNECTION-FLOOD / SLOWLORIS ЗАЩИТА ===
@@ -2639,22 +2686,17 @@ $FIB_ANTISPOOF_RULE
     }
 
     chain syn_overflow {
-        # v3.15.3: log prefix [shield:syn_escalate] на момент ESCALATION в confirmed_attack_v4.
-        # Виден SRC где IP перешёл из suspect → ban 1ч. Rate-limited чтобы не флудить.
-        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\
-            limit rate 1/second burst 5 packets \\
-            log prefix "[shield:syn_escalate] " level info flags ip options \\
-            counter name syn_confirmed_v4 drop
+        # v3.15.3 / v3.23.0: log prefix [shield:syn_escalate] на момент ESCALATION
+        # в confirmed_attack_v4. При SHIELDNODE_VERBOSE_LOGS=0 (default) log-блок
+        # пуст — escalation работает но без log. Counter+drop ниже всегда активен.
+$SHIELD_LOG_SYN_ESC_FULL
         ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name syn_confirmed_v4 drop
         add @suspect_v4 { ip saddr }
     }
 
     chain udp_overflow {
-        # v3.15.3: log prefix [shield:udp_escalate] на момент ESCALATION.
-        ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } \\
-            limit rate 1/second burst 5 packets \\
-            log prefix "[shield:udp_escalate] " level info flags ip options \\
-            counter name udp_confirmed_v4 drop
+        # v3.15.3 / v3.23.0: log prefix [shield:udp_escalate] (optional).
+$SHIELD_LOG_UDP_ESC_FULL
         ip saddr @suspect_v4 add @confirmed_attack_v4 { ip saddr } counter name udp_confirmed_v4 drop
         add @suspect_v4 { ip saddr }
     }
