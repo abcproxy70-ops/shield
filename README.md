@@ -1,53 +1,47 @@
 # shieldnode
 
-Bash-скрипт DDoS-защиты для VPN-нод (Reality / Xray / sing-box / Hysteria2).
+Bash-скрипт DDoS-защиты для VPN-нод (Reality / Xray / sing-box / Hysteria2 / WireGuard).
 
-Стек: **nftables + CrowdSec + UFW**. Целевые ОС: Ubuntu 22.04 / 24.04, Debian 11 / 12.
+Стек: **nftables + CrowdSec + UFW**. Целевые ОС: Ubuntu 22.04 / 24.04, Debian 12 / 13.
 
-## Архитектура (v3.21.5)
+## Архитектура (v3.22.0)
 
 **Чистое разделение зон ответственности с vpn-node-setup:**
 
-- shieldnode владеет: scanner blocklist, rate-limit, ct count, fib anti-spoof, SSH pre-auth flood защита, infrastructure bypass (CDN/cloud whitelist), CrowdSec, security sysctl (rp_filter, syncookies, redirects, icmp, tcp_rfc1337, log_martians, conntrack UDP timeouts)
-- vpn-node-setup владеет: kernel (XanMod LTS), BBR, qdisc fq, buffers, MSS clamp, NIC tuning
+- shieldnode владеет: scanner blocklist, rate-limit, ct count, fib anti-spoof, CrowdSec, security sysctl (rp_filter, syncookies, redirects, icmp, tcp_rfc1337, log_martians, conntrack UDP timeouts)
+- vpn-node-setup владеет: kernel (XanMod LTS), BBR, qdisc fq, buffers, MSS clamp, NIC tuning, conntrack max + TCP timeouts
 
 Никаких пересечений в netfilter pipeline. Двойного MSS clamp нет.
 
-**Pipeline:** ct established → manual_whitelist → tcp_invalid drop → fib_spoof drop → scanner/threat/tor blocklist drops → **infrastructure_v4 accept (v3.21.5)** → SSH rate-limit → conn_flood / newconn_rate → accept.
+**Лимиты v3.22.0 рассчитаны на ноду с 500-1000 VPN-клиентами:**
 
-**Защита для всех IP без whitelists:**
+- **conn_flood**: `ct count over 50000` per-IP (CGNAT-провайдеры РФ держат до 200 абонентов за одним public IPv4 через PAT — на peak ~30k entries/IP)
+- **newconn rate**: 40000/min, burst 60000 (массовый reconnect 200 юзеров × 50 retry/min = 10000/min sustained)
+- **SYN flood**: 2000/sec, burst 3000 (CGNAT × 200 юзеров × 1-2 SYN/sec = 200-400/sec baseline)
+- **UDP flood**: 10000/sec, burst 20000 (Hysteria2/QUIC 4K streaming + cloud gaming)
+- **SSH per-IP**: ct=5 + 8/min burst 20 (CGNAT-админы + ansible deploy на ≤5 нод параллельно)
 
-- **conn_flood**: ct count over 5000 (extreme CGNAT support)
-- **newconn rate**: 5000/min, burst 8000
-- **SYN flood**: 300/sec, burst 500 (kernel rate-limit)
-- **UDP flood**: 1500/sec, burst 3000
-- **SSH per-IP**: ct count over 3 concurrent + 5/min new connections (v3.21.4)
+Реальные DDoS-атаки 50k+ SYN/sec, 100k+ connections — drop на kernel level. Ban-once архитектура: первое нарушение → suspect (30 мин наблюдения без drop), второе → confirmed (15 мин drop).
 
-**Infrastructure bypass (v3.21.5):**
-
-- **218 CIDR** (Cloudflare/Google/AWS/Azure/Apple/Meta/Akamai/Fastly/GitHub/Telegram/Yandex/VK/Selectel) обходят rate-limit и conn_flood/newconn_rate
-- НЕ попадают в events.db как "атакующие" — решает проблему ложных банов CDN
-- tcp_invalid и fib_spoof работают для ВСЕХ включая инфраструктуру (санитарный фильтр, не rate-limit)
-- counter `infrastructure_passes_v4` для observability (без log prefix — слишком много трафика)
-
-99.5% пользователей не упираются в лимиты. Реальные DDoS-атаки 5000+ concurrent/IP — drop на kernel level. SSH-флуд дропается на nft до sshd. CDN-трафик (Google YouTube, Cloudflare websites, Telegram, Apple iCloud) **проходит без задержек** и не считается атакой.
+**Требует:** `net.netfilter.nf_conntrack_max >= 262144` (Ubuntu 24.04 default OK на нодах ≥1GB RAM; vpn-node-setup v5.0.6+ ставит tier-aware значения 262k/786k/1M/2M в зависимости от RAM).
 
 ## Возможности
 
-- **nftables rate-limit** (kernel-level, IPv4-only): SYN-flood, UDP-flood, conn-flood
-- **TCP flag sanity**: drop XMAS, NULL, SYN+FIN, SYN+RST scan-пакетов
+- **nftables rate-limit** (kernel-level, IPv4-only): SYN-flood, UDP-flood, conn-flood, newconn-rate
+- **SSH pre-auth flood protection**: ct count + rate limit прямо на nft, защита от slowloris до того как пакеты дойдут до sshd
+- **TCP flag sanity**: drop XMAS, NULL, SYN+FIN, SYN+RST, FIN+RST scan-пакетов
 - **Anti-spoofing**: fib reverse-path (single-homed VPS)
+- **Infrastructure bypass**: ~220 CIDR крупных CDN/cloud (Cloudflare, Google, AWS, Azure, Apple, Meta, Akamai, Fastly, GitHub, Telegram, Yandex, VK, Selectel) проходят без rate-limit и не попадают в events.db как "атакующие"
 - **4 blocklist'а**:
   - `scanner` — Shodan, Censys, госсканеры РФ (shadow-netlab + CyberOK_Skipa + MISP)
   - `threat` — Spamhaus DROP + FireHOL Level 1 (high-confidence криминал)
   - `tor` — Tor exit nodes (опционально, `BLOCK_TOR=1`)
   - `custom` — личный список оператора (file-based + URL union)
-- **GitHub auto-sync**: `lists/custom.txt` синкается с репо каждые 6ч.
-  Локальные дополнения — в `custom-local.txt`, не перезаписываются.
-- **CrowdSec** + nftables bouncer (SSH brute-force + community blocklist)
-- **guard CLI** — дашборд защиты с ASN/owner column для top attackers
+- **GitHub auto-sync**: `lists/custom.txt` синкается с репо каждые 6ч. Локальные дополнения — в `custom-local.txt`, не перезаписываются.
+- **CrowdSec** + nftables bouncer (SSH brute-force + community blocklist ~28k IP)
+- **guard CLI** — дашборд защиты с ASN/owner column для top attackers, settings menu, upgrade/rollback
 - **Aggregator**: журналы → sqlite events.db с per-IP analytics
-- **Auto-detect портов** из UFW + inotify path-watcher (мгновенный sync)
+- **Auto-detect портов** из UFW + inotify path-watcher (мгновенный sync) + 5-min catch-all timer
 
 ## Установка
 
@@ -60,9 +54,9 @@ curl -fL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode
 
 ## Совместимость
 
-- Работает рядом с **vpn-node-setup v5.0.5+** (рекомендуется порядок: **vpn-node-setup первым, потом shieldnode** — минимизирует окно потери MSS clamp)
+- Работает рядом с **vpn-node-setup v5.0.6+** (рекомендуется порядок: **vpn-node-setup первым, потом shieldnode**)
 - Совместим с UFW (читает open ports автоматически)
-- Совместим с любыми VPN-стэками (Xray Reality, sing-box, Hysteria2, WireGuard)
+- Совместим с любыми VPN-стэками (Xray Reality, sing-box, Hysteria2, WireGuard, AmneziaWG)
 
 ## Удаление
 
@@ -73,30 +67,33 @@ curl -fL https://raw.githubusercontent.com/abcproxy70-ops/shield/main/shieldnode
 ## guard CLI
 
 ```bash
-sudo guard          # дашборд защиты с интерактивным меню
-sudo guard --once   # снимок без меню (для cron / мониторинга)
-sudo guard --json   # JSON-вывод для интеграций (Zabbix, Prometheus)
+sudo guard            # дашборд защиты с интерактивным меню
+sudo guard --once     # снимок без меню (для cron / мониторинга)
+sudo guard --json     # JSON-вывод для интеграций (Zabbix, Prometheus)
+sudo guard upgrade    # re-install с github (auto-snapshot для rollback)
+sudo guard rollback   # откатиться к предыдущему snapshot'у
+sudo guard sync       # синк custom.txt прямо сейчас
 ```
 
 ## Версии
 
-- **v3.21.5** — INFRASTRUCTURE BYPASS: добавлены два nft set'а `infrastructure_v4` (218 CIDR) и `infrastructure_v6` (26 CIDR) с диапазонами Cloudflare/Google/AWS/Azure/Apple/Meta/Akamai/Fastly/GitHub/Telegram/Yandex/VK/Selectel. Новое правило `ip saddr @infrastructure_v4 accept` в input chain в позиции ПОСЛЕ blocklist drops (scanner/threat/tor), но ДО SSH rate-limit и conn_flood. Пакеты от CDN/cloud обходят rate-limit, не попадают в events.db как "атакующие". Решает проблему ложных банов: до v3.21.5 на production-ноде Google/Cloudflare/Azure IP попадали в топ events.db из-за TCP retransmits/conntrack quirks, оператор копирующий "топ атакующих" в custom.txt мог забанить инфраструктуру → сломались бы YouTube/Telegram/iCloud у VPN-клиентов. tcp_invalid и fib_spoof работают для всех включая инфра. Counter `infrastructure_passes_v4` для observability (без log prefix). JSON-вывод (guard --json) extended: `infrastructure_passes_v4_packets`, `infrastructure_set_size`. Smoke test проверяет наличие set'а на этапе установки. Trade-off: реальный атакующий с AWS/Cloudflare relay пройдёт без detection, но физический rate-limit пакетов всё равно работает; атрибуция теряется, защита нет.
-- **v3.21.4** — SSH RATE-LIMIT TIGHTENED: на основе production-данных (нода с 345M dropped пакетов / 21 GB за 10 часов) ужесточены SSH per-IP лимиты. `ssh_connlimit_v4`: ct count over 5 → 3 (slowloris ловится в 1.67x агрессивнее, 99.5% дропов на v3.21.0 были именно от ct count, не rate). `ssh_newconn_rate_v4`: 10/min → 5/min, burst 15 без изменений. Для админа из CGNAT — добавить IP в `manual_whitelist_v4`.
-- **v3.21.3** — LOG DEDUP + DB CLEANUP + AWK BUGFIX: (1) убрано дублирование kern.* в /var/log/syslog через in-place edit `/etc/rsyslog.d/50-default.conf` с backup и graceful reload (предыдущая drop-in архитектура не работала — rsyslog evaluates все matching rules, не "first wins"). (2) journald drop-in `/etc/systemd/journald.conf.d/shieldnode.conf` с SystemMaxUse=500M вместо 10% /var. (3) shieldnode-cleanup.sh теперь делает реальную чистку sqlite БД: `DELETE events WHERE last_seen < -90d`, `DELETE asn_cache WHERE cached_at < -7d`, `wal_checkpoint(TRUNCATE)`, `VACUUM`. До v3.21.3 cleanup чистил несуществующую директорию /var/lib/shieldnode/asn_cache/. (4) CRITICAL BUGFIX: апостроф в кириллическом комментарии (`whitelist'ы`) внутри `awk '...'` блока aggregator-скрипта закрывал bash single-quoted строку раньше времени → весь awk-код парсился bash как команды → aggregator.service падал с exit 2 на каждом срабатывании таймера (каждую минуту). Защита nft при этом работала, но events.db не пополнялась — дашборд показывал stale данные.
-- **v3.21.2** — UX FIX: whitelist add/remove теперь явно триггерит updater, больше не нужно вручную нажимать [f] Force re-sync.
-- **v3.21.1** — SSH защита перемещена ПОСЛЕ tor_blocklist/scanner_blocklist drops. Раньше SSH-rate-limit стоял до этих blocklists → Tor exit nodes могли подключаться к SSH при `BLOCK_TOR=1`.
-- **v3.21.0** — SSH PRE-AUTH FLOOD DEFENSE: добавлены два rate-limit'а на SSH-порт: `ssh_connlimit_v4` (ct count over 5 concurrent на IP) и `ssh_newconn_rate_v4` (10/min, burst 15). Закрыта дыра: атакующий мог открывать 100+ TCP-коннектов к sshd, забивая softirq на handshake. Реальный кейс: тестовая нода получала 345M dropped пакетов / 21 GB за 10 часов с открытым :22 в публичный интернет — все срезались на nft-уровне до sshd. Рекомендация: SSH на нестандартный порт + per-IP allow.
-- **v3.20.7** — WHITELIST CONSISTENCY FIX: единая точка управления whitelist во всех слоях. На установке автоимпортируются UFW `ALLOW from <IP>` правила в `whitelist-local.txt` + `TRUSTED_IPS` в `shieldnode.conf` + применяются через CrowdSec whitelist на 1 год. `BRIDGE_IPS` тоже расширен на все 3 слоя. Раньше IP попадали только в nft set через port-syncer, но UI `guard → Trusted IPs` показывал «пусто» и CrowdSec мог их забанить.
-- **v3.20.6** — SMOKE-TEST FIX: убран ложный smoke-test FAIL после v3.20.5. Smoke-test проверял наличие `chain forward` (которая удалена в v3.20.5 by design) → все установки показывали красный FAIL хотя защита работала. Косметика, функциональность не менялась.
-- **v3.20.5** — ARCH SIMPLIFICATION: удалён MSS clamp forward chain (зона vpn-node-setup), удалён panel auto-detect через docker ps (нестабильное определение priorities), priorities захардкожены (prerouting -100 standalone, -150 panel-mode через manual override).
-- **v3.20.4** — HOTFIX: критический баг в v3.20.3 (backticks в unquoted heredoc).
-- **v3.20.3** — DISK USAGE FIX: ротация логов, ограничения на size.
-- **v3.20.1** — extreme CGNAT support: conn_flood 3000→5000, newconn 3000/min→5000/min.
-- **v3.20.0** — SIMPLIFICATION: убраны mobile-RU и broadband-RU whitelist'ы.
-- **v3.18.x** — TRUSTED_IPS feature, UFW-FIX, post-audit hardening.
+- **v3.22.0** — ROBUSTNESS PACK + SECURITY TUNING для 500-1000 клиентов на ноде:
+  - **Лимиты подняты под реальный CGNAT load** (МТС/T2/Beeline/Tele2 200+ абонентов/IP): conn_flood 5000→50000, newconn 5000→40000/min, syn 300→2000/sec, udp 1500→10000/sec, ssh ct=3→5
+  - **Aggregator robustness**: `journalctl --lines=500000` cap (защита от RAM blow-up под штормом 100k+ events/min), `PRAGMA busy_timeout=5000` (защита от SQLITE_BUSY race с guard)
+  - **protected-ports timer 60s → 5min**: path-unit (inotify) ловит изменения мгновенно, timer остался как catch-all, экономия ~15% CPU на 1GB нодах
+  - **guard ASN lookup**: curl timeout 2s → 0.5s + offline-mode fallback (top attackers больше не лагает на 40 сек при недоступности ipinfo.io)
+  - **cleanup VACUUM**: Nice=19 + IOSchedulingClass=idle (не блокирует sshd/Xray logs на shared-disk VPS)
+  - **unban_all**: + `conntrack -D -s <ip>` (FP-разбан реально работает на extreme-CGNAT)
+  - **healthcheck timeouts**: `timeout 5 cscli ...` + sqlite fallback (быстрее install на нодах с ~28k CAPI decisions)
+  - **Cleanup**: удалены dead counters mobile_ru_*/broadband_ru_*, changelog history >1600 строк (история в git)
+- **v3.21.x** — SSH pre-auth flood defense, infrastructure_v4 bypass для CDN/cloud (~220 CIDR), Google 192.178/16 в baseline, log dedup (rsyslog kern.none + journald limits), DB cleanup (events.db + asn_cache).
+- **v3.20.x** — SIMPLIFICATION (убраны mobile-RU/broadband-RU whitelist'ы), arch simplification (MSS clamp → vpn-node-setup), WHITELIST CONSISTENCY (TRUSTED_IPS через все 3 слоя), aggressive logrotate.
+- **v3.18.x** — TRUSTED_IPS feature, UFW-FIX, post-audit hardening, foreign CrowdSec detection.
 - **v3.14.0** — GitHub auto-sync custom.txt + version check + guard settings menu.
 - **v3.12.0** — blocklists архитектура (universal updater, file+URL union).
 - **v3.10.x** — fib anti-spoof, TCP MSS clamping.
+
+Полная история: https://github.com/abcproxy70-ops/shield/commits/main/shieldnode.sh
 
 ## Лицензия
 
