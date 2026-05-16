@@ -1,7 +1,40 @@
 #!/bin/bash
 
 # ==============================================================================
-#  VPN NODE DDoS PROTECTION v3.23.0 (Commercial Edition) — LOG NOISE & UDP UX
+#  VPN NODE DDoS PROTECTION v3.23.1 (Commercial Edition) — TRUSTED_IPS + UFW FIXES
+#
+#  Что нового vs v3.23.0:
+#    1. CRIT: TRUSTED_IPS теперь применяются через postoverflow whitelist
+#       (parser-level), а не только через cscli decisions (decision-level).
+#       Раньше: scenarios (например crowdsecurity/http-probing) продолжали
+#       триггериться на trusted IPs → alerts уходили в CAPI, race condition
+#       между whitelist-decision и ban-decision приводил к коротким окнам
+#       drop'а. Теперь scenarios даже не пытаются банить trusted IPs.
+#       Симметрично с MGMT_IPV4 (который через postoverflow с v3.10.4).
+#       Файл: /etc/crowdsec/postoverflows/s01-whitelist/shieldnode-trusted.yaml
+#    2. CRIT: guard → Trusted IPs → Delete теперь корректно экранирует точки
+#       в IP при поиске UFW-правил. Раньше: regex "1.2.3.4" матчил "1.2.3.40",
+#       "1.2.3.41" и т.п. (точки в regex = любой символ). При удалении одного
+#       IP `yes | ufw delete` мог снести правила для соседних IP'шников.
+#       Теперь: точное соответствие через ${ip//./\\.} + word-boundaries.
+#    3. FEATURE: TRUSTED_IPS теперь поддерживает CIDR (например 10.0.0.0/24).
+#       Раньше: только single IPs принимались, CIDR молча отбрасывались на
+#       merge → bridge подсети получали только 2 слоя защиты (nft) вместо 5.
+#       Теперь все 5 слоёв работают для CIDR:
+#         • shieldnode whitelist-local.txt (nft manual_whitelist_v4)
+#         • UFW allow from <CIDR>
+#         • CrowdSec decision --range <CIDR> (decision-level)
+#         • CrowdSec postoverflow cidr: секция (parser-level)
+#       guard UI Add/Delete также принимают CIDR. Затронуты: BRIDGE_IPS merge,
+#       apply_trusted_ip, generate_trusted_postoverflow, _trusted_regen_postoverflow,
+#       все три ветки guard UI (Add/Delete/Re-apply).
+#    4. MINOR: guard NFT_SINCE теперь читает shieldnode-nftables.service
+#       (раньше — masked nftables.service → всегда пустой timestamp).
+#       Дашборд "Drops since reboot" теперь показывает реальную дату.
+#    5. MINOR: apply_trusted_ip UFW grep тоже экранирует точки в IP.
+#    6. DATA FIX: убрана невалидная запись "17::/32" из IPv6 infrastructure
+#       baseline (была попыткой скопировать Apple AS714 IPv4 17.0.0.0/8 в IPv6,
+#       но 17::/32 = IETF reserved space, никому не присвоен).
 #
 #  Что нового vs v3.22.0:
 #    1. CRIT-2: log_martians = 0 (was 1).
@@ -125,7 +158,7 @@ cscli_collection_installed() {
 SHIELD_REPO_URL="${SHIELD_REPO_URL:-https://raw.githubusercontent.com/abcproxy70-ops/shield/main}"
 
 # v3.18.3: версия для self-check
-SHIELDNODE_VERSION="3.23.0"
+SHIELDNODE_VERSION="3.23.1"
 
 # Каталоги (объявлены РАНЬШЕ дефолтов — нужны для подгрузки conf на строке ниже)
 SHIELD_ETC_DIR="/etc/shieldnode"
@@ -520,6 +553,8 @@ if [ "${1:-}" = "--uninstall" ]; then
 
     # v3.10.4: убираем postoverflow whitelist
     rm -f /etc/crowdsec/postoverflows/s01-whitelist/shieldnode-mgmt.yaml
+    # v3.23.1: убираем postoverflow whitelist для TRUSTED_IPS
+    rm -f /etc/crowdsec/postoverflows/s01-whitelist/shieldnode-trusted.yaml
 
     # v3.10.4: убираем journalctl SSH acquisition если он от нас
     if [ -f /etc/crowdsec/acquis.d/sshd.yaml ] && \
@@ -758,14 +793,12 @@ if [ -n "${BRIDGE_IPS:-}" ]; then
             echo "$ip" >> "$WL_LOCAL"
             print_ok "Добавлен в whitelist: $ip"
         fi
-        # v3.20.7: single IPs (не CIDR) идут в TRUSTED_IPS чтобы guard UI их показывал
-        # и ШАГ 12.5 применил UFW + CrowdSec whitelist.
-        if [[ "$ip" != */* ]]; then
-            if [ -z "$BRIDGE_TRUSTED_ADDED" ]; then
-                BRIDGE_TRUSTED_ADDED="$ip"
-            else
-                BRIDGE_TRUSTED_ADDED="${BRIDGE_TRUSTED_ADDED},${ip}"
-            fi
+        # v3.23.1: и single IPs, и CIDR идут в TRUSTED_IPS чтобы guard UI их показывал
+        # и ШАГ 12.5 применил UFW + CrowdSec whitelist (для CIDR — через --range).
+        if [ -z "$BRIDGE_TRUSTED_ADDED" ]; then
+            BRIDGE_TRUSTED_ADDED="$ip"
+        else
+            BRIDGE_TRUSTED_ADDED="${BRIDGE_TRUSTED_ADDED},${ip}"
         fi
     done
 
@@ -1978,7 +2011,6 @@ INFRASTRUCTURE_V6_CIDR=$(cat <<'INFRA_V6_EOF'
 2620:107:300f::/48
 2603:1000::/24
 2620:1ec::/36
-17::/32
 2a03:2880::/29
 2620:0:1c00::/40
 2620:0:1cff::/48
@@ -5864,7 +5896,10 @@ collect_stats() {
     # v3.20.0+: mobile-RU и broadband-RU stats УБРАНЫ (whitelist'ы удалены)
 
     # Когда nft started — для "stats since"
-    NFT_SINCE=$(systemctl show nftables.service --property=ActiveEnterTimestamp --value 2>/dev/null | \
+    # v3.23.1: читаем shieldnode-nftables.service вместо nftables.service.
+    # Последний masked в установщике (стр 1000) → ActiveEnterTimestamp пуст →
+    # NFT_SINCE всегда был "—" после первого ребута.
+    NFT_SINCE=$(systemctl show shieldnode-nftables.service --property=ActiveEnterTimestamp --value 2>/dev/null | \
         xargs -I{} date -d {} '+%Y-%m-%d %H:%M' 2>/dev/null)
     NFT_SINCE="${NFT_SINCE:-—}"
 
@@ -6538,6 +6573,63 @@ show_full_log() {
     echo ""
 }
 
+# v3.23.1: helper для регенерации postoverflow whitelist для TRUSTED_IPS
+# из guard UI (add/delete/re-apply). Симметрично с installer'ом ШАГ 12.5.
+_trusted_regen_postoverflow() {
+    local csv="$1"
+    local PO_DIR=/etc/crowdsec/postoverflows/s01-whitelist
+    local PO_FILE="$PO_DIR/shieldnode-trusted.yaml"
+    # Не трогаем foreign CrowdSec
+    [ -f /etc/shieldnode/.crowdsec_managed ] || return 0
+    command -v cscli >/dev/null 2>&1 || return 0
+    mkdir -p "$PO_DIR"
+    if [ -z "$csv" ]; then
+        rm -f "$PO_FILE" 2>/dev/null
+        systemctl reload crowdsec >/dev/null 2>&1
+        return 0
+    fi
+    local TMP_FILE
+    TMP_FILE=$(mktemp "${PO_FILE}.XXXXXX") || return 1
+    {
+        echo "# Auto-generated by guard (TRUSTED_IPS management)."
+        echo "# Parser-level whitelist — scenarios не триггерят на этих IPs."
+        echo "name: shieldnode/trusted-whitelist"
+        echo "description: \"Whitelist trusted infrastructure IPs (TRUSTED_IPS)\""
+        echo "whitelist:"
+        echo "  reason: \"Trusted infrastructure (TRUSTED_IPS)\""
+        # v3.23.1: разделяем single IPs и CIDR в две секции
+        local ip _ips="" _cidrs=""
+        IFS=',' read -ra _ARR <<< "$csv"
+        for ip in "${_ARR[@]}"; do
+            ip=$(echo "$ip" | tr -d ' ')
+            [ -z "$ip" ] && continue
+            if [[ "$ip" == */* ]]; then
+                # Валидный CIDR: X.X.X.X/N
+                echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' || continue
+                _cidrs="$_cidrs $ip"
+            else
+                echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || continue
+                _ips="$_ips $ip"
+            fi
+        done
+        if [ -n "$_ips" ]; then
+            echo "  ip:"
+            for ip in $_ips; do
+                echo "    - \"$ip\""
+            done
+        fi
+        if [ -n "$_cidrs" ]; then
+            echo "  cidr:"
+            for cidr in $_cidrs; do
+                echo "    - \"$cidr\""
+            done
+        fi
+    } > "$TMP_FILE"
+    chmod 0644 "$TMP_FILE"
+    mv "$TMP_FILE" "$PO_FILE"
+    systemctl reload crowdsec >/dev/null 2>&1 || systemctl restart crowdsec >/dev/null 2>&1
+}
+
 # v3.14.0: settings menu — toggle ENABLE_* flags
 # v3.18.8: убран MAXMIND_LICENSE_KEY (deprecated с v3.15.0)
 show_settings_menu() {
@@ -6725,13 +6817,25 @@ show_settings_menu() {
                     read -r TC
                     case "$TC" in
                         a|A)
-                            echo -ne "  Enter IP (e.g. 1.2.3.4): "
+                            echo -ne "  Enter IP or CIDR (e.g. 1.2.3.4 or 10.0.0.0/24): "
                             read -r NEW_IP
                             NEW_IP=$(echo "$NEW_IP" | tr -d ' ')
-                            if ! echo "$NEW_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-                                echo -e "  ${R}Невалидный IP${N}"
+                            # v3.23.1: принимаем и single IP, и CIDR
+                            local is_cidr_input=0
+                            if ! echo "$NEW_IP" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$'; then
+                                echo -e "  ${R}Невалидный IP/CIDR${N}"
                                 sleep 1
                                 continue
+                            fi
+                            [[ "$NEW_IP" == */* ]] && is_cidr_input=1
+                            # Для CIDR проверяем prefix length
+                            if [ "$is_cidr_input" = "1" ]; then
+                                local prefix="${NEW_IP##*/}"
+                                if [ "$prefix" -lt 8 ] || [ "$prefix" -gt 32 ]; then
+                                    echo -e "  ${R}Refused:${N} prefix должен быть от /8 до /32"
+                                    sleep 1
+                                    continue
+                                fi
                             fi
                             # v3.18.11 SH-NEW-10: отклоняем 0.0.0.0, multicast, broadcast
                             if echo "$NEW_IP" | grep -qE '^(0\.|22[4-9]\.|23[0-9]\.|24[0-9]\.|25[0-5]\.|255\.255\.255\.255)'; then
@@ -6739,8 +6843,10 @@ show_settings_menu() {
                                 sleep 1
                                 continue
                             fi
-                            # Проверяем что не дубль
-                            if echo ",$trusted_csv," | grep -qE ",[[:space:]]*$NEW_IP[[:space:]]*,"; then
+                            # Проверяем что не дубль (escape точки и слэш)
+                            local NEW_RE="${NEW_IP//./\\.}"
+                            NEW_RE="${NEW_RE//\//\\/}"
+                            if echo ",$trusted_csv," | grep -qE ",[[:space:]]*${NEW_RE}[[:space:]]*,"; then
                                 echo -e "  ${Y}Уже в списке${N}"
                                 sleep 1
                                 continue
@@ -6753,7 +6859,7 @@ show_settings_menu() {
                                 new_csv="$trusted_csv,$NEW_IP"
                             fi
                             _write_setting "TRUSTED_IPS" "$new_csv"
-                            # Применяем сразу через все три слоя
+                            # Применяем сразу через все слои
                             echo ""
                             local WL=/etc/shieldnode/lists/whitelist-local.txt
                             mkdir -p "$(dirname "$WL")"
@@ -6766,11 +6872,21 @@ show_settings_menu() {
                                 echo -e "    ${G}✓${N} UFW allow"
                             fi
                             if command -v cscli >/dev/null 2>&1; then
-                                cscli decisions add --ip "$NEW_IP" --duration 8760h --type whitelist --reason "Trusted (TRUSTED_IPS)" >/dev/null 2>&1 || true
-                                echo -e "    ${G}✓${N} CrowdSec whitelist"
+                                # v3.23.1: --range для CIDR, --ip для single
+                                if [ "$is_cidr_input" = "1" ]; then
+                                    cscli decisions add --range "$NEW_IP" --duration 8760h --type whitelist --reason "Trusted (TRUSTED_IPS)" >/dev/null 2>&1 || true
+                                else
+                                    cscli decisions add --ip "$NEW_IP" --duration 8760h --type whitelist --reason "Trusted (TRUSTED_IPS)" >/dev/null 2>&1 || true
+                                fi
+                                echo -e "    ${G}✓${N} CrowdSec whitelist (decision-level)"
                             fi
-                            # Очистить старые events
-                            sqlite3 /var/lib/shieldnode/events.db "DELETE FROM events WHERE ip='$NEW_IP';" 2>/dev/null || true
+                            # Очистить старые events (только для single IPs — events.db хранит per-IP)
+                            if [ "$is_cidr_input" = "0" ]; then
+                                sqlite3 /var/lib/shieldnode/events.db "DELETE FROM events WHERE ip='$NEW_IP';" 2>/dev/null || true
+                            fi
+                            # v3.23.1: регенерируем postoverflow whitelist (parser-level)
+                            _trusted_regen_postoverflow "$new_csv"
+                            echo -e "    ${G}✓${N} CrowdSec postoverflow whitelist (parser-level)"
                             echo -e "  ${G}Done.${N}"
                             sleep 2
                             ;;
@@ -6783,19 +6899,30 @@ show_settings_menu() {
                             echo -ne "  Enter IP to remove: "
                             read -r DEL_IP
                             DEL_IP=$(echo "$DEL_IP" | tr -d ' ')
+                            # v3.23.1: определяем CIDR vs single IP
+                            local del_is_cidr=0
+                            [[ "$DEL_IP" == */* ]] && del_is_cidr=1
                             # Удалить из CSV
                             local cleaned
                             cleaned=$(echo "$trusted_csv" | tr ',' '\n' | grep -vxF "$DEL_IP" | paste -sd',' -)
                             _write_setting "TRUSTED_IPS" "$cleaned"
                             # shieldnode whitelist
-                            sed -i "/^${DEL_IP//./\\.}\$/d" /etc/shieldnode/lists/whitelist-local.txt 2>/dev/null || true
+                            # v3.23.1: sed delimiter '|' вместо '/' чтобы CIDR (содержит /) не ломал regex
+                            local DEL_IP_SED="${DEL_IP//./\\.}"
+                            sed -i "\\|^${DEL_IP_SED}\$|d" /etc/shieldnode/lists/whitelist-local.txt 2>/dev/null || true
                             echo -e "    ${G}✓${N} shieldnode whitelist"
                             # UFW
                             if command -v ufw >/dev/null 2>&1; then
+                                # v3.23.1 CRIT FIX: экранируем точки и слэш в IP — иначе regex
+                                # "1.2.3.4" сматчит "1.2.3.40" и т.п., и `yes | ufw delete N` без
+                                # подтверждения снесёт чужие правила. Также добавляем end-anchor.
+                                # CIDR в UFW отображается как "10.0.0.0/24" — экранируем слэш отдельно.
+                                local DEL_IP_RE="${DEL_IP//./\\.}"
+                                DEL_IP_RE="${DEL_IP_RE//\//\\/}"
                                 # Найти rule number и удалить (ufw нумерует rules)
-                                while ufw status numbered 2>/dev/null | grep -E "^\\[[0-9]+\\] +Anywhere.* $DEL_IP" >/dev/null 2>&1; do
+                                while ufw status numbered 2>/dev/null | grep -E "^\[[0-9]+\] +Anywhere.* ${DEL_IP_RE}( |$|/)" >/dev/null 2>&1; do
                                     local rule_num
-                                    rule_num=$(ufw status numbered 2>/dev/null | grep -E "^\\[[0-9]+\\] +Anywhere.* $DEL_IP" | head -1 | grep -oE '\[[0-9]+\]' | tr -d '[]')
+                                    rule_num=$(ufw status numbered 2>/dev/null | grep -E "^\[[0-9]+\] +Anywhere.* ${DEL_IP_RE}( |$|/)" | head -1 | grep -oE '\[[0-9]+\]' | tr -d '[]')
                                     [ -z "$rule_num" ] && break
                                     yes | ufw delete "$rule_num" >/dev/null 2>&1 || break
                                 done
@@ -6804,9 +6931,17 @@ show_settings_menu() {
                             fi
                             # CrowdSec
                             if command -v cscli >/dev/null 2>&1; then
-                                cscli decisions delete --ip "$DEL_IP" >/dev/null 2>&1 || true
+                                # v3.23.1: --range для CIDR, --ip для single
+                                if [ "$del_is_cidr" = "1" ]; then
+                                    cscli decisions delete --range "$DEL_IP" >/dev/null 2>&1 || true
+                                else
+                                    cscli decisions delete --ip "$DEL_IP" >/dev/null 2>&1 || true
+                                fi
                                 echo -e "    ${G}✓${N} CrowdSec decision removed"
                             fi
+                            # v3.23.1: регенерируем postoverflow whitelist (parser-level)
+                            _trusted_regen_postoverflow "$cleaned"
+                            echo -e "    ${G}✓${N} CrowdSec postoverflow whitelist updated"
                             echo -e "  ${G}Done.${N}"
                             sleep 2
                             ;;
@@ -6822,19 +6957,32 @@ show_settings_menu() {
                             for ip in "${TRUSTED_ARR[@]}"; do
                                 ip=$(echo "$ip" | tr -d ' ')
                                 [ -z "$ip" ] && continue
+                                # v3.23.1: экранируем точки и слэш для grep, и трекаем CIDR
+                                local ip_re="${ip//./\\.}"
+                                ip_re="${ip_re//\//\\/}"
+                                local is_cidr_ra=0
+                                [[ "$ip" == */* ]] && is_cidr_ra=1
                                 local WL=/etc/shieldnode/lists/whitelist-local.txt
                                 grep -qxF "$ip" "$WL" 2>/dev/null || echo "$ip" >> "$WL"
                                 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-                                    ufw status 2>/dev/null | grep -qE "(^|[[:space:]])$ip([[:space:]]|$)" || \
+                                    ufw status 2>/dev/null | grep -qE "(^|[[:space:]])${ip_re}([[:space:]]|$)" || \
                                         ufw allow from "$ip" comment "Trusted (TRUSTED_IPS)" >/dev/null 2>&1
                                 fi
                                 if command -v cscli >/dev/null 2>&1; then
-                                    cscli decisions list --ip "$ip" 2>/dev/null | grep -q whitelist || \
-                                        cscli decisions add --ip "$ip" --duration 8760h --type whitelist --reason "Trusted (TRUSTED_IPS)" >/dev/null 2>&1
+                                    # v3.23.1: --range для CIDR, --ip для single, --type whitelist в list-запросе
+                                    if [ "$is_cidr_ra" = "1" ]; then
+                                        cscli decisions list --range "$ip" --type whitelist -o json 2>/dev/null | grep -q '"id":' || \
+                                            cscli decisions add --range "$ip" --duration 8760h --type whitelist --reason "Trusted (TRUSTED_IPS)" >/dev/null 2>&1
+                                    else
+                                        cscli decisions list --ip "$ip" --type whitelist -o json 2>/dev/null | grep -q '"id":' || \
+                                            cscli decisions add --ip "$ip" --duration 8760h --type whitelist --reason "Trusted (TRUSTED_IPS)" >/dev/null 2>&1
+                                    fi
                                 fi
                                 echo -e "    ${G}✓${N} $ip"
                             done
                             command -v ufw >/dev/null 2>&1 && ufw reload >/dev/null 2>&1 || true
+                            # v3.23.1: регенерируем postoverflow whitelist (parser-level)
+                            _trusted_regen_postoverflow "$trusted_csv"
                             echo -e "  ${G}Done.${N}"
                             sleep 2
                             ;;
@@ -6983,15 +7131,20 @@ apply_trusted_ip() {
         print_warn "  Пропускаю невалидный IP: '$ip' (запрещены 0.0.0.0/x, multicast, prefix<8)"
         return 1
     fi
-    # Trusted IPs ожидаются как single IPs (не CIDR) — для UFW/CrowdSec consistency
-    if [[ "$ip" == */* ]]; then
-        print_warn "  TRUSTED_IPS должны быть single IP (не CIDR): '$ip' — пропускаю"
-        return 1
-    fi
+
+    # v3.23.1: CIDR теперь поддерживаются (cscli umеет --range, ufw allow from <CIDR>).
+    local is_cidr=0
+    [[ "$ip" == */* ]] && is_cidr=1
+
+    # v3.23.1: экранируем точки для безопасного использования в grep -E.
+    # Без этого regex "1.2.3.4" сматчит "1A2B3C4", "1.2.3.40" и т.п.
+    # Для CIDR экранируем точки и слэш отдельно.
+    local ip_re="${ip//./\\.}"
+    ip_re="${ip_re//\//\\/}"
 
     local layer_count=0
 
-    # 1. shieldnode whitelist-local
+    # 1. shieldnode whitelist-local (works for single IP и CIDR, nft set с flags interval)
     local WL=/etc/shieldnode/lists/whitelist-local.txt
     if [ -f "$WL" ] && grep -qxF "$ip" "$WL"; then
         :
@@ -7000,21 +7153,39 @@ apply_trusted_ip() {
         layer_count=$((layer_count + 1))
     fi
 
-    # 2. UFW
+    # 2. UFW (поддерживает single IP и CIDR одинаково)
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        if ! ufw status 2>/dev/null | grep -qE "(^|[[:space:]])$ip([[:space:]]|$)"; then
+        # v3.23.1: ip_re с экранированными точками вместо raw $ip
+        if ! ufw status 2>/dev/null | grep -qE "(^|[[:space:]])${ip_re}([[:space:]]|$)"; then
             ufw allow from "$ip" comment "$comment" >/dev/null 2>&1 || true
             layer_count=$((layer_count + 1))
         fi
     fi
 
-    # 3. CrowdSec
+    # 3. CrowdSec decision-level whitelist (быстрая отмена существующих banов)
     if command -v cscli >/dev/null 2>&1; then
-        if ! cscli decisions list --ip "$ip" 2>/dev/null | grep -q whitelist; then
-            cscli decisions add --ip "$ip" --duration 8760h --type whitelist --reason "$comment" >/dev/null 2>&1 || true
-            layer_count=$((layer_count + 1))
+        if [ "$is_cidr" = "1" ]; then
+            # v3.23.1: CIDR через --range
+            # Note: --range делает scope=Range вместо Ip; список не дублируется
+            # благодаря reason-check (cscli не отклоняет дубль самостоятельно).
+            if ! cscli decisions list --range "$ip" --type whitelist -o json 2>/dev/null | \
+                 grep -q '"id":'; then
+                cscli decisions add --range "$ip" --duration 8760h --type whitelist --reason "$comment" >/dev/null 2>&1 || true
+                layer_count=$((layer_count + 1))
+            fi
+        else
+            # v3.23.1: --type whitelist в самом list-запросе вместо grep'а вывода
+            if ! cscli decisions list --ip "$ip" --type whitelist -o json 2>/dev/null | \
+                 grep -q '"id":'; then
+                cscli decisions add --ip "$ip" --duration 8760h --type whitelist --reason "$comment" >/dev/null 2>&1 || true
+                layer_count=$((layer_count + 1))
+            fi
         fi
     fi
+
+    # Слой 4 (postoverflow whitelist для parser-level) применяется не здесь
+    # а после цикла — одним файлом со всеми IP сразу (см. ниже).
+    # Postoverflow умеет ip: для single и cidr: для CIDR.
 
     if [ "$layer_count" -gt 0 ]; then
         print_ok "  $ip — применено в $layer_count слое(в)"
@@ -7022,6 +7193,83 @@ apply_trusted_ip() {
         print_info "  $ip — уже whitelisted во всех слоях"
     fi
     return 0
+}
+
+# v3.23.1: CRIT FIX — генерация postoverflow whitelist для TRUSTED_IPS.
+# Раньше (≤v3.23.0): TRUSTED_IPS жили только в decision-level whitelist
+# (cscli decisions add --type whitelist). Это отменяет ban-decisions, но НЕ
+# предотвращает scenarios (crowdsecurity/http-probing, ssh-bf, etc) от
+# срабатывания → alerts уходили в CAPI как сигналы атаки от trusted IP.
+# Хуже: между моментом создания ban-decision и применения whitelist-decision
+# было короткое окно когда bouncer мог дропнуть IP.
+#
+# Симметрично с MGMT_IPV4 которые с v3.10.4 уже через postoverflow.
+generate_trusted_postoverflow() {
+    if [ "${SHIELDNODE_CROWDSEC_MANAGED:-0}" != "1" ]; then
+        return 0   # foreign CrowdSec — не трогаем
+    fi
+    local PO_DIR=/etc/crowdsec/postoverflows/s01-whitelist
+    local PO_FILE="$PO_DIR/shieldnode-trusted.yaml"
+    mkdir -p "$PO_DIR"
+
+    # Если TRUSTED_IPS пуст — удалим файл (idempotent)
+    if [ -z "${TRUSTED_IPS:-}" ]; then
+        if [ -f "$PO_FILE" ]; then
+            rm -f "$PO_FILE"
+            systemctl reload crowdsec >/dev/null 2>&1
+        fi
+        return 0
+    fi
+
+    # Собираем валидные IP и CIDR в отдельные списки
+    local TMP_IPS=""
+    local TMP_CIDRS=""
+    IFS=',' read -ra _ARR <<< "$TRUSTED_IPS"
+    for _ip in "${_ARR[@]}"; do
+        _ip=$(echo "$_ip" | tr -d ' ')
+        [ -z "$_ip" ] && continue
+        validate_ipv4_or_cidr "$_ip" 2>/dev/null || continue
+        # v3.23.1: CIDR поддержан через cidr: секцию postoverflow
+        if [[ "$_ip" == */* ]]; then
+            TMP_CIDRS="$TMP_CIDRS $_ip"
+        else
+            TMP_IPS="$TMP_IPS $_ip"
+        fi
+    done
+
+    if [ -z "$TMP_IPS" ] && [ -z "$TMP_CIDRS" ]; then
+        rm -f "$PO_FILE" 2>/dev/null
+        return 0
+    fi
+
+    # Atomic write: tmp в той же директории + mv
+    local TMP_FILE
+    TMP_FILE=$(mktemp "${PO_FILE}.XXXXXX") || return 1
+    {
+        echo "# v3.23.1: parser-level whitelist для TRUSTED_IPS."
+        echo "# Срабатывает ПОСЛЕ scenario trigger но ДО alert/decision —"
+        echo "# scenarios (http-probing, ssh-bf, etc) не оставляют следов на trusted IPs."
+        echo "# Симметрично с MGMT_IPV4 (shieldnode-mgmt.yaml)."
+        echo "name: shieldnode/trusted-whitelist"
+        echo "description: \"Whitelist trusted infrastructure IPs (TRUSTED_IPS)\""
+        echo "whitelist:"
+        echo "  reason: \"Trusted infrastructure (TRUSTED_IPS)\""
+        if [ -n "$TMP_IPS" ]; then
+            echo "  ip:"
+            for ip in $TMP_IPS; do
+                echo "    - \"$ip\""
+            done
+        fi
+        if [ -n "$TMP_CIDRS" ]; then
+            echo "  cidr:"
+            for cidr in $TMP_CIDRS; do
+                echo "    - \"$cidr\""
+            done
+        fi
+    } > "$TMP_FILE"
+    chmod 0644 "$TMP_FILE"
+    mv "$TMP_FILE" "$PO_FILE"   # atomic — same FS
+    systemctl reload crowdsec >/dev/null 2>&1 || systemctl restart crowdsec >/dev/null 2>&1
 }
 
 if [ -n "${TRUSTED_IPS:-}" ]; then
@@ -7037,6 +7285,9 @@ if [ -n "${TRUSTED_IPS:-}" ]; then
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw reload >/dev/null 2>&1 || true
     fi
+    # v3.23.1: postoverflow whitelist одним файлом (parser-level)
+    generate_trusted_postoverflow
+    print_ok "Postoverflow whitelist: /etc/crowdsec/postoverflows/s01-whitelist/shieldnode-trusted.yaml"
 fi
 
 # ==============================================================================
